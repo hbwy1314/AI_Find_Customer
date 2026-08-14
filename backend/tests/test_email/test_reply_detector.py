@@ -11,7 +11,7 @@ def _seed_store(store: EmailStore) -> None:
     store.upsert_account({
         "id": "default",
         "provider_type": "smtp",
-        "from_name": "B2Binsights",
+        "from_name": "Ai Hunter",
         "from_email": "sales@example.com",
         "reply_to": "sales@example.com",
         "smtp_host": "smtp.example.com",
@@ -130,7 +130,7 @@ async def test_reply_detector_matches_in_reply_to_and_stops_sequence(tmp_path: P
         fetcher=fake_fetcher,
     )
 
-    assert result == {"checked": 1, "matched": 1, "skipped": 0, "ignored": 0}
+    assert {"checked": 1, "matched": 1, "skipped": 0, "ignored": 0} == {k: result[k] for k in ("checked", "matched", "skipped", "ignored")}
     seq = store.get_sequence("seq_1")
     assert seq is not None
     assert seq["status"] == "replied"
@@ -166,7 +166,7 @@ async def test_reply_detector_deduplicates_raw_ref(tmp_path: Path, monkeypatch):
 
     await run_reply_detection_once(store, store.get_account("default") or {}, now_iso="2026-03-10T00:05:00Z", fetcher=fake_fetcher)
     result = await run_reply_detection_once(store, store.get_account("default") or {}, now_iso="2026-03-10T00:06:00Z", fetcher=fake_fetcher)
-    assert result == {"checked": 1, "matched": 0, "skipped": 1, "ignored": 0}
+    assert {"checked": 1, "matched": 0, "skipped": 1, "ignored": 0} == {k: result[k] for k in ("checked", "matched", "skipped", "ignored")}
 
 
 @pytest.mark.asyncio
@@ -197,7 +197,7 @@ async def test_reply_detector_ignores_out_of_office(tmp_path: Path, monkeypatch)
         fetcher=fake_fetcher,
     )
 
-    assert result == {"checked": 1, "matched": 0, "skipped": 0, "ignored": 1}
+    assert {"checked": 1, "matched": 0, "skipped": 0, "ignored": 1} == {k: result[k] for k in ("checked", "matched", "skipped", "ignored")}
     seq = store.get_sequence("seq_1")
     assert seq is not None
     assert seq["status"] == "running"
@@ -232,7 +232,7 @@ async def test_reply_detector_ignores_bounce_from_mailer_daemon(tmp_path: Path, 
         fetcher=fake_fetcher,
     )
 
-    assert result == {"checked": 1, "matched": 0, "skipped": 0, "ignored": 1}
+    assert {"checked": 1, "matched": 0, "skipped": 0, "ignored": 1} == {k: result[k] for k in ("checked", "matched", "skipped", "ignored")}
     seq = store.get_sequence("seq_1")
     assert seq is not None
     assert seq["status"] == "running"

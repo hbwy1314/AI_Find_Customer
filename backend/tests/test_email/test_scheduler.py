@@ -14,7 +14,7 @@ async def test_scheduler_sends_pending_message(tmp_path: Path, monkeypatch):
     store.upsert_account({
         "id": "acct_1",
         "provider_type": "smtp",
-        "from_name": "B2Binsights",
+        "from_name": "Ai Hunter",
         "from_email": "sales@example.com",
         "reply_to": "sales@example.com",
         "smtp_host": "smtp.example.com",
@@ -111,7 +111,7 @@ async def test_scheduler_stops_underperforming_template_sequence(tmp_path: Path,
     store.upsert_account({
         "id": "acct_1",
         "provider_type": "smtp",
-        "from_name": "B2Binsights",
+        "from_name": "Ai Hunter",
         "from_email": "sales@example.com",
         "reply_to": "sales@example.com",
         "smtp_host": "smtp.example.com",

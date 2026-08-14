@@ -10,7 +10,7 @@ def test_email_store_init_and_account_roundtrip(tmp_path: Path):
     store.upsert_account({
         "id": "acct_1",
         "provider_type": "smtp",
-        "from_name": "B2Binsights",
+        "from_name": "Ai Hunter",
         "from_email": "sales@example.com",
         "reply_to": "sales@example.com",
         "smtp_host": "smtp.example.com",
@@ -32,6 +32,72 @@ def test_email_store_init_and_account_roundtrip(tmp_path: Path):
     account = store.get_account("acct_1")
     assert account is not None
     assert account["from_email"] == "sales@example.com"
+
+
+def test_account_sort_order_and_reorder(tmp_path: Path):
+    """Drag-to-reorder in the quotas page relies on `sort_order`.
+
+    - Existing rows default to 0 (ties broken by created_at asc)
+    - `reorder_accounts` rewrites indices so the i-th id in the list has
+      sort_order = i
+    - `next_sort_order` returns MAX(sort_order)+1 so newly created
+      accounts append to the end of the rotation
+    """
+    db_path = tmp_path / "email.db"
+    store = EmailStore(str(db_path))
+    store.init_db()
+
+    base = {
+        "provider_type": "smtp",
+        "from_name": "Ai Hunter",
+        "from_email": "sales@example.com",
+        "reply_to": "sales@example.com",
+        "smtp_host": "smtp.example.com",
+        "smtp_port": 587,
+        "smtp_username": "sales@example.com",
+        "smtp_secret_encrypted": "",
+        "imap_host": "",
+        "imap_port": 993,
+        "imap_username": "",
+        "imap_secret_encrypted": "",
+        "use_tls": 1,
+        "status": "active",
+        "daily_send_limit": 50,
+        "hourly_send_limit": 10,
+        "last_test_at": "",
+        "secrets_ciphertext": b"",
+        "graph_tenant_id": "",
+        "graph_user_principal_name": "",
+    }
+    for i, created_at in enumerate(["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"]):
+        store.upsert_account({
+            **base,
+            "id": f"acct_{i+1}",
+            "from_email": f"a{i+1}@example.com",
+            "created_at": created_at,
+            "updated_at": created_at,
+        })
+    # All three should come back in created_at order (all sort_order=0
+    # tiebreaker), so the rotation list is stable on first load.
+    assert [a["id"] for a in store.list_accounts()] == ["acct_1", "acct_2", "acct_3"]
+
+    # next_sort_order starts at 0 (empty would also be 0, but with rows
+    # all at 0 the next is 1).
+    assert store.next_sort_order() == 1
+
+    # Drag acct_2 to the top, then acct_1 to the bottom.
+    store.reorder_accounts(["acct_2", "acct_3", "acct_1"])
+    assert [a["id"] for a in store.list_accounts()] == ["acct_2", "acct_3", "acct_1"]
+    assert [a["sort_order"] for a in store.list_accounts()] == [0, 1, 2]
+
+    # Duplicates are silently de-duped (defensive).
+    store.reorder_accounts(["acct_1", "acct_1", "acct_2", "acct_3"])
+    assert [a["sort_order"] for a in store.list_accounts()] == [0, 1, 2]
+
+    # Empty list is a no-op.
+    before = [a["sort_order"] for a in store.list_accounts()]
+    store.reorder_accounts([])
+    assert [a["sort_order"] for a in store.list_accounts()] == before
 
 
 def test_message_lifecycle(tmp_path: Path):
@@ -232,3 +298,83 @@ def test_template_performance_uses_custom_thresholds(tmp_path: Path):
     )
     assert summary["tpl_custom"]["status"] == "underperforming"
     assert summary["tpl_custom"]["remaining_capacity"] == 2
+
+
+def test_test_send_log_counts_toward_daily_quota(tmp_path: Path):
+    """The quotas page bar and the scheduler's daily cap both call
+    `count_sent_today_for_account`; that helper now folds in the
+    `email_test_send_log` table so operator-driven test sends burn
+    through the same per-account daily budget as production sends.
+    """
+    db_path = tmp_path / "email.db"
+    store = EmailStore(str(db_path))
+    store.init_db()
+    now_iso = "2026-08-14T10:00:00+00:00"
+    # Empty to start with.
+    assert store.count_sent_today_for_account("acct_a", now_iso=now_iso) == 0
+
+    # A successful test send on `acct_a` ticks the counter by 1.
+    store.record_test_send(
+        account_id="acct_a",
+        to_email="qa@example.com",
+        subject="ping",
+        body_text="body",
+        provider="smtp",
+        provider_message_id="<m1@x>",
+        thread_key="t1",
+        ok=True,
+        failure_reason="",
+        sent_at=now_iso,
+    )
+    assert store.count_sent_today_for_account("acct_a", now_iso=now_iso) == 1
+
+    # A second one stacks.
+    store.record_test_send(
+        account_id="acct_a",
+        to_email="qa@example.com",
+        subject="ping 2",
+        body_text="body",
+        provider="smtp",
+        provider_message_id="<m2@x>",
+        thread_key="t2",
+        ok=True,
+        failure_reason="",
+        sent_at=now_iso,
+    )
+    assert store.count_sent_today_for_account("acct_a", now_iso=now_iso) == 2
+
+    # Failed attempts are recorded for audit but DON'T count toward
+    # the budget — the user might hit a transient SMTP auth error and
+    # we don't want to charge them for it.
+    store.record_test_send(
+        account_id="acct_a",
+        to_email="qa@example.com",
+        subject="ping failed",
+        body_text="body",
+        provider="smtp",
+        provider_message_id="",
+        thread_key="t3",
+        ok=False,
+        failure_reason="smtp_account_incomplete",
+        sent_at=now_iso,
+    )
+    assert store.count_sent_today_for_account("acct_a", now_iso=now_iso) == 2
+
+    # A different account has its own bucket.
+    assert store.count_sent_today_for_account("acct_b", now_iso=now_iso) == 0
+
+    # Old sends (before today's 00:00 UTC) are excluded.
+    yesterday = "2026-08-13T23:59:59+00:00"
+    store.record_test_send(
+        account_id="acct_a",
+        to_email="qa@example.com",
+        subject="yesterday",
+        body_text="body",
+        provider="smtp",
+        provider_message_id="<y@x>",
+        thread_key="t4",
+        ok=True,
+        failure_reason="",
+        sent_at=yesterday,
+    )
+    assert store.count_sent_today_for_account("acct_a", now_iso=now_iso) == 2

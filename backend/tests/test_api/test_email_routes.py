@@ -57,7 +57,7 @@ def test_create_and_start_email_campaign(monkeypatch, tmp_path):
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_provider_type": "smtp",
-        "email_from_name": "B2Binsights",
+        "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
         "email_smtp_host": "smtp.example.com",
@@ -135,7 +135,7 @@ def test_create_campaign_skips_blocked_template(monkeypatch, tmp_path):
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_provider_type": "smtp",
-        "email_from_name": "B2Binsights",
+        "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
         "email_smtp_host": "smtp.example.com",
@@ -213,7 +213,7 @@ def test_create_campaign_skips_unapproved_sequences(monkeypatch, tmp_path):
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_provider_type": "smtp",
-        "email_from_name": "B2Binsights",
+        "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
         "email_smtp_host": "smtp.example.com",
@@ -276,7 +276,7 @@ def test_create_campaign_includes_needs_review_when_approval_not_required(monkey
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_provider_type": "smtp",
-        "email_from_name": "B2Binsights",
+        "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
         "email_smtp_host": "smtp.example.com",
@@ -340,7 +340,7 @@ def test_create_campaign_skips_previously_contacted_lead_email(monkeypatch, tmp_
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_provider_type": "smtp",
-        "email_from_name": "B2Binsights",
+        "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
         "email_smtp_host": "smtp.example.com",
@@ -411,7 +411,7 @@ def test_run_email_reply_check_route(monkeypatch, tmp_path):
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_provider_type": "smtp",
-        "email_from_name": "B2Binsights",
+        "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
         "email_smtp_host": "smtp.example.com",
@@ -472,7 +472,7 @@ def test_create_campaign_requires_smtp_configuration(monkeypatch, tmp_path):
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_provider_type": "smtp",
-        "email_from_name": "B2Binsights",
+        "email_from_name": "Ai Hunter",
         "email_from_address": "",
         "email_reply_to": "",
         "email_smtp_host": "",
@@ -668,7 +668,7 @@ def test_email_routes_require_token_when_configured(monkeypatch, tmp_path):
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_provider_type": "smtp",
-        "email_from_name": "B2Binsights",
+        "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
         "email_smtp_host": "smtp.example.com",

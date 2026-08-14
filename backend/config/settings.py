@@ -5,7 +5,9 @@ import platform
 import sys
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -109,6 +111,15 @@ class Settings(BaseSettings):
     moonshot_api_key: str = ""    # Kimi / Moonshot AI
     minimax_api_key: str = ""
     minimax_api_base: str = "https://api.minimax.io/v1"
+    # Optional custom base URL for OpenAI-compatible providers (OpenAI,
+    # OpenRouter, Groq, Zai, Moonshot, MiniMax, and any local/self-hosted
+    # proxy that speaks the OpenAI /v1/chat/completions schema).
+    # Empty = use each provider's built-in default endpoint.
+    # When set, this overrides OPENAI_API_BASE and ANTHROPIC_API_BASE
+    # (for Anthropic-compatible proxies like one running Claude behind
+    # an OpenAI-shaped gateway).
+    llm_api_base: str = ""
+    email_llm_api_base: str = ""
     email_openai_api_key: str = ""
     email_anthropic_api_key: str = ""
     email_openrouter_api_key: str = ""
@@ -124,7 +135,7 @@ class Settings(BaseSettings):
 
     # --- Email ---
     email_provider_type: str = "smtp"
-    email_from_name: str = "B2Binsights"
+    email_from_name: str = "Ai Hunter"
     email_from_address: str = ""
     email_reply_to: str = ""
     email_smtp_host: str = ""
@@ -147,7 +158,7 @@ class Settings(BaseSettings):
     email_business_hours_end: str = "18:00"
     email_weekdays_only: bool = True
     email_timezone: str = "Asia/Shanghai"
-    email_daily_send_limit: int = 50
+    email_daily_send_limit: int = 20
     email_hourly_send_limit: int = 10
     email_language_mode: str = "auto_by_region"
     email_default_language: str = "en"
@@ -211,6 +222,11 @@ class Settings(BaseSettings):
     automation_alert_interval_seconds: int = 1800
     automation_alert_backlog_threshold: int = 20
     automation_alert_failed_messages_threshold: int = 10
+    # Inbound-reply push notifications. When True (default) and a Feishu
+    # webhook is configured, every reply matched by the scheduler is
+    # pushed to the webhook in a single batched message per poll cycle.
+    # Set to False to silence reply alerts while keeping the in-app bell.
+    automation_reply_notifications_enabled: bool = True
     automation_event_notifications_enabled: bool = True
     automation_discovery_batch_size: int = 5
     automation_send_batch_size: int = 10
@@ -229,6 +245,57 @@ class Settings(BaseSettings):
     # --- File upload ---
     upload_dir: str = _resolve_dir("uploads")
     max_upload_size_mb: int = 50
+
+    # --- Runtime environment (dev | production) ---
+    # When `production` is selected, `cookie_secure` is forced True and trusted_hosts
+    # is restricted to the host portion of `public_base_url` (unless explicitly set).
+    app_env: str = "dev"
+    public_base_url: str = ""
+
+    # --- Auth (server-side sessions + bcrypt + CSRF double-submit) ---
+    session_secret: str = ""           # HMAC key for cookie integrity (itsdangerous)
+    session_cookie_name: str = "aih_session"
+    csrf_cookie_name: str = "aih_csrf"
+    session_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days
+    cookie_secure: bool = False        # auto-True when app_env == "production"
+    cookie_samesite: str = "lax"
+    trusted_hosts: list[str] = ["*"]
+
+    # --- Secrets at rest (Fernet 32-byte url-safe b64 key) ---
+    secrets_encryption_key: str = ""
+
+    # --- Microsoft Graph (Application permission / client_credentials) ---
+    graph_tenant_id: str = ""
+    graph_client_id: str = ""
+    graph_client_secret: str = ""
+    graph_mailbox_upn: str = ""        # shared mailbox, e.g. sales@company.com
+    graph_default_scopes: str = "https://graph.microsoft.com/.default"
+
+    @model_validator(mode="after")
+    def _apply_production_defaults(self) -> "Settings":
+        """In production mode, enforce secure cookies and tighten trusted_hosts.
+
+        The `cookie_secure` override is gated on the env var being
+        explicitly absent: setting `COOKIE_SECURE=false` in the
+        environment keeps cookies usable on plain-HTTP deployments
+        (e.g. behind an nginx reverse-proxy that hasn't been issued a
+        cert yet). Re-enable by unsetting the env var once HTTPS is
+        in place.
+        """
+        if str(self.app_env).lower() == "production":
+            # Only force `cookie_secure = True` if the env var wasn't
+            # explicitly set. pydantic-settings populates the field
+            # from env before this validator runs, so checking
+            # `os.environ` is a reliable "did the user ask for false?"
+            # signal.
+            if "COOKIE_SECURE" not in os.environ:
+                self.cookie_secure = True
+            if not self.trusted_hosts or self.trusted_hosts == ["*"]:
+                if self.public_base_url:
+                    host = urlparse(self.public_base_url).hostname or ""
+                    if host:
+                        self.trusted_hosts = [host]
+        return self
 
 
 @lru_cache
