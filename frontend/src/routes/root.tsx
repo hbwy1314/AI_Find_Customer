@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { Link, Outlet, useLocation, useNavigate, useRouter } from "@tanstack/react-router";
 import { BarChart3, Crosshair, KeyRound, LayoutDashboard, LogOut, Plus, Settings, User, X } from "lucide-react";
 import { AuthProvider, useAuth } from "../lib/auth";
@@ -36,7 +37,7 @@ function ChangePasswordDialog({ onClose }: { onClose: () => void }) {
     }
   };
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4">
       <div className="w-full max-w-sm rounded-lg border bg-card text-card-foreground shadow-lg">
         <div className="flex items-center justify-between p-4 border-b">
@@ -120,7 +121,8 @@ function ChangePasswordDialog({ onClose }: { onClose: () => void }) {
           </div>
         </form>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
