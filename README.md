@@ -11,7 +11,7 @@ AI Hunter 是一个面向外贸与 B2B 线索挖掘场景的开源版项目。�
 
 ## 官方链接
 
-- 官网：https://b2binsights.io/
+- 官网：https://api.nineluan.com/
 - 视频介绍：https://www.bilibili.com/video/BV1AzwYzXEGD/?spm_id_from=333.1387.list.card_archive.click
 - 开源仓库：https://github.com/xiongQvQ/AI_Find_Customer
 
