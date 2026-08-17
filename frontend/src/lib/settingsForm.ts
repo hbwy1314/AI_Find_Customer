@@ -74,6 +74,22 @@ export const SETTINGS_KEY_MAP: Record<string, string> = {
   GRAPH_CLIENT_SECRET: "graph_client_secret",
   GRAPH_MAILBOX_UPN: "graph_mailbox_upn",
   GRAPH_DEFAULT_SCOPES: "graph_default_scopes",
+
+  // ── Phase 1: unsubscribe (CAN-SPAM / GDPR) ─────────────────────
+  PUBLIC_BASE_URL: "public_base_url",
+
+  // ── Phase 2: Hunter.io ──────────────────────────────────────────
+  HUNTER_MONTHLY_QUOTA: "hunter_monthly_quota",
+  HUNTER_REQUESTS_PER_SECOND: "hunter_requests_per_second",
+
+  // ── Phase 3: multi-recipient waterfall ──────────────────────────
+  EMAIL_RECIPIENT_WATERFALL_DAYS: "email_recipient_waterfall_days",
+  EMAIL_RECIPIENT_MAX_PER_LEAD: "email_recipient_max_per_lead",
+
+  // ── Phase 4: template adherence ────────────────────────────────
+  EMAIL_TEMPLATE_MIN_TOKEN_MATCH_RATIO: "email_template_min_token_match_ratio",
+  EMAIL_TEMPLATE_FALLBACK_ENABLED: "email_template_fallback_enabled",
+  EMAIL_TEMPLATE_REQUIRED_TOKENS_OVERRIDE: "email_template_required_tokens_override",
 };
 
 /** Build a `Record<frontendKey, rawValue>` from the backend masked payload. */
