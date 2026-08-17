@@ -5,6 +5,7 @@ import { DashboardPage } from "./dashboard";
 import { NewHuntPage } from "./new-hunt";
 import { HuntDetailPage } from "./hunt-detail";
 import { AutomationJobPage } from "./automation-job";
+import { SettingsLayout } from "./settings-layout";
 import { SettingsPage } from "./settings";
 import { LLMSettingsPage } from "./settings-llm";
 import { SmtpSettingsPage } from "./settings-smtp";
@@ -72,58 +73,72 @@ const automationJobRoute = createRoute({
   component: AutomationJobPage,
 });
 
-const settingsRoute = createRoute({
+const settingsLayoutRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings",
+  component: SettingsLayout,
+});
+
+// Settings hub: shows status row + nav card grid. The hub nav points
+// to the child routes below, which render in <Outlet /> on the right.
+const settingsIndexRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "/",
   component: SettingsPage,
 });
 
 const llmSettingsRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/settings/llm",
+  getParentRoute: () => settingsLayoutRoute,
+  path: "/llm",
   component: LLMSettingsPage,
 });
 
 const smtpSettingsRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/settings/smtp",
+  getParentRoute: () => settingsLayoutRoute,
+  path: "/smtp",
   component: SmtpSettingsPage,
 });
 
 const graphSettingsRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/settings/graph",
+  getParentRoute: () => settingsLayoutRoute,
+  path: "/graph",
   component: GraphSettingsPage,
 });
 
 const searchSettingsRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/settings/search",
+  getParentRoute: () => settingsLayoutRoute,
+  path: "/search",
   component: SearchSettingsPage,
 });
 
 const notificationsSettingsRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/settings/notifications",
+  getParentRoute: () => settingsLayoutRoute,
+  path: "/notifications",
   component: NotificationsSettingsPage,
 });
 
 const performanceSettingsRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/settings/performance",
+  getParentRoute: () => settingsLayoutRoute,
+  path: "/performance",
   component: PerformanceSettingsPage,
 });
 
 const emailTestRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/settings/email-test",
+  getParentRoute: () => settingsLayoutRoute,
+  path: "/email-test",
   component: EmailTestPage,
 });
 
 const workflowSettingsRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/settings/workflow",
+  getParentRoute: () => settingsLayoutRoute,
+  path: "/workflow",
   component: WorkflowSettingsPage,
+});
+
+const connectedMailboxesRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "/mailboxes",
+  component: MailboxesPlaceholder,
 });
 
 // Placeholders for routes already linked from the nav / hub
@@ -148,12 +163,6 @@ const quotasRoute = createRoute({
   component: QuotasPlaceholder,
 });
 
-const connectedMailboxesRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/settings/mailboxes",
-  component: MailboxesPlaceholder,
-});
-
 export const routeTree = rootRoute.addChildren([
   indexRoute,
   loginRoute,
@@ -162,15 +171,17 @@ export const routeTree = rootRoute.addChildren([
   huntDetailRoute,
   automationJobRoute,
   quotasRoute,
-  settingsRoute,
-  llmSettingsRoute,
-  smtpSettingsRoute,
-  graphSettingsRoute,
-  searchSettingsRoute,
-  notificationsSettingsRoute,
-  performanceSettingsRoute,
-  emailTestRoute,
-  workflowSettingsRoute,
-  connectedMailboxesRoute,
+  settingsLayoutRoute.addChildren([
+    settingsIndexRoute,
+    llmSettingsRoute,
+    smtpSettingsRoute,
+    graphSettingsRoute,
+    searchSettingsRoute,
+    notificationsSettingsRoute,
+    performanceSettingsRoute,
+    emailTestRoute,
+    workflowSettingsRoute,
+    connectedMailboxesRoute,
+  ]),
 ]);
 
