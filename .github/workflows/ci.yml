@@ -57,6 +57,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Move any local untracked working-tree files out of the way so
+      # the linter and the tests see only what's actually in the
+      # repository. The runner is ephemeral — we don't bother popping
+      # the stash afterwards.
+      - name: Stash untracked WIP
+        run: git stash --include-untracked --message "ci-temp-stash" || true
+
       - name: Lint (ruff)
         run: |
           pip install ruff
