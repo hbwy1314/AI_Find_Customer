@@ -110,6 +110,46 @@ def _extract_hunt_id_from_error(message: str) -> str:
     return str(match.group(1)) if match else ""
 
 
+# Markers that signal a non-retryable failure: configuration is missing or
+# the request itself is invalid. Retrying with the same payload will keep
+# failing forever, so the consumer must mark the job failed instead of
+# requeuing it. A leading "4xx" (HTTP 4xx raised as a string) is the
+# strongest signal — that's how `create_email_campaign` and similar
+# endpoints surface permanent validation errors today.
+_NON_RETRYABLE_ERROR_MARKERS: tuple[str, ...] = (
+    "4xx:",
+    "400:",
+    "401:",
+    "403:",
+    "404:",
+    "409:",
+    "422:",
+    "not configured",
+    "missing:",
+    "is required",
+    "validationerror",
+    "invalid api key",
+    "unauthorized",
+)
+
+
+def _is_non_retryable_automation_error(exc: BaseException) -> bool:
+    """Return True if the exception is permanent (no point retrying)."""
+    message = str(exc or "")
+    if not message:
+        return False
+    lowered = message.lower()
+    for marker in _NON_RETRYABLE_ERROR_MARKERS:
+        if marker in lowered:
+            return True
+    # Last resort: look at the exception type name itself (e.g. ValueError,
+    # KeyError) which we treat as caller bugs that won't be fixed by retry.
+    type_name = type(exc).__name__.lower()
+    if type_name in {"valueerror", "keyerror", "typeerror", "attributeerror"}:
+        return True
+    return False
+
+
 def _embedded_consumer_enabled(settings) -> bool:
     # TestClient/pytest should not mutate the operator's real queue DB.
     if os.environ.get("PYTEST_CURRENT_TEST"):
@@ -316,6 +356,15 @@ async def _run_embedded_consumer_job(args: Namespace, payload: dict[str, object]
             poll_seconds=int(args.status_poll_seconds),
             should_cancel=cancel_check,
         )
+        if str(status.get("status", "")) == "cancelled":
+            # The hunt was cancelled (via the job cancel route or the
+            # hunt detail page). Don't raise RuntimeError — that path
+            # treats the failure as retryable and burns attempts.
+            # JobCancelledError is caught by the outer handler and ends
+            # the loop without requeueing.
+            raise JobCancelledError(
+                f"queue job cancelled while waiting for hunt {hunt_id}"
+            )
         if str(status.get("status", "")) != "completed":
             raise RuntimeError(f"hunt {hunt_id} failed: {status.get('error', 'unknown error')}")
 
@@ -472,10 +521,28 @@ async def _run_automation_consumer_once() -> bool:
     except Exception as exc:
         attempts_used = int(job.get("attempt_count", 0) or 0)
         max_attempts = max(1, int(getattr(settings, "automation_consumer_max_attempts", 5) or 5))
-        if attempts_used >= max_attempts:
-            # Permanent failures (e.g. an endpoint 400/409) must not
-            # requeue forever — the attempt budget is exhausted, so mark
-            # the job failed and surface the error in the console.
+        # Non-retryable errors (missing config, validation failures, etc.)
+        # fail the same way every time — requeueing just wastes attempts
+        # and burns the user's quota. Mark them failed immediately and
+        # surface the error.
+        if _is_non_retryable_automation_error(exc):
+            queue.mark_failed(
+                job_id,
+                error_message=f"non-retryable: {exc}",
+                finished_at=_now_iso(),
+            )
+            update_worker_state(
+                "consumer",
+                active_job_id="",
+                last_activity_at=_now_iso(),
+                last_error=str(exc),
+            )
+            logger.error(
+                "[AutomationConsumer] job=%s marked failed (non-retryable): %s",
+                job_id[:8], exc,
+            )
+        elif attempts_used >= max_attempts:
+            # Transient errors that exhausted the attempt budget.
             queue.mark_failed(
                 job_id,
                 error_message=f"stopped after {attempts_used} attempts: {exc}",
