@@ -78,7 +78,6 @@ jobs:
         env:
           # CI environment — never let tests talk to a real DB / SMTP / API.
           APP_ENV: test
-          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         run: |
           python -m pytest -x --tb=short -m "not live" --maxfail=5
 
