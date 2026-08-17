@@ -24,9 +24,6 @@ from agents.search_agent import search_node
 from api.hunt_store import load_all_hunts, now_iso, save_hunt
 from api.security import require_api_access
 from config.settings import get_settings
-from emailing.imap_client import search_recent_replies
-from emailing.readiness import ensure_imap_ready, ensure_imap_tested, ensure_smtp_ready
-from emailing.smtp_client import send_smtp_email
 from emailing.template_pipeline import compose_template_plan, extract_template_profile
 from graph.builder import build_graph
 from graph.evaluate import _build_keyword_performance, evaluate_progress, should_continue_hunting
@@ -441,9 +438,10 @@ async def _scan_hunt_replies() -> None:
     if not bool(settings.email_reply_detection_enabled):
         return
     try:
-        ensure_imap_tested(settings)
+        from emailing.readiness import ensure_graph_tested
+        ensure_graph_tested(settings)
     except ValueError as exc:
-        logger.debug("[ReplyDetection] Skipping automated reply scan because IMAP is not verified: %s", exc)
+        logger.debug("[ReplyDetection] Skipping automated reply scan because Graph is not verified: %s", exc)
         return
 
     for hunt_id, hunt in list(_hunts.items()):
@@ -468,9 +466,30 @@ async def _scan_hunt_replies() -> None:
 
             previous_count = int(((sequence.get("reply_detection") or {}).get("reply_count", 0)) or 0)
             try:
-                replies = await asyncio.to_thread(search_recent_replies, settings, from_address=recipient)
+                from emailing import graph_client
+                from emailing.reply_detector import run_graph_reply_detection_once
+                # We use the canonical reply-detection loop which handles
+                # per-account UPNs and auto-reply filtering. The result's
+                # ``matches`` already carries the recipient-side info we
+                # need to surface to the SSE bell.
+                from emailing.store import EmailStore
+                store = EmailStore(settings.email_db_path)
+                store.init_db()
+                reply_result = await run_graph_reply_detection_once(store, None, recent_days=1, limit=50)
+                matches = reply_result.get("matches", []) or []
+                # Filter to replies for this recipient (the matches list
+                # contains the lead_email).
+                replies = [
+                    {
+                        "subject": m.get("subject", ""),
+                        "from_email": m.get("lead_email", ""),
+                        "snippet": m.get("snippet", ""),
+                    }
+                    for m in matches
+                    if str(m.get("lead_email", "")).strip().lower() == recipient.strip().lower()
+                ]
             except Exception as exc:
-                logger.debug("[ReplyDetection] IMAP scan failed for %s: %s", recipient, exc)
+                logger.debug("[ReplyDetection] Graph scan failed for %s: %s", recipient, exc)
                 continue
 
             sequence["reply_detection"] = {
@@ -1218,7 +1237,7 @@ async def send_email_sequence_draft(
     sequence_index: int,
     request: SendEmailDraftRequest,
 ):
-    """Send a specific draft from an approved email sequence via SMTP."""
+    """Send a specific draft from an approved email sequence via Microsoft Graph."""
     if hunt_id not in _hunts:
         raise HTTPException(status_code=404, detail="Hunt not found")
 
@@ -1249,24 +1268,32 @@ async def send_email_sequence_draft(
         raise HTTPException(status_code=404, detail="Requested draft not found")
 
     settings = get_settings()
+    from emailing.readiness import ensure_outbound_ready
     try:
-        ensure_smtp_ready(settings)
+        ensure_outbound_ready(settings)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    try:
-        send_result = await asyncio.to_thread(
-            send_smtp_email,
-            settings,
-            to_address=recipient,
-            subject=str(draft.get("subject", "") or ""),
-            body_text=str(draft.get("body_text", "") or ""),
+    from emailing.store import EmailStore
+    store = EmailStore(settings.email_db_path)
+    store.init_db()
+    account = store.get_account("default") or {}
+    from emailing import email_sender
+    send_result = await email_sender.send_email(
+        account,
+        to_email=recipient,
+        subject=str(draft.get("subject", "") or ""),
+        body_text=str(draft.get("body_text", "") or ""),
+    )
+    if not send_result.get("ok"):
+        raise HTTPException(
+            status_code=502,
+            detail=send_result.get("error") or "Graph send failed",
         )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     draft["send_status"] = "sent"
-    draft["sent_at"] = now_iso()
+    draft["sent_at"] = send_result.get("sent_at") or now_iso()
     draft["sent_to"] = recipient
+    draft["provider_message_id"] = send_result.get("provider_message_id", "")
     hunt["result"] = result
     save_hunt(hunt_id, hunt)
 
@@ -1276,7 +1303,7 @@ async def send_email_sequence_draft(
         sequence_number=request.sequence_number,
         sent_to=recipient,
         subject=str(draft.get("subject", "") or ""),
-        status=send_result["status"],
+        status=send_result.get("status") or "ok",
     )
 
 
@@ -1289,7 +1316,7 @@ async def detect_email_sequence_replies(
     hunt_id: str,
     sequence_index: int,
 ):
-    """Check IMAP inbox for replies from the lead's email address."""
+    """Check the Graph inbox for replies from the lead's email address."""
     if hunt_id not in _hunts:
         raise HTTPException(status_code=404, detail="Hunt not found")
 
@@ -1309,12 +1336,27 @@ async def detect_email_sequence_replies(
         raise HTTPException(status_code=422, detail="No recipient email found on this lead")
 
     settings = get_settings()
+    from emailing.readiness import ensure_inbound_ready
     try:
-        ensure_imap_ready(settings)
+        ensure_inbound_ready(settings)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     try:
-        replies = await asyncio.to_thread(search_recent_replies, settings, from_address=recipient)
+        from emailing.store import EmailStore
+        from emailing.reply_detector import run_graph_reply_detection_once
+        store = EmailStore(settings.email_db_path)
+        store.init_db()
+        reply_result = await run_graph_reply_detection_once(store, None, recent_days=14, limit=50)
+        matches = reply_result.get("matches", []) or []
+        replies = [
+            {
+                "subject": m.get("subject", ""),
+                "from_email": m.get("lead_email", ""),
+                "snippet": m.get("snippet", ""),
+            }
+            for m in matches
+            if str(m.get("lead_email", "")).strip().lower() == recipient.strip().lower()
+        ]
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

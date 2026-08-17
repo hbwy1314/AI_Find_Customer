@@ -1,10 +1,16 @@
-"""Detect inbound email replies via IMAP polling."""
+"""Detect inbound email replies via Microsoft Graph.
+
+The legacy IMAP polling path has been removed. The Graph fetcher
+(`graph_client.fetch_graph_replies`) and the shared
+`process_inbound_messages` reply-matching loop are the only supported
+flow. Per-account ``provider_type`` is coerced to ``"graph"`` at read
+time so old rows that still say ``"smtp"`` keep working.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import email
-import imaplib
 import uuid
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
@@ -12,7 +18,6 @@ from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any, Callable
 
 from api.hunt_store import load_hunt, save_hunt
-from auth import secrets as secret_cipher
 from emailing.store import EmailStore
 
 _AUTO_REPLY_SUBJECT_MARKERS = (
@@ -69,7 +74,7 @@ def _extract_message_ids(header_value: str) -> list[str]:
     text = str(header_value or "").strip()
     if not text:
         return []
-    ids = []
+    ids: list[str] = []
     for token in text.replace(",", " ").split():
         normalized = _normalize_message_id(token)
         if normalized:
@@ -98,106 +103,59 @@ def _normalize_subject(subject: str) -> str:
                 text = text[len(prefix):].strip()
                 changed = True
                 break
-    return " ".join(text.split())
+    return text
 
 
-def _extract_snippet(message: email.message.Message) -> str:
-    if message.is_multipart():
-        for part in message.walk():
-            if part.get_content_type() == "text/plain":
-                payload = part.get_payload(decode=True) or b""
-                charset = part.get_content_charset() or "utf-8"
-                return payload.decode(charset, errors="replace").strip()[:500]
-    payload = message.get_payload(decode=True) or b""
-    charset = message.get_content_charset() or "utf-8"
-    return payload.decode(charset, errors="replace").strip()[:500]
-
-
-def _received_at(message: email.message.Message, fallback_iso: str) -> str:
-    raw_date = message.get("Date", "")
-    if not raw_date:
-        return fallback_iso
+def _received_at(parsed: email.message.Message, fallback: str) -> str:
+    raw = parsed.get("Date", "")
+    if not raw:
+        return fallback
     try:
-        dt = parsedate_to_datetime(raw_date)
+        dt = parsedate_to_datetime(raw)
+        if dt is None:
+            return fallback
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc).isoformat()
     except Exception:
-        return fallback_iso
+        return fallback
 
 
-def _refresh_hunt_email_summary(store: EmailStore, hunt_id: str, campaign_id: str) -> None:
-    hunt = load_hunt(hunt_id)
-    if not hunt:
-        return
-    campaign = store.get_campaign(campaign_id)
-    sequences = store.list_sequences_for_campaign(campaign_id)
-    result = hunt.setdefault("result", {})
-    result["email_campaign_summary"] = {
-        "campaign_id": campaign_id,
-        "status": campaign.get("status", "draft") if campaign else "draft",
-        "sequences_total": len(sequences),
-        "sent_count": store.count_messages_for_campaign(campaign_id, status="sent"),
-        "failed_count": store.count_messages_for_campaign(campaign_id, status="failed"),
-        "pending_count": store.count_messages_for_campaign(campaign_id, status="pending"),
-        "replied_count": sum(1 for seq in sequences if seq.get("status") == "replied"),
-    }
-    save_hunt(hunt_id, hunt)
-
-
-def _match_sent_message(store: EmailStore, inbound: dict[str, Any]) -> dict[str, Any] | None:
-    # Graph replies carry a stable `conversationId` that beats In-Reply-To.
-    conversation_id = str(inbound.get("conversation_id", "") or "").strip()
-    if conversation_id:
-        # thread_key was set to the Graph conversationId on send; we look it up
-        # via the provider_message_id index first, then by scanning thread_key
-        # (cheap because the table is small per campaign).
-        matched = store.find_message_by_thread_key(conversation_id)
-        if matched:
-            return matched
-
-    candidates = []
-    in_reply_to = _normalize_message_id(str(inbound.get("in_reply_to", "") or ""))
-    if in_reply_to:
-        candidates.append(in_reply_to)
-    for ref in inbound.get("references", []) or []:
-        normalized = _normalize_message_id(str(ref or ""))
-        if normalized:
-            candidates.append(normalized)
-    for message_id in candidates:
-        matched = store.find_message_by_provider_message_id(message_id)
-        if matched:
-            return matched
-
-    from_email = str(inbound.get("from_email", "") or "").strip().lower()
-    normalized_subject = _normalize_subject(str(inbound.get("subject", "") or ""))
-    if from_email and normalized_subject:
-        return store.find_sent_message_by_lead_email_and_subject(from_email, normalized_subject)
-    return None
+def _extract_snippet(parsed: email.message.Message, max_chars: int = 280) -> str:
+    body = parsed.get_body(preferencelist=("plain", "html"))
+    text = ""
+    if body is not None:
+        try:
+            text = body.get_content() if hasattr(body, "get_content") else str(body)
+        except Exception:
+            text = str(body.get_payload(decode=True) or "")
+    if not text:
+        payload = parsed.get_payload(decode=True) or b""
+        if isinstance(payload, bytes):
+            text = payload.decode("utf-8", errors="replace")
+    text = str(text or "").strip()
+    if len(text) > max_chars:
+        text = text[: max_chars - 1] + "…"
+    return text
 
 
 def _is_auto_reply(inbound: dict[str, Any]) -> bool:
-    from_email = str(inbound.get("from_email", "") or "").strip().lower()
-    if from_email and "@" in from_email:
-        local = from_email.split("@", 1)[0]
-        if local in _AUTO_REPLY_LOCAL_PARTS:
-            return True
-
-    subject = _normalize_subject(str(inbound.get("subject", "") or "")).lower()
+    subject = str(inbound.get("subject", "") or "").lower()
+    snippet = str(inbound.get("snippet", "") or "").lower()
     if any(marker in subject for marker in _AUTO_REPLY_SUBJECT_MARKERS):
         return True
-
-    snippet = str(inbound.get("snippet", "") or "").strip().lower()
     if any(marker in snippet for marker in _AUTO_REPLY_SNIPPET_MARKERS):
         return True
-
-    headers = {str(k).lower(): str(v).lower() for k, v in (inbound.get("headers", {}) or {}).items()}
-    auto_submitted = headers.get("auto-submitted", "")
-    precedence = headers.get("precedence", "")
-    x_autoreply = headers.get("x-autoreply", "")
-    x_autorespond = headers.get("x-autorespond", "")
-    x_failed_recipients = headers.get("x-failed-recipients", "")
-
+    from_email = str(inbound.get("from_email", "") or "").strip().lower()
+    local = from_email.split("@", 1)[0] if "@" in from_email else from_email
+    if local in _AUTO_REPLY_LOCAL_PARTS:
+        return True
+    headers = inbound.get("headers") or {}
+    auto_submitted = str(headers.get("Auto-Submitted", "") or "").strip().lower()
+    precedence = str(headers.get("Precedence", "") or "").strip().lower()
+    x_autoreply = str(headers.get("X-Autoreply", "") or "").strip().lower()
+    x_autorespond = str(headers.get("X-Autorespond", "") or "").strip().lower()
+    x_failed_recipients = str(headers.get("X-Failed-Recipients", "") or "").strip().lower()
     if auto_submitted and auto_submitted != "no":
         return True
     if precedence in {"bulk", "junk", "list", "auto_reply"}:
@@ -207,67 +165,6 @@ def _is_auto_reply(inbound: dict[str, Any]) -> bool:
     return False
 
 
-def fetch_imap_replies(account: dict[str, Any], *, now_iso: str, recent_days: int = 14) -> list[dict[str, Any]]:
-    """Fetch recent inbound messages from IMAP for reply matching."""
-    host = str(account.get("imap_host", "") or "").strip()
-    username = str(account.get("imap_username", "") or "").strip()
-    secrets = secret_cipher.decrypt_dict(account.get("secrets_ciphertext") or b"")
-    password = secrets.get("imap_secret", "") or str(account.get("imap_secret_encrypted", "") or "")
-    port = int(account.get("imap_port", 993) or 993)
-    use_tls = bool(account.get("use_tls", True))
-    if not host or not username or not password:
-        return []
-
-    mailbox: imaplib.IMAP4 = imaplib.IMAP4_SSL(host, port) if use_tls else imaplib.IMAP4(host, port)
-    messages: list[dict[str, Any]] = []
-    try:
-        mailbox.login(username, password)
-        mailbox.select("INBOX")
-        since = (datetime.fromisoformat(now_iso.replace("Z", "+00:00")) - timedelta(days=recent_days)).strftime("%d-%b-%Y")
-        status, data = mailbox.search(None, "SINCE", since)
-        if status != "OK":
-            return []
-        message_nums = data[0].split()[-100:]
-        for num in message_nums:
-            status, parts = mailbox.fetch(num, "(RFC822)")
-            if status != "OK":
-                continue
-            raw_email = b""
-            for part in parts:
-                if isinstance(part, tuple):
-                    raw_email += part[1]
-            if not raw_email:
-                continue
-            parsed = email.message_from_bytes(raw_email)
-            addresses = getaddresses([parsed.get("From", "")])
-            from_email = addresses[0][1].strip().lower() if addresses else ""
-            message_id = _normalize_message_id(parsed.get("Message-ID", ""))
-            raw_ref = message_id or f"imap:{num.decode()}"
-            messages.append({
-                "raw_ref": raw_ref,
-                "message_id": message_id,
-                "from_email": from_email,
-                "subject": _decode_header_value(parsed.get("Subject", "")),
-                "in_reply_to": parsed.get("In-Reply-To", ""),
-                "references": _extract_message_ids(parsed.get("References", "")),
-                "received_at": _received_at(parsed, now_iso),
-                "snippet": _extract_snippet(parsed),
-                "headers": {
-                    "Auto-Submitted": parsed.get("Auto-Submitted", ""),
-                    "Precedence": parsed.get("Precedence", ""),
-                    "X-Autoreply": parsed.get("X-Autoreply", ""),
-                    "X-Autorespond": parsed.get("X-Autorespond", ""),
-                    "X-Failed-Recipients": parsed.get("X-Failed-Recipients", ""),
-                },
-            })
-    finally:
-        try:
-            mailbox.logout()
-        except Exception:
-            pass
-    return messages
-
-
 def process_inbound_messages(
     store: EmailStore,
     inbound_messages: list[dict[str, Any]],
@@ -275,9 +172,9 @@ def process_inbound_messages(
 ) -> dict[str, Any]:
     """Run the reply-matching loop over a pre-fetched inbound list.
 
-    Shared by the IMAP path (`run_reply_detection_once`) and the Graph
-    path (`run_graph_reply_detection_once`) so both providers apply the
-    exact same dedup / auto-reply filtering / sequence-stopping logic.
+    Used by the Graph fetcher (`run_graph_reply_detection_once`) so all
+    inbound mail, regardless of mailbox, applies the same dedup /
+    auto-reply filtering / sequence-stopping logic.
 
     Returns a dict with `checked / matched / skipped / ignored` counts
     plus a `matches` list of dicts suitable for `render_reply_detected_text`:
@@ -349,14 +246,14 @@ def process_inbound_messages(
         # Capture what we need for a Feishu push notification. The
         # caller decides whether to actually send one (gated by
         # `automation_reply_notifications_enabled`).
-        _from_email = str(inbound.get("from_email", "") or "")
-        _subject = str(inbound.get("subject", "") or "")
-        _snippet = str(inbound.get("snippet", "") or "")
+        from_email = str(inbound.get("from_email", "") or "")
+        subject = str(inbound.get("subject", "") or "")
+        snippet = str(inbound.get("snippet", "") or "")
         matched_details.append({
-            "lead_email": _from_email,
+            "lead_email": from_email,
             "lead_name": str(sequence.get("lead_name", "") or ""),
-            "subject": _subject,
-            "snippet": _snippet,
+            "subject": subject,
+            "snippet": snippet,
         })
         # SSE push so the browser bell updates without waiting for the
         # 30s poll. Best-effort: never raise out of the detection loop.
@@ -367,9 +264,9 @@ def process_inbound_messages(
                 "sequence_id": str(sequence["id"]),
                 "hunt_id": str(sequence.get("hunt_id", "") or ""),
                 "campaign_id": str(sequence.get("campaign_id", "") or ""),
-                "from_email": _from_email,
-                "subject": _subject,
-                "snippet": _snippet,
+                "from_email": from_email,
+                "subject": subject,
+                "snippet": snippet,
                 "received_at": received_at,
             })
         except Exception:
@@ -390,23 +287,6 @@ def process_inbound_messages(
     }
 
 
-async def run_reply_detection_once(
-    store: EmailStore,
-    account: dict[str, Any],
-    *,
-    now_iso: str | None = None,
-    fetcher: Callable[..., list[dict[str, Any]]] = fetch_imap_replies,
-) -> dict[str, Any]:
-    """Poll an IMAP inbox once, match replies to sent messages, stop follow-ups.
-
-    This is the SMTP-provider entry point. For the Graph provider use
-    `run_graph_reply_detection_once` instead.
-    """
-    current = now_iso or _now_iso()
-    inbound_messages = await asyncio.to_thread(fetcher, account, now_iso=current)
-    return process_inbound_messages(store, inbound_messages, current)
-
-
 async def run_graph_reply_detection_once(
     store: EmailStore,
     account: dict[str, Any] | None = None,
@@ -417,10 +297,10 @@ async def run_graph_reply_detection_once(
 ) -> dict[str, Any]:
     """Poll a Graph mailbox once and match replies to sent messages.
 
-    Graph-provider counterpart of `run_reply_detection_once`. With
-    `account=None` it polls the global shared mailbox (`GRAPH_MAILBOX_UPN`);
-    pass a connected account row to poll that account's own mailbox —
-    replies land in whichever mailbox did the sending.
+    With ``account=None`` it polls the global shared mailbox
+    (``GRAPH_MAILBOX_UPN``); pass a connected account row to poll that
+    account's own mailbox — replies land in whichever mailbox did the
+    sending.
     """
     from emailing import graph_client
 
@@ -429,3 +309,89 @@ async def run_graph_reply_detection_once(
         account, now_iso=current, recent_days=recent_days, limit=limit
     )
     return process_inbound_messages(store, inbound_messages, current)
+
+
+# Backward-compat alias: the legacy IMAP path exposed this signature
+# so the test suite (and any older caller) can still pass a custom
+# `fetcher` to inject reply messages. In production this always
+# falls through to the Graph fetcher, but the test seam is preserved
+# so the matching logic stays covered.
+async def run_reply_detection_once(
+    store: EmailStore,
+    account: dict[str, Any] | None = None,
+    *,
+    now_iso: str | None = None,
+    fetcher: Callable[..., list[dict[str, Any]]] | None = None,
+    recent_days: int = 14,
+    limit: int = 100,
+    **_: Any,
+) -> dict[str, Any]:
+    if fetcher is not None:
+        # IMAP-style test seam: call the provided fetcher and run the
+        # shared reply-matching loop on its output. This is only used
+        # by tests; production code goes through run_graph_reply_detection_once.
+        current = now_iso or _now_iso()
+        inbound_messages = await asyncio.to_thread(
+            fetcher, account or {}, now_iso=current
+        )
+        return process_inbound_messages(store, inbound_messages, current)
+    return await run_graph_reply_detection_once(
+        store,
+        account,
+        now_iso=now_iso,
+        recent_days=recent_days,
+        limit=limit,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared with the scheduler / hunt store. Kept here so the Graph
+# and (legacy) IMAP paths can both call them.
+# ---------------------------------------------------------------------------
+
+def _match_sent_message(store: EmailStore, inbound: dict[str, Any]) -> dict[str, Any] | None:
+    # Walk the message-id / in-reply-to / references chain to find the
+    # sent message that this reply is for. If nothing matches, fall
+    # back to a (lead_email, subject) lookup which is threading-
+    # tolerant (strips Re:/Fwd: prefixes, case-insensitive).
+    candidates: list[str] = []
+    message_id = _normalize_message_id(str(inbound.get("message_id", "") or ""))
+    if message_id:
+        candidates.append(message_id)
+    in_reply_to = _normalize_message_id(str(inbound.get("in_reply_to", "") or ""))
+    if in_reply_to:
+        candidates.append(in_reply_to)
+    for ref in inbound.get("references", []) or []:
+        normalized = _normalize_message_id(str(ref or ""))
+        if normalized:
+            candidates.append(normalized)
+    for mid in candidates:
+        matched = store.find_message_by_provider_message_id(mid)
+        if matched:
+            return matched
+
+    from_email = str(inbound.get("from_email", "") or "").strip().lower()
+    normalized_subject = _normalize_subject(str(inbound.get("subject", "") or ""))
+    if from_email and normalized_subject:
+        return store.find_sent_message_by_lead_email_and_subject(from_email, normalized_subject)
+    return None
+
+
+def _refresh_hunt_email_summary(store: EmailStore, hunt_id: str, campaign_id: str) -> None:
+    """Recompute hunt-level email counters and persist the hunt JSON."""
+    hunt = load_hunt(hunt_id)
+    if not hunt:
+        return
+    campaign = store.get_campaign(campaign_id)
+    sequences = store.list_sequences_for_campaign(campaign_id)
+    result = hunt.setdefault("result", {})
+    result["email_campaign_summary"] = {
+        "campaign_id": campaign_id,
+        "status": campaign.get("status", "draft") if campaign else "draft",
+        "sequences_total": len(sequences),
+        "sent_count": store.count_messages_for_campaign(campaign_id, status="sent"),
+        "failed_count": store.count_messages_for_campaign(campaign_id, status="failed"),
+        "pending_count": store.count_messages_for_campaign(campaign_id, status="pending"),
+        "replied_count": sum(1 for seq in sequences if seq.get("status") == "replied"),
+    }
+    save_hunt(hunt_id, hunt)

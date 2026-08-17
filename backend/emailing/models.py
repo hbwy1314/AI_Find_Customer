@@ -7,26 +7,30 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class EmailAccount:
+    """Per-account send/receive config.
+
+    All outbound and inbound mail flows through Microsoft Graph, so
+    the SMTP/IMAP fields are gone. The corresponding columns remain
+    in the SQLite schema for backward compat (existing rows are
+    read with default empty values) but no new code touches them.
+    """
     id: str
     provider_type: str
     from_name: str
     from_email: str
     reply_to: str
-    smtp_host: str
-    smtp_port: int
-    smtp_username: str
-    smtp_secret_encrypted: str
-    imap_host: str
-    imap_port: int
-    imap_username: str
-    imap_secret_encrypted: str
-    use_tls: bool
-    status: str
-    daily_send_limit: int
-    hourly_send_limit: int
-    last_test_at: str
-    created_at: str
-    updated_at: str
+    # Graph fields (per-account overrides; the global
+    # ``GRAPH_*`` settings are used when these are empty)
+    graph_tenant_id: str = ""
+    graph_client_id: str = ""
+    graph_client_secret_encrypted: str = ""
+    graph_user_principal_name: str = ""
+    status: str = "active"
+    daily_send_limit: int = 0
+    hourly_send_limit: int = 0
+    last_test_at: str = ""
+    created_at: str = ""
+    updated_at: str = ""
 
 
 @dataclass(slots=True)

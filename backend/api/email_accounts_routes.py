@@ -1,18 +1,21 @@
 """CRUD routes for `email_accounts` (multi-account per user).
 
+All accounts use Microsoft Graph for both send and receive. The
+SMTP/IMAP fields are gone from the public API. Existing DB rows
+that still have ``provider_type='smtp'`` are coerced to ``'graph'``
+at read time so no migration is required.
+
 Endpoints:
   GET    /api/v1/email-accounts               list (secrets hidden)
-  POST   /api/v1/email-accounts               create SMTP or Graph placeholder
+  POST   /api/v1/email-accounts               create Graph account
   PATCH  /api/v1/email-accounts/{id}          update fields (secrets encrypted)
   DELETE /api/v1/email-accounts/{id}          delete (only if no campaign ref)
-  POST   /api/v1/email-accounts/{id}/test    test connection (smtp|imap|graph)
+  POST   /api/v1/email-accounts/{id}/test    test Graph connection
 """
 
 from __future__ import annotations
 
 import logging
-import smtplib
-import ssl
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -35,19 +38,14 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 class AccountCreate(BaseModel):
-    provider_type: str = Field("smtp", pattern="^(smtp|graph)$")
+    provider_type: str = Field("graph", pattern="^graph$")
     from_name: str = ""
     from_email: str = ""
     reply_to: str = ""
-    smtp_host: str = ""
-    smtp_port: int = 587
-    smtp_username: str = ""
-    smtp_password: str = ""  # write-only; never returned
-    imap_host: str = ""
-    imap_port: int = 993
-    imap_username: str = ""
-    imap_password: str = ""  # write-only; never returned
-    use_tls: bool = True
+    graph_tenant_id: str = ""
+    graph_client_id: str = ""
+    graph_client_secret: str = ""  # write-only; never returned
+    graph_user_principal_name: str = ""
     daily_send_limit: int = 20
     hourly_send_limit: int = 10
     status: str = "active"
@@ -57,15 +55,10 @@ class AccountUpdate(BaseModel):
     from_name: Optional[str] = None
     from_email: Optional[str] = None
     reply_to: Optional[str] = None
-    smtp_host: Optional[str] = None
-    smtp_port: Optional[int] = None
-    smtp_username: Optional[str] = None
-    smtp_password: Optional[str] = None
-    imap_host: Optional[str] = None
-    imap_port: Optional[int] = None
-    imap_username: Optional[str] = None
-    imap_password: Optional[str] = None
-    use_tls: Optional[bool] = None
+    graph_tenant_id: Optional[str] = None
+    graph_client_id: Optional[str] = None
+    graph_client_secret: Optional[str] = None
+    graph_user_principal_name: Optional[str] = None
     daily_send_limit: Optional[int] = None
     hourly_send_limit: Optional[int] = None
     status: Optional[str] = None
@@ -76,7 +69,7 @@ class ReorderRequest(BaseModel):
 
 
 class TestRequest(BaseModel):
-    kind: str = Field("smtp", pattern="^(smtp|imap|graph)$")
+    kind: str = Field("graph", pattern="^graph$")
 
 
 # ---------------------------------------------------------------------------
@@ -116,15 +109,32 @@ def _mask_secret(value: str) -> str:
     return f"{value[:4]}****{value[-4:]}"
 
 
+def _encrypt_graph_secret(secret: str) -> str:
+    """Encrypt a per-account Graph client secret for storage.
+
+    Returns an empty string for an empty input so the column stays
+    consistent with rows that don't override the global env-var
+    secret. The encrypted blob is the same shape used elsewhere
+    (base64-wrapped Fernet token).
+    """
+    if not secret:
+        return ""
+    return str(secret_cipher.encrypt_dict({"graph_secret": secret}).decode("utf-8", errors="replace"))
+
+
 def _strip_blob(account: dict[str, Any]) -> dict[str, Any]:
     """Return the account as JSON-safe, secrets scrubbed."""
     out = dict(account)
     out.pop("secrets_ciphertext", None)
+    # The legacy SMTP/IMAP secret fields are still encrypted in some rows
+    # for historical reasons; surface a "has_*" flag so the UI can warn
+    # the user to rotate them. They are no longer used to send mail.
     secrets = secret_cipher.decrypt_dict(account.get("secrets_ciphertext"))
     out["has_smtp_password"] = bool(secrets.get("smtp_secret"))
     out["has_imap_password"] = bool(secrets.get("imap_secret"))
     out["smtp_password_masked"] = _mask_secret(secrets.get("smtp_secret", "")) if secrets.get("smtp_secret") else ""
     out["imap_password_masked"] = _mask_secret(secrets.get("imap_secret", "")) if secrets.get("imap_secret") else ""
+    out["has_graph_secret"] = bool(account.get("graph_client_secret_encrypted"))
     return out
 
 
@@ -179,35 +189,37 @@ def create_account(
     store = get_email_store()
     account_id = f"acct_{uuid.uuid4().hex[:16]}"
     now = _now_iso()
-    secrets_dict: dict[str, Any] = {}
-    if payload.smtp_password:
-        secrets_dict["smtp_secret"] = payload.smtp_password
-    if payload.imap_password:
-        secrets_dict["imap_secret"] = payload.imap_password
+    # Graph client secret, if provided, is encrypted and stored on the
+    # row's `graph_client_secret_encrypted` column (same column the
+    # global `GRAPH_CLIENT_SECRET` env var is keyed against).
+    graph_secret = payload.graph_client_secret.strip() if payload.graph_client_secret else ""
     row = {
         "id": account_id,
-        "provider_type": payload.provider_type,
+        "provider_type": "graph",
         "from_name": payload.from_name or "",
         "from_email": payload.from_email or "",
         "reply_to": payload.reply_to or "",
-        "smtp_host": payload.smtp_host or "",
-        "smtp_port": payload.smtp_port,
-        "smtp_username": payload.smtp_username or "",
-        "smtp_secret_encrypted": "",  # legacy column no longer used
-        "imap_host": payload.imap_host or "",
-        "imap_port": payload.imap_port,
-        "imap_username": payload.imap_username or "",
-        "imap_secret_encrypted": "",  # legacy column no longer used
-        "use_tls": 1 if payload.use_tls else 0,
+        # Legacy SMTP/IMAP columns are kept on the row with empty
+        # values so the schema doesn't have to migrate.
+        "smtp_host": "",
+        "smtp_port": 587,
+        "smtp_username": "",
+        "smtp_secret_encrypted": "",
+        "imap_host": "",
+        "imap_port": 993,
+        "imap_username": "",
+        "imap_secret_encrypted": "",
+        "use_tls": 1,
         "status": payload.status or "active",
         "daily_send_limit": payload.daily_send_limit,
         "hourly_send_limit": payload.hourly_send_limit,
         "last_test_at": "",
         "created_at": now,
         "updated_at": now,
-        "secrets_ciphertext": secret_cipher.encrypt_dict(secrets_dict) if secrets_dict else b"",
-        "graph_tenant_id": "",
-        "graph_user_principal_name": "",
+        "secrets_ciphertext": b"",
+        "graph_tenant_id": payload.graph_tenant_id or "",
+        "graph_user_principal_name": payload.graph_user_principal_name or "",
+        "graph_client_secret_encrypted": _encrypt_graph_secret(graph_secret),
         # Append new accounts to the end of the rotation. The quotas page
         # lets the user drag them up later via /reorder.
         "sort_order": store.next_sort_order(),
@@ -277,27 +289,30 @@ def update_account(
     if not existing:
         raise HTTPException(status_code=404, detail="Email account not found")
     updates: dict[str, Any] = {}
-    for field in ("from_name", "from_email", "reply_to", "smtp_host", "smtp_port",
-                  "smtp_username", "imap_host", "imap_port", "imap_username",
-                  "use_tls", "daily_send_limit", "hourly_send_limit", "status"):
+    for field in (
+        "from_name",
+        "from_email",
+        "reply_to",
+        "graph_tenant_id",
+        "graph_user_principal_name",
+        "daily_send_limit",
+        "hourly_send_limit",
+        "status",
+    ):
         value = getattr(patch, field)
         if value is not None:
-            updates[field] = int(value) if field == "use_tls" else value
+            updates[field] = value
     if updates:
         updates["updated_at"] = _now_iso()
         existing.update(updates)
         store.upsert_account(existing)
-    # Secrets are handled separately (encrypted blob).
-    secret_updates: dict[str, Any] = {}
-    if patch.smtp_password is not None and patch.smtp_password != "":
-        secret_updates["smtp_secret"] = patch.smtp_password
-    if patch.imap_password is not None and patch.imap_password != "":
-        secret_updates["imap_secret"] = patch.imap_password
-    if secret_updates:
-        existing_secrets = secret_cipher.decrypt_dict(existing.get("secrets_ciphertext"))
-        existing_secrets.update(secret_updates)
-        store.set_account_secrets(account_id, existing_secrets)
-        store.upsert_account({**existing, "updated_at": _now_iso()})
+    # Per-account Graph client secret is encrypted separately. An
+    # empty string clears the override and falls back to the global
+    # GRAPH_CLIENT_SECRET env var.
+    if patch.graph_client_secret is not None:
+        encrypted = _encrypt_graph_secret(patch.graph_client_secret.strip())
+        store.upsert_account({**existing, "graph_client_secret_encrypted": encrypted, "updated_at": _now_iso()})
+        existing["graph_client_secret_encrypted"] = encrypted
     return _account_to_response(store.get_account(account_id) or existing)
 
 
@@ -357,21 +372,18 @@ async def test_account(
     account = store.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Email account not found")
-    if payload.kind == "smtp":
-        return await _test_smtp(account)
-    if payload.kind == "imap":
-        return await _test_imap(account)
-    if payload.kind == "graph":
-        result = await _test_graph(account)
-        if result.get("ok"):
-            # Graph credentials are tenant-global, so a successful account
-            # test also satisfies the "verify before auto send" gate that
-            # the settings-page Graph test records. Without this, users
-            # who set up Graph here would be bounced to the settings page
-            # for a second, redundant connectivity test.
-            _record_graph_tested()
-        return result
-    raise HTTPException(status_code=400, detail="Unknown test kind")
+    # The legacy ``smtp`` / ``imap`` test kinds are no longer accepted —
+    # the TestRequest schema already restricts ``kind`` to ``"graph"``,
+    # so anything else is a 422 from pydantic before we get here.
+    result = await _test_graph(account)
+    if result.get("ok"):
+        # Graph credentials are tenant-global, so a successful account
+        # test also satisfies the "verify before auto send" gate that
+        # the settings-page Graph test records. Without this, users
+        # who set up Graph here would be bounced to the settings page
+        # for a second, redundant connectivity test.
+        _record_graph_tested()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +449,7 @@ async def test_send_email(
         "这是一封来自 AI Hunter 的测试邮件。\n\n"
         f"账号: {account.get('from_email')}\n"
         f"时间: {datetime.now(timezone.utc).isoformat()}\n\n"
-        "如果收到说明发送链路 (SMTP/Graph) 工作正常。"
+        "如果收到说明 Microsoft Graph 发送链路工作正常。"
     )
     sent = await email_sender.send_email(
         account,
@@ -480,9 +492,9 @@ async def test_inbox(
     recent_minutes: int = 10,
     limit: int = 10,
 ) -> dict:
-    """Fetch the most recent messages from this account's inbox (SMTP/IMAP or Graph).
+    """Fetch the most recent messages from this account's inbox via Microsoft Graph.
 
-    Polls IMAP/Graph for the latest N messages received in the last `recent_minutes`.
+    Polls Graph for the latest N messages received in the last `recent_minutes`.
     """
     require_api_access(request)
     require_user(request)
@@ -493,93 +505,25 @@ async def test_inbox(
     from datetime import datetime, timedelta, timezone
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, min(recent_minutes, 1440)))
     since_iso = cutoff.isoformat()
-    provider = str(account.get("provider_type") or "smtp").lower()
-    if provider == "graph":
-        from emailing import graph_client
-        # Graph fetcher exposes (raw_ref, message_id, from_email, from_name, subject,
-        # in_reply_to, references, received_at, snippet, headers, conversation_id)
-        inbound = await graph_client.fetch_graph_replies(
-            None, now_iso=since_iso, recent_days=max(1, recent_minutes // (60 * 24) + 1), limit=limit
-        )
-        items = [
-            {
-                "id": m.get("message_id") or m.get("raw_ref"),
-                "from_email": m.get("from_email"),
-                "from_name": m.get("from_name"),
-                "subject": m.get("subject"),
-                "received_at": m.get("received_at"),
-                "snippet": m.get("snippet"),
-                "conversation_id": m.get("conversation_id"),
-            }
-            for m in (inbound or [])[:limit]
-        ]
-        return {"account_id": account_id, "provider": "graph", "since": since_iso, "items": items}
-    # SMTP/IMAP path: poll the inbox via IMAP (using the same secrets we use for reply detection)
-    from emailing.reply_detector import fetch_imap_replies
-    raw = fetch_imap_replies(account, now_iso=since_iso, recent_days=1)
+    from emailing import graph_client
+    # Graph fetcher exposes (raw_ref, message_id, from_email, from_name, subject,
+    # in_reply_to, references, received_at, snippet, headers, conversation_id)
+    inbound = await graph_client.fetch_graph_replies(
+        None, now_iso=since_iso, recent_days=max(1, recent_minutes // (60 * 24) + 1), limit=limit
+    )
     items = [
         {
-            "id": m.get("raw_ref"),
+            "id": m.get("message_id") or m.get("raw_ref"),
             "from_email": m.get("from_email"),
-            "from_name": (m.get("headers") or {}).get("From", ""),
+            "from_name": m.get("from_name"),
             "subject": m.get("subject"),
             "received_at": m.get("received_at"),
             "snippet": m.get("snippet"),
+            "conversation_id": m.get("conversation_id"),
         }
-        for m in (raw or [])[:limit]
+        for m in (inbound or [])[:limit]
     ]
-    return {"account_id": account_id, "provider": "smtp", "since": since_iso, "items": items}
-
-
-async def _test_smtp(account: dict[str, Any]) -> dict:
-    host = str(account.get("smtp_host") or "").strip()
-    port = int(account.get("smtp_port") or 587)
-    username = str(account.get("smtp_username") or "").strip()
-    secrets = secret_cipher.decrypt_dict(account.get("secrets_ciphertext"))
-    password = secrets.get("smtp_secret", "")
-    use_tls = bool(account.get("use_tls", True))
-    if not (host and username and password):
-        return {"ok": False, "provider": "smtp", "error": "smtp_account_incomplete", "error_type": "auth_error"}
-    try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP(host, port, timeout=15) as server:
-            server.ehlo()
-            if use_tls:
-                server.starttls(context=context)
-                server.ehlo()
-            server.login(username, password)
-        return {"ok": True, "provider": "smtp", "host": host, "username": username}
-    except smtplib.SMTPAuthenticationError as exc:
-        return {"ok": False, "provider": "smtp", "error": str(exc), "error_type": "auth_error"}
-    except (TimeoutError, OSError) as exc:
-        return {"ok": False, "provider": "smtp", "error": str(exc), "error_type": "network_error"}
-
-
-async def _test_imap(account: dict[str, Any]) -> dict:
-    import imaplib
-    host = str(account.get("imap_host") or "").strip()
-    port = int(account.get("imap_port") or 993)
-    username = str(account.get("imap_username") or "").strip()
-    secrets = secret_cipher.decrypt_dict(account.get("secrets_ciphertext"))
-    password = secrets.get("imap_secret", "")
-    use_tls = bool(account.get("use_tls", True))
-    if not (host and username and password):
-        return {"ok": False, "provider": "imap", "error": "imap_account_incomplete", "error_type": "auth_error"}
-    try:
-        client = imaplib.IMAP4_SSL(host, port) if use_tls else imaplib.IMAP4(host, port)
-        try:
-            client.login(username, password)
-            client.select("INBOX", readonly=True)
-        finally:
-            try:
-                client.logout()
-            except Exception:
-                pass
-        return {"ok": True, "provider": "imap", "host": host, "username": username}
-    except imaplib.IMAP4.error as exc:
-        return {"ok": False, "provider": "imap", "error": str(exc), "error_type": "auth_error"}
-    except (TimeoutError, OSError) as exc:
-        return {"ok": False, "provider": "imap", "error": str(exc), "error_type": "network_error"}
+    return {"account_id": account_id, "provider": "graph", "since": since_iso, "items": items}
 
 
 async def _test_graph(account: dict[str, Any]) -> dict:

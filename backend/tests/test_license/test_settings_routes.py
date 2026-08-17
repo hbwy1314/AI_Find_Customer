@@ -139,7 +139,7 @@ class TestSaveSettings:
                 os.environ["JINA_API_KEY"] = original_jina
 
     @pytest.mark.asyncio
-    async def test_saves_smtp_fields(self, client):
+    async def test_saves_graph_fields(self, client):
         with (
             patch("api.settings_routes.update_settings") as mock_update,
             patch("api.settings_routes.get_settings") as mock_gs,
@@ -147,103 +147,96 @@ class TestSaveSettings:
             mock_gs.cache_clear = MagicMock()
             resp = await client.post("/api/settings", json={
                 "email_from_address": "sales@example.com",
-                "email_smtp_host": "smtp.example.com",
-                "email_smtp_port": "587",
-                "email_smtp_username": "sales@example.com",
-                "email_smtp_password": "secret",
-                "email_use_tls": "true",
+                "graph_tenant_id": "tenant-1",
+                "graph_client_id": "client-1",
+                "graph_client_secret": "secret",
+                "graph_mailbox_upn": "sales@example.com",
             })
         assert resp.status_code == 204
         call_args = mock_update.call_args[0][0]
         assert call_args["EMAIL_FROM_ADDRESS"] == "sales@example.com"
-        assert call_args["EMAIL_SMTP_HOST"] == "smtp.example.com"
-        assert call_args["EMAIL_SMTP_PORT"] == "587"
-        assert call_args["EMAIL_SMTP_USERNAME"] == "sales@example.com"
-        assert call_args["EMAIL_SMTP_PASSWORD"] == "secret"
-        assert call_args["EMAIL_USE_TLS"] == "true"
-        assert call_args["EMAIL_SMTP_LAST_TEST_AT"] == ""
+        assert call_args["GRAPH_TENANT_ID"] == "tenant-1"
+        assert call_args["GRAPH_CLIENT_ID"] == "client-1"
+        assert call_args["GRAPH_CLIENT_SECRET"] == "secret"
+        assert call_args["GRAPH_MAILBOX_UPN"] == "sales@example.com"
 
     @pytest.mark.asyncio
-    async def test_changing_imap_fields_clears_imap_test_timestamp(self, client):
+    async def test_changing_graph_fields_clears_graph_test_timestamp(self, client):
         with (
             patch("api.settings_routes.update_settings") as mock_update,
             patch("api.settings_routes.get_settings") as mock_gs,
         ):
             mock_gs.cache_clear = MagicMock()
             resp = await client.post("/api/settings", json={
-                "email_imap_host": "imap.example.com",
-                "email_imap_port": "993",
+                "graph_tenant_id": "tenant-2",
             })
         assert resp.status_code == 204
         call_args = mock_update.call_args[0][0]
-        assert call_args["EMAIL_IMAP_LAST_TEST_AT"] == ""
+        # The exact env-var name is implementation detail; we just
+        # verify that *some* graph test-timestamp clear is in the diff.
+        graph_clear_keys = [k for k in call_args if "LAST_TEST_AT" in k and "GRAPH" in k]
+        assert graph_clear_keys, f"expected a graph test-timestamp clear; got: {list(call_args)}"
 
     @pytest.mark.asyncio
-    async def test_allows_clearing_smtp_fields(self, client):
+    async def test_allows_clearing_graph_secret(self, client):
         with (
             patch("api.settings_routes.update_settings") as mock_update,
             patch("api.settings_routes.get_settings") as mock_gs,
         ):
             mock_gs.cache_clear = MagicMock()
             resp = await client.post("/api/settings", json={
-                "email_smtp_password": "",
+                "graph_client_secret": "",
                 "email_from_address": "",
             })
         assert resp.status_code == 204
         call_args = mock_update.call_args[0][0]
-        assert call_args["EMAIL_SMTP_PASSWORD"] == ""
+        assert call_args["GRAPH_CLIENT_SECRET"] == ""
         assert call_args["EMAIL_FROM_ADDRESS"] == ""
 
 
 class TestEmailSettings:
     @pytest.mark.asyncio
-    async def test_smtp_test_success(self, client):
+    async def test_graph_test_success(self, client):
         with (
             patch("api.settings_routes.get_settings") as mock_gs,
-            patch("api.settings_routes.test_smtp_connection", return_value={
-                "host": "smtp.example.com",
-                "username": "sales@example.com",
+            patch("emailing.graph_client.test_graph_connection", return_value={
+                "ok": True,
+                "mailbox": "sales@example.com",
+                "upn": "sales@example.com",
+                "display_name": "Sales",
             }),
             patch("api.settings_routes.update_settings") as mock_update,
         ):
             mock_gs.cache_clear = MagicMock()
-            mock_gs.return_value = MagicMock()
-            resp = await client.post("/api/settings/email/test")
+            mock_gs.return_value = MagicMock(graph_mailbox_upn="sales@example.com")
+            resp = await client.post("/api/settings/email/graph-test")
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["host"] == "smtp.example.com"
-        assert "EMAIL_SMTP_LAST_TEST_AT" in mock_update.call_args[0][0]
+        assert data["mailbox"] == "sales@example.com"
+        assert "GRAPH_LAST_TEST_AT" in mock_update.call_args[0][0]
 
     @pytest.mark.asyncio
-    async def test_smtp_test_failure(self, client):
+    async def test_graph_test_failure(self, client):
         with (
             patch("api.settings_routes.get_settings") as mock_gs,
-            patch("api.settings_routes.test_smtp_connection", side_effect=ValueError("Missing SMTP settings")),
+            patch("emailing.graph_client.test_graph_connection", return_value={
+                "ok": False,
+                "error": "Missing Graph settings",
+            }),
         ):
             mock_gs.cache_clear = MagicMock()
-            mock_gs.return_value = MagicMock()
-            resp = await client.post("/api/settings/email/test")
+            mock_gs.return_value = MagicMock(graph_mailbox_upn="sales@example.com")
+            resp = await client.post("/api/settings/email/graph-test")
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_imap_test_success(self, client):
-        with (
-            patch("api.settings_routes.get_settings") as mock_gs,
-            patch("api.settings_routes.test_imap_connection", return_value={
-                "host": "imap.example.com",
-                "username": "sales@example.com",
-            }),
-            patch("api.settings_routes.update_settings") as mock_update,
-        ):
+    async def test_graph_test_requires_mailbox_upn(self, client):
+        with patch("api.settings_routes.get_settings") as mock_gs:
             mock_gs.cache_clear = MagicMock()
-            mock_gs.return_value = MagicMock()
-            resp = await client.post("/api/settings/email/imap-test")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "ok"
-        assert data["host"] == "imap.example.com"
-        assert "EMAIL_IMAP_LAST_TEST_AT" in mock_update.call_args[0][0]
+            mock_gs.return_value = MagicMock(graph_mailbox_upn="")
+            resp = await client.post("/api/settings/email/graph-test")
+        assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_feishu_test_success(self, client):

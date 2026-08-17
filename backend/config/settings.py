@@ -133,21 +133,18 @@ class Settings(BaseSettings):
     jina_api_key: str = ""
 
     # --- Email ---
-    email_provider_type: str = "smtp"
+    # All outbound and inbound email goes through Microsoft Graph.
+    # SMTP/IMAP paths have been removed; the per-account
+    # ``provider_type`` column still accepts the legacy ``"smtp"``
+    # value for backward compat (rows are coerced to ``"graph"``
+    # at read time) but the settings + send + reply code paths only
+    # implement Graph.
+    email_provider_type: str = "graph"
     email_from_name: str = "Ai Hunter"
     email_from_address: str = ""
     email_reply_to: str = ""
-    email_smtp_host: str = ""
-    email_smtp_port: int = 587
-    email_smtp_username: str = ""
-    email_smtp_password: str = ""
     email_smtp_last_test_at: str = ""
-    email_imap_host: str = ""
-    email_imap_port: int = 993
-    email_imap_username: str = ""
-    email_imap_password: str = ""
     email_imap_last_test_at: str = ""
-    email_use_tls: bool = True
     email_sequence_enabled: bool = False
     email_auto_send_enabled: bool = False
     email_step1_delay_days: int = 0
@@ -335,11 +332,10 @@ class Settings(BaseSettings):
     graph_client_secret: str = ""
     graph_mailbox_upn: str = ""        # shared mailbox, e.g. sales@company.com
     graph_default_scopes: str = "https://graph.microsoft.com/.default"
-    # Timestamp of the last successful Graph connectivity test (mirrors
-    # EMAIL_SMTP_LAST_TEST_AT / EMAIL_IMAP_LAST_TEST_AT). Recorded by the
-    # settings graph-test endpoint and cleared whenever any GRAPH_* field
-    # changes, so auto-send / reply detection stay gated on a verified
-    # connection regardless of which provider is active.
+    # Timestamp of the last successful Graph connectivity test. Recorded
+    # by the settings graph-test endpoint and cleared whenever any
+    # GRAPH_* field changes, so auto-send / reply detection stay gated
+    # on a verified connection.
     graph_last_test_at: str = ""
 
     @model_validator(mode="after")

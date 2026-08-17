@@ -1,4 +1,4 @@
-import { createRootRoute, createRoute } from "@tanstack/react-router";
+import { createRootRoute, createRoute, redirect } from "@tanstack/react-router";
 import { RootLayout } from "./root";
 import { DashboardPage } from "./dashboard";
 import { NewHuntPage } from "./new-hunt";
@@ -10,7 +10,6 @@ import { SignupPage } from "./signup";
 import { SettingsLayout } from "./settings-layout";
 import { SettingsPage } from "./settings";
 import { LLMSettingsPage } from "./settings-llm";
-import { SmtpSettingsPage } from "./settings-smtp";
 import { GraphSettingsPage } from "./settings-graph";
 import { SearchSettingsPage } from "./settings-search";
 import { NotificationsSettingsPage } from "./settings-notifications";
@@ -23,7 +22,45 @@ import { ConnectedMailboxesPage } from "./connected-mailboxes";
 // repository. The /settings/* routes are children of a
 // SettingsLayout that renders a left sidebar + right <Outlet />.
 
-const rootRoute = createRootRoute({ component: RootLayout });
+// Catch invalid paths and send the user somewhere useful. TanStack
+// Router treats trailing slashes as distinct from the no-slash
+// form, so /hunts/ and /hunts both 404 even though the parent
+// route is real. /hunts itself is also unused (hunts are listed
+// on the dashboard) so it bounces to /.
+const KNOWN_ROUTES = new Set([
+  "/",
+  "/hunts/new",
+  "/automation",
+  "/settings",
+  "/quotas",
+  "/login",
+  "/signup",
+]);
+function isKnownPrefix(path: string): boolean {
+  if (KNOWN_ROUTES.has(path)) return true;
+  for (const known of KNOWN_ROUTES) {
+    if (path === known || path.startsWith(known + "/")) return true;
+  }
+  if (/^\/hunts\/[^/]+/.test(path)) return true; // /hunts/$huntId
+  if (/^\/automation\/[^/]+/.test(path)) return true; // /automation/$jobId
+  return false;
+}
+
+const rootRoute = createRootRoute({
+  component: RootLayout,
+  beforeLoad: ({ location }) => {
+    const path = location.pathname;
+    // Strip a stray trailing slash (TanStack Router treats
+    // /hunts/ and /hunts as different routes).
+    if (path.length > 1 && path.endsWith("/")) {
+      throw redirect({ to: path.slice(0, -1) as "/", replace: true });
+    }
+    // Any other unknown top-level path lands on the dashboard.
+    if (!isKnownPrefix(path)) {
+      throw redirect({ to: "/", replace: true });
+    }
+  },
+});
 
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -67,12 +104,6 @@ const llmSettingsRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "/llm",
   component: LLMSettingsPage,
-});
-
-const smtpSettingsRoute = createRoute({
-  getParentRoute: () => settingsLayoutRoute,
-  path: "/smtp",
-  component: SmtpSettingsPage,
 });
 
 const graphSettingsRoute = createRoute({
@@ -148,7 +179,6 @@ export const routeTree = rootRoute.addChildren([
   settingsLayoutRoute.addChildren([
     settingsIndexRoute,
     llmSettingsRoute,
-    smtpSettingsRoute,
     graphSettingsRoute,
     searchSettingsRoute,
     notificationsSettingsRoute,

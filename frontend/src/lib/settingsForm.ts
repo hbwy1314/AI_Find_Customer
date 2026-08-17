@@ -43,17 +43,10 @@ export const SETTINGS_KEY_MAP: Record<string, string> = {
   EMAIL_FROM_NAME: "email_from_name",
   EMAIL_FROM_ADDRESS: "email_from_address",
   EMAIL_REPLY_TO: "email_reply_to",
-  EMAIL_SMTP_HOST: "email_smtp_host",
-  EMAIL_SMTP_PORT: "email_smtp_port",
-  EMAIL_SMTP_USERNAME: "email_smtp_username",
-  EMAIL_SMTP_PASSWORD: "email_smtp_password",
-  EMAIL_SMTP_LAST_TEST_AT: "email_smtp_last_test_at",
-  EMAIL_IMAP_HOST: "email_imap_host",
-  EMAIL_IMAP_PORT: "email_imap_port",
-  EMAIL_IMAP_USERNAME: "email_imap_username",
-  EMAIL_IMAP_PASSWORD: "email_imap_password",
-  EMAIL_IMAP_LAST_TEST_AT: "email_imap_last_test_at",
-  EMAIL_USE_TLS: "email_use_tls",
+  // SMTP/IMAP removed — outbound and inbound email all flow through
+  // Microsoft Graph now. The legacy keys are still accepted on the
+  // wire (the backend ignores them) so old saved settings don't
+  // 422 the user; we just don't render inputs for them.
   EMAIL_AUTO_SEND_ENABLED: "email_auto_send_enabled",
   EMAIL_REPLY_DETECTION_ENABLED: "email_reply_detection_enabled",
   EMAIL_REPLY_CHECK_INTERVAL_SECONDS: "email_reply_check_interval_seconds",
@@ -153,20 +146,12 @@ export function useSettingsForm() {
   const handleChange = (key: string, value: string) => {
     setValues((prev) => {
       const next = { ...prev, [key]: value };
-      // Clearing the SMTP/IMAP "last tested at" stamp when relevant fields
+      // Clearing the Graph "last tested at" stamp when relevant fields
       // change, so the "verified" badge reverts to "unconfigured".
       if (
-        [
-          "email_smtp_host", "email_smtp_port", "email_smtp_username",
-          "email_smtp_password", "email_use_tls",
-        ].includes(key)
+        ["graph_tenant_id", "graph_client_id", "graph_client_secret", "graph_mailbox_upn"].includes(key)
       ) {
-        next.email_smtp_last_test_at = "";
-      }
-      if (
-        ["email_imap_host", "email_imap_port", "email_imap_username", "email_imap_password"].includes(key)
-      ) {
-        next.email_imap_last_test_at = "";
+        next.graph_last_test_at = "";
       }
       return next;
     });

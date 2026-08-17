@@ -13,8 +13,6 @@ from pydantic import BaseModel
 from automation.notifier import send_feishu_text
 from config.settings import get_settings
 from config.settings_store import is_configured, read_settings, update_settings
-from emailing.imap_client import test_imap_connection
-from emailing.smtp_client import test_smtp_connection
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -24,6 +22,12 @@ class SettingsPayload(BaseModel):
     reasoning_model: str = ""
     email_llm_model: str = ""
     email_reasoning_model: str = ""
+    # Optional custom OpenAI-compatible base URL. When set, the LLM
+    # client routes every provider (openai, anthropic, openrouter, groq,
+    # zai, moonshot, huggingface, togetherai) through it. Empty =
+    # each provider's built-in default endpoint.
+    llm_api_base: str = ""
+    email_llm_api_base: str = ""
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     openrouter_api_key: str = ""
@@ -48,17 +52,8 @@ class SettingsPayload(BaseModel):
     email_from_name: str = ""
     email_from_address: str = ""
     email_reply_to: str = ""
-    email_smtp_host: str = ""
-    email_smtp_port: str = ""
-    email_smtp_username: str = ""
-    email_smtp_password: str = ""
     email_smtp_last_test_at: str = ""
-    email_imap_host: str = ""
-    email_imap_port: str = ""
-    email_imap_username: str = ""
-    email_imap_password: str = ""
     email_imap_last_test_at: str = ""
-    email_use_tls: str = ""
     email_sequence_enabled: str = ""
     email_auto_send_enabled: str = ""
     email_step1_delay_days: str = ""
@@ -97,6 +92,19 @@ class SettingsPayload(BaseModel):
     search_concurrency: str = ""
     scrape_concurrency: str = ""
 
+    # --- Runtime / auth / Graph (added with the user-auth + Graph upgrade) ---
+    app_env: str = ""
+    public_base_url: str = ""
+    session_secret: str = ""
+    session_ttl_seconds: str = ""
+    secrets_encryption_key: str = ""
+    trusted_hosts: str = ""
+    graph_tenant_id: str = ""
+    graph_client_id: str = ""
+    graph_client_secret: str = ""
+    graph_mailbox_upn: str = ""
+    graph_default_scopes: str = ""
+
 
 class SettingsResponse(BaseModel):
     settings: dict[str, str]
@@ -127,18 +135,12 @@ class LicenseStatusResponse(BaseModel):
     expires_at: str | None
 
 
-class SmtpTestResponse(BaseModel):
+class GraphTestResponse(BaseModel):
     status: str
     message: str
-    host: str
-    username: str
-
-
-class ImapTestResponse(BaseModel):
-    status: str
-    message: str
-    host: str
-    username: str
+    mailbox: str
+    upn: str
+    display_name: str = ""
 
 
 class FeishuTestResponse(BaseModel):
@@ -157,7 +159,12 @@ async def get_settings_api():
     """Return current settings with sensitive values partially masked."""
     _ensure_settings_api_enabled()
     raw = read_settings()
-    masked = {key: _mask(value) for key, value in raw.items()}
+    masked = {}
+    for key, value in raw.items():
+        if key in _SECRET_KEYS:
+            masked[key] = _mask(value)
+        else:
+            masked[key] = value
     return SettingsResponse(
         settings=masked,
         is_configured=is_configured(),
@@ -172,8 +179,10 @@ async def save_settings(payload: SettingsPayload):
     field_map = {
         "llm_model": "LLM_MODEL",
         "reasoning_model": "REASONING_MODEL",
+        "llm_api_base": "LLM_API_BASE",
         "email_llm_model": "EMAIL_LLM_MODEL",
         "email_reasoning_model": "EMAIL_REASONING_MODEL",
+        "email_llm_api_base": "EMAIL_LLM_API_BASE",
         "openai_api_key": "OPENAI_API_KEY",
         "anthropic_api_key": "ANTHROPIC_API_KEY",
         "openrouter_api_key": "OPENROUTER_API_KEY",
@@ -198,17 +207,8 @@ async def save_settings(payload: SettingsPayload):
         "email_from_name": "EMAIL_FROM_NAME",
         "email_from_address": "EMAIL_FROM_ADDRESS",
         "email_reply_to": "EMAIL_REPLY_TO",
-        "email_smtp_host": "EMAIL_SMTP_HOST",
-        "email_smtp_port": "EMAIL_SMTP_PORT",
-        "email_smtp_username": "EMAIL_SMTP_USERNAME",
-        "email_smtp_password": "EMAIL_SMTP_PASSWORD",
         "email_smtp_last_test_at": "EMAIL_SMTP_LAST_TEST_AT",
-        "email_imap_host": "EMAIL_IMAP_HOST",
-        "email_imap_port": "EMAIL_IMAP_PORT",
-        "email_imap_username": "EMAIL_IMAP_USERNAME",
-        "email_imap_password": "EMAIL_IMAP_PASSWORD",
         "email_imap_last_test_at": "EMAIL_IMAP_LAST_TEST_AT",
-        "email_use_tls": "EMAIL_USE_TLS",
         "email_sequence_enabled": "EMAIL_SEQUENCE_ENABLED",
         "email_auto_send_enabled": "EMAIL_AUTO_SEND_ENABLED",
         "email_step1_delay_days": "EMAIL_STEP1_DELAY_DAYS",
@@ -246,11 +246,22 @@ async def save_settings(payload: SettingsPayload):
         "automation_alert_failed_messages_threshold": "AUTOMATION_ALERT_FAILED_MESSAGES_THRESHOLD",
         "search_concurrency": "SEARCH_CONCURRENCY",
         "scrape_concurrency": "SCRAPE_CONCURRENCY",
+        "app_env": "APP_ENV",
+        "public_base_url": "PUBLIC_BASE_URL",
+        "session_secret": "SESSION_SECRET",
+        "session_ttl_seconds": "SESSION_TTL_SECONDS",
+        "secrets_encryption_key": "SECRETS_ENCRYPTION_KEY",
+        "trusted_hosts": "TRUSTED_HOSTS",
+        "graph_tenant_id": "GRAPH_TENANT_ID",
+        "graph_client_id": "GRAPH_CLIENT_ID",
+        "graph_client_secret": "GRAPH_CLIENT_SECRET",
+        "graph_mailbox_upn": "GRAPH_MAILBOX_UPN",
+        "graph_default_scopes": "GRAPH_DEFAULT_SCOPES",
+        "graph_last_test_at": "GRAPH_LAST_TEST_AT",
     }
 
     updates: dict[str, str] = {}
-    smtp_fields_changed = False
-    imap_fields_changed = False
+    graph_fields_changed = False
     for field, env_key in field_map.items():
         if field not in provided_fields:
             continue
@@ -258,63 +269,72 @@ async def save_settings(payload: SettingsPayload):
         if isinstance(value, str) and _is_masked(value):
             continue
         updates[env_key] = str(value)
-        if field in {"email_from_address", "email_smtp_host", "email_smtp_port", "email_smtp_username", "email_smtp_password", "email_use_tls"}:
-            smtp_fields_changed = True
-        if field in {"email_imap_host", "email_imap_port", "email_imap_username", "email_imap_password"}:
-            imap_fields_changed = True
+        if field in {"graph_tenant_id", "graph_client_id", "graph_client_secret", "graph_mailbox_upn"}:
+            graph_fields_changed = True
 
-    if smtp_fields_changed:
-        updates["EMAIL_SMTP_LAST_TEST_AT"] = ""
-    if imap_fields_changed:
-        updates["EMAIL_IMAP_LAST_TEST_AT"] = ""
+    if graph_fields_changed:
+        # Any credential change invalidates the previous verified test.
+        updates["GRAPH_LAST_TEST_AT"] = ""
 
     if updates:
         update_settings(updates)
         for env_key, value in updates.items():
             _os.environ[env_key] = value
 
+    # If Graph credentials changed, drop the cached app token so the next
+    # sendMail call re-acquires it with the new credentials.
+    if any(k.startswith("GRAPH_") for k in updates.keys()):
+        try:
+            from emailing.graph_client import reset_graph_token_cache
+            reset_graph_token_cache()
+        except Exception:  # noqa: BLE001
+            pass
+
     get_settings.cache_clear()
 
 
-@router.post("/email/test", response_model=SmtpTestResponse)
-async def test_email_settings():
-    """Test SMTP connectivity using the current saved settings."""
+@router.post("/email/graph-test", response_model=GraphTestResponse)
+async def test_graph_settings():
+    """Test Microsoft Graph connectivity using the current saved settings.
+
+    Reads the GRAPH_TENANT_ID / GRAPH_CLIENT_ID / GRAPH_CLIENT_SECRET /
+    GRAPH_MAILBOX_UPN from .env (already saved by /api/settings) and calls
+    `GET /users/{mailbox}` to verify the app can acquire an app-only token
+    and reach the mailbox. This works without first creating an email account.
+    """
+    from emailing import graph_client
+
     get_settings.cache_clear()
     settings = get_settings()
+    if not settings.graph_mailbox_upn.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="GRAPH_MAILBOX_UPN is not set. Save the Graph settings first.",
+        )
+    # Clear the in-memory app token so we always pick up the latest creds.
+    graph_client.reset_graph_token_cache()
     try:
-        result = await asyncio.to_thread(test_smtp_connection, settings)
-    except Exception as exc:
+        result = await graph_client.test_graph_connection()
+    except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("error") or "Graph test failed",
+        )
+    # Record the verified-test timestamp (mirrors EMAIL_SMTP_LAST_TEST_AT).
+    # The campaign-start / scheduler / reply-detection gates check this so
+    # Graph deployments get the same "test before auto send" protection.
     tested_at = _now_iso()
-    update_settings({"EMAIL_SMTP_LAST_TEST_AT": tested_at})
-    _os.environ["EMAIL_SMTP_LAST_TEST_AT"] = tested_at
+    update_settings({"GRAPH_LAST_TEST_AT": tested_at})
+    _os.environ["GRAPH_LAST_TEST_AT"] = tested_at
     get_settings.cache_clear()
-    return SmtpTestResponse(
+    return GraphTestResponse(
         status="ok",
-        message="SMTP connection successful",
-        host=result["host"],
-        username=result["username"],
-    )
-
-
-@router.post("/email/imap-test", response_model=ImapTestResponse)
-async def test_email_imap_settings():
-    """Test IMAP connectivity using the current saved settings."""
-    get_settings.cache_clear()
-    settings = get_settings()
-    try:
-        result = await asyncio.to_thread(test_imap_connection, settings)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    tested_at = _now_iso()
-    update_settings({"EMAIL_IMAP_LAST_TEST_AT": tested_at})
-    _os.environ["EMAIL_IMAP_LAST_TEST_AT"] = tested_at
-    get_settings.cache_clear()
-    return ImapTestResponse(
-        status="ok",
-        message="IMAP connection successful",
-        host=result["host"],
-        username=result["username"],
+        message="Microsoft Graph connection successful",
+        mailbox=str(result.get("mailbox", "")),
+        upn=str(result.get("upn", "")),
+        display_name=str(result.get("display_name", "")),
     )
 
 
@@ -384,6 +404,20 @@ async def save_license_token(req: SaveTokenRequest):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+# Settings keys whose value is a credential — must always be masked on read
+# and skipped on write when the user has not provided a new value.
+_SECRET_KEYS = {
+    "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+    "GROQ_API_KEY", "ZAI_API_KEY", "MOONSHOT_API_KEY", "MINIMAX_API_KEY",
+    "EMAIL_OPENAI_API_KEY", "EMAIL_ANTHROPIC_API_KEY", "EMAIL_OPENROUTER_API_KEY",
+    "EMAIL_GROQ_API_KEY", "EMAIL_ZAI_API_KEY", "EMAIL_MOONSHOT_API_KEY", "EMAIL_MINIMAX_API_KEY",
+    "SERPER_API_KEY", "TAVILY_API_KEY", "JINA_API_KEY",
+    "AMAP_API_KEY", "BAIDU_API_KEY", "HUNTER_API_KEY",
+    "SESSION_SECRET", "SECRETS_ENCRYPTION_KEY",
+    "GRAPH_CLIENT_SECRET",
+}
+
+
 def _mask(value: str) -> str:
     """Partially mask a secret value for display."""
     if not value or len(value) < 8:

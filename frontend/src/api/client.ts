@@ -51,13 +51,15 @@ export interface EmailAccountRow {
   from_name: string;
   from_email: string;
   reply_to: string;
-  smtp_host: string;
-  smtp_port: number;
-  smtp_username: string;
-  imap_host: string;
-  imap_port: number;
-  imap_username: string;
-  use_tls: number;
+  // SMTP/IMAP fields kept on the type as optional, never written by
+  // the frontend, but the backend still ships them on legacy rows.
+  smtp_host?: string;
+  smtp_port?: number;
+  smtp_username?: string;
+  imap_host?: string;
+  imap_port?: number;
+  imap_username?: string;
+  use_tls?: number;
   status: string;
   daily_send_limit: number;
   hourly_send_limit: number;
@@ -66,6 +68,9 @@ export interface EmailAccountRow {
   updated_at: string;
   graph_tenant_id?: string;
   graph_user_principal_name?: string;
+  graph_client_id?: string;
+  /** Per-account Graph secret is encrypted server-side; flag only. */
+  has_graph_secret?: boolean;
   has_smtp_password?: boolean;
   has_imap_password?: boolean;
   smtp_password_masked?: string;
@@ -81,19 +86,16 @@ export interface EmailAccountList {
 }
 
 export interface EmailAccountPayload {
-  provider_type: "smtp" | "graph";
+  /** All accounts are now Microsoft Graph; this is hard-coded to "graph". */
+  provider_type: "graph";
   from_name?: string;
   from_email?: string;
   reply_to?: string;
-  smtp_host?: string;
-  smtp_port?: number;
-  smtp_username?: string;
-  smtp_password?: string;
-  imap_host?: string;
-  imap_port?: number;
-  imap_username?: string;
-  imap_password?: string;
-  use_tls?: boolean;
+  graph_tenant_id?: string;
+  graph_client_id?: string;
+  /** Write-only; the backend encrypts and stores this. */
+  graph_client_secret?: string;
+  graph_user_principal_name?: string;
   daily_send_limit?: number;
   hourly_send_limit?: number;
   status?: string;
@@ -428,20 +430,6 @@ export interface EmailSequenceDecisionResponse {
   decision: string;
   auto_send_eligible: boolean;
   manual_review: EmailManualReview;
-}
-
-export interface SmtpTestResponse {
-  status: string;
-  message: string;
-  host: string;
-  username: string;
-}
-
-export interface ImapTestResponse {
-  status: string;
-  message: string;
-  host: string;
-  username: string;
 }
 
 export interface GraphTestResponse {
@@ -803,7 +791,7 @@ export const api = {
       "/email-accounts/reorder",
       { method: "POST", body: JSON.stringify({ account_ids: accountIds }) },
     ),
-  testEmailAccount: (id: string, kind: "smtp" | "imap" | "graph") =>
+  testEmailAccount: (id: string, kind: "graph" = "graph") =>
     request<EmailAccountTestResult>(`/email-accounts/${id}/test`, {
       method: "POST",
       body: JSON.stringify({ kind }),
@@ -925,11 +913,6 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  testEmailSettings: () =>
-    requestSettings<SmtpTestResponse>("/email/test", {
-      method: "POST",
-    }),
-
   getSettings: () =>
     requestSettings<SettingsApiResponse>(""),
 
@@ -941,11 +924,6 @@ export const api = {
 
   testGraphSettings: () =>
     requestSettings<GraphTestResponse>("/email/graph-test", {
-      method: "POST",
-    }),
-
-  testImapSettings: () =>
-    requestSettings<ImapTestResponse>("/email/imap-test", {
       method: "POST",
     }),
 

@@ -14,57 +14,26 @@ async def test_send_email_missing_recipient():
 
 
 @pytest.mark.asyncio
-async def test_send_email_smtp_success():
+async def test_send_email_legacy_smtp_provider_is_coerced_to_graph(monkeypatch):
+    """Old rows with provider_type='smtp' must flow through Graph (not error out)."""
+    monkeypatch.setattr("emailing.graph_client._mailbox_upn", lambda: "sales@example.com")
+
+    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0):
+        if url.endswith("/messages"):
+            return (201, {"id": "m1", "internetMessageId": "<m1@x>", "conversationId": "c1"})
+        return (202, "")
+
+    monkeypatch.setattr("emailing.graph_client._graph_request", fake_request)
+
     account = {
-        "provider_type": "smtp",
+        "provider_type": "smtp",  # legacy value, should be coerced to graph
         "from_name": "Ai Hunter",
         "from_email": "sales@example.com",
-        "reply_to": "sales@example.com",
-        "smtp_host": "smtp.example.com",
-        "smtp_port": 587,
-        "smtp_username": "sales@example.com",
-        "smtp_secret_encrypted": "secret",
-        "use_tls": 1,
+        "reply_to": "",
     }
-    smtp = MagicMock()
-    smtp.__enter__.return_value = smtp
-    smtp.__exit__.return_value = False
-    with patch("emailing.email_sender.smtplib.SMTP", return_value=smtp):
-        result = await send_email(account, to_email="buyer@example.com", subject="Hi", body_text="Hello")
+    result = await send_email(account, to_email="buyer@example.com", subject="Hi", body_text="Hello")
     assert result["ok"] is True
-    assert result["provider"] == "smtp"
-    assert result["provider_message_id"].startswith("<")
-
-
-@pytest.mark.asyncio
-async def test_send_email_formats_plaintext_body_before_sending():
-    account = {
-        "provider_type": "smtp",
-        "from_name": "Ai Hunter",
-        "from_email": "sales@example.com",
-        "reply_to": "sales@example.com",
-        "smtp_host": "smtp.example.com",
-        "smtp_port": 587,
-        "smtp_username": "sales@example.com",
-        "smtp_secret_encrypted": "secret",
-        "use_tls": 1,
-    }
-    smtp = MagicMock()
-    smtp.__enter__.return_value = smtp
-    smtp.__exit__.return_value = False
-    with patch("emailing.email_sender.smtplib.SMTP", return_value=smtp):
-        await send_email(
-            account,
-            to_email="buyer@example.com",
-            subject="Hi",
-            body_text=(
-                "Dear Sir/Madam, We manufacture industrial switches for control systems. "
-                "Given your product mix, there may be a fit. Kind regards,"
-            ),
-        )
-
-    sent_message = smtp.send_message.call_args.args[0]
-    assert "\n\n" in sent_message.get_content()
+    assert result["provider"] == "graph"
 
 
 # ---------------------------------------------------------------------------

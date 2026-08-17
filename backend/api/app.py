@@ -57,8 +57,7 @@ from automation.notifier import (
 )
 from automation.runtime import update_worker_state
 from config.settings import get_settings
-from emailing.readiness import ensure_imap_tested, ensure_outbound_tested
-from emailing.reply_detector import run_reply_detection_once
+from emailing.readiness import ensure_outbound_tested
 from emailing.scheduler import run_scheduler_once
 from emailing.store import EmailStore, set_email_store
 from scripts.headless_worker import JobCancelledError, _campaign_name
@@ -614,10 +613,9 @@ async def _email_scheduler_loop() -> None:
             if not bool(settings.email_auto_send_enabled):
                 await asyncio.sleep(60)
                 continue
-            # Provider-aware gate: checks GRAPH_* + a verified Graph test
-            # when the outbound provider is graph, EMAIL_SMTP_* otherwise.
-            # The old unconditional SMTP check made every scheduler
-            # iteration throw on Graph-only deployments.
+            # Provider-aware gate: checks GRAPH_* + a verified Graph test.
+            # The scheduler previously did an unconditional SMTP check
+            # which made every iteration throw on Graph-only deployments.
             ensure_outbound_tested(settings)
             store = EmailStore(settings.email_db_path)
             store.init_db()
@@ -634,9 +632,9 @@ async def _email_scheduler_loop() -> None:
 async def _email_reply_loop() -> None:
     """Poll inbox for replies and stop follow-up sequences.
 
-    Dispatches on `email_provider_type`:
-      - "smtp"  → IMAP via the `default` email_accounts row
-      - "graph" → Microsoft Graph (Application permission) shared mailbox
+    Uses Microsoft Graph exclusively. Each connected Graph account may
+    send from its own UPN, so replies land there; the loop also polls
+    the global shared mailbox (Graph ``MAILBOX_UPN``) as a fallback.
     """
     while True:
         try:
@@ -646,53 +644,40 @@ async def _email_reply_loop() -> None:
                 continue
             store = EmailStore(settings.email_db_path)
             store.init_db()
-            provider = (settings.email_provider_type or "smtp").lower()
-            if provider == "graph":
-                from emailing import graph_client
-                from emailing.reply_detector import run_graph_reply_detection_once
+            from emailing import graph_client
+            from emailing.reply_detector import run_graph_reply_detection_once
 
-                # Poll every distinct Graph mailbox: each connected account
-                # may send from its own UPN, so replies land there. Falls
-                # back to the global shared mailbox when configured.
-                poll_accounts: list[dict[str, Any] | None] = []
-                seen_upns: set[str] = set()
-                for acct in store.list_accounts_by_provider("graph"):
-                    if str(acct.get("status", "active")) != "active":
-                        continue
-                    upn = graph_client.account_upn(acct)
-                    if not upn or upn in seen_upns:
-                        continue
-                    seen_upns.add(upn)
-                    poll_accounts.append(acct)
-                global_upn = graph_client.account_upn(None)
-                if global_upn and global_upn not in seen_upns:
-                    poll_accounts.append(None)
-                if not poll_accounts:
-                    poll_accounts = [None]
+            # Poll every distinct Graph mailbox: each connected account
+            # may send from its own UPN, so replies land there. Falls
+            # back to the global shared mailbox when configured.
+            poll_accounts: list[dict[str, Any] | None] = []
+            seen_upns: set[str] = set()
+            for acct in store.list_accounts_by_provider("graph"):
+                if str(acct.get("status", "active")) != "active":
+                    continue
+                upn = graph_client.account_upn(acct)
+                if not upn or upn in seen_upns:
+                    continue
+                seen_upns.add(upn)
+                poll_accounts.append(acct)
+            global_upn = graph_client.account_upn(None)
+            if global_upn and global_upn not in seen_upns:
+                poll_accounts.append(None)
+            if not poll_accounts:
+                poll_accounts = [None]
 
-                result = {"checked": 0, "matched": 0, "skipped": 0, "ignored": 0, "matches": []}
-                for poll_account in poll_accounts:
-                    part = await run_graph_reply_detection_once(store, poll_account)
-                    for key in ("checked", "matched", "skipped", "ignored"):
-                        result[key] += int(part.get(key, 0) or 0)
-                    result["matches"].extend(part.get("matches", []) or [])
-                if result["matched"]:
-                    logger.info(
-                        "[EmailReply][graph] checked=%s matched=%s skipped=%s",
-                        result["checked"], result["matched"], result["skipped"],
-                    )
-                await _maybe_notify_reply_matches(result.get("matches", []))
-            else:
-                ensure_imap_tested(settings)
-                account = store.get_account("default")
-                if account:
-                    result = await run_reply_detection_once(store, account)
-                    if result["matched"]:
-                        logger.info(
-                            "[EmailReply][smtp] checked=%s matched=%s skipped=%s",
-                            result["checked"], result["matched"], result["skipped"],
-                        )
-                    await _maybe_notify_reply_matches(result.get("matches", []))
+            result = {"checked": 0, "matched": 0, "skipped": 0, "ignored": 0, "matches": []}
+            for poll_account in poll_accounts:
+                part = await run_graph_reply_detection_once(store, poll_account)
+                for key in ("checked", "matched", "skipped", "ignored"):
+                    result[key] += int(part.get(key, 0) or 0)
+                result["matches"].extend(part.get("matches", []) or [])
+            if result["matched"]:
+                logger.info(
+                    "[EmailReply][graph] checked=%s matched=%s skipped=%s",
+                    result["checked"], result["matched"], result["skipped"],
+                )
+            await _maybe_notify_reply_matches(result.get("matches", []))
         except asyncio.CancelledError:
             raise
         except Exception:

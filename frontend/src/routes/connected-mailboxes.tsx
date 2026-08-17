@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Mail, Pencil, Plus, Trash2 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
-import { api, type EmailAccountRow } from "../api/client";
+import { api, type EmailAccountRow, type EmailAccountPayload } from "../api/client";
 import { EmptyState, LoadingState } from "@/components/data-states";
 
 function GraphConfigCard() {
@@ -71,19 +71,15 @@ function AccountForm({
 }) {
   const qc = useQueryClient();
   const isEdit = Boolean(initial);
-  const [provider, setProvider] = useState<"smtp" | "graph">(
-    (initial?.provider_type as "smtp" | "graph") || "smtp"
-  );
+  // All accounts use Microsoft Graph for send + receive. The provider
+  // select is shown only on create for backward compat with rows that
+  // still say provider_type='smtp' (the backend coerces them).
   const [fromEmail, setFromEmail] = useState(initial?.from_email ?? "");
   const [fromName, setFromName] = useState(initial?.from_name ?? "");
-  const [smtpHost, setSmtpHost] = useState(initial?.smtp_host ?? "");
-  const [smtpPort, setSmtpPort] = useState<string>(String(initial?.smtp_port ?? 587));
-  const [smtpUsername, setSmtpUsername] = useState(initial?.smtp_username ?? "");
-  const [smtpPassword, setSmtpPassword] = useState("");
-  const [imapHost, setImapHost] = useState(initial?.imap_host ?? "");
-  const [imapPort, setImapPort] = useState<string>(String(initial?.imap_port ?? 993));
-  const [imapUsername, setImapUsername] = useState(initial?.imap_username ?? "");
-  const [imapPassword, setImapPassword] = useState("");
+  const [graphTenantId, setGraphTenantId] = useState(initial?.graph_tenant_id ?? "");
+  const [graphClientId, setGraphClientId] = useState(initial?.graph_client_id ?? "");
+  const [graphSecret, setGraphSecret] = useState("");
+  const [graphUpn, setGraphUpn] = useState(initial?.graph_user_principal_name ?? "");
   const [dailyLimit, setDailyLimit] = useState<string>(
     String(initial?.daily_send_limit ?? 20)
   );
@@ -94,26 +90,21 @@ function AccountForm({
 
   const save = useMutation({
     mutationFn: async () => {
-      const payload = {
-        provider_type: provider,
+      const payload: EmailAccountPayload = {
+        provider_type: "graph",
         from_email: fromEmail,
         from_name: fromName,
-        smtp_host: smtpHost,
-        smtp_port: Number(smtpPort) || 587,
-        smtp_username: smtpUsername,
-        smtp_password: smtpPassword,
-        imap_host: imapHost,
-        imap_port: Number(imapPort) || 993,
-        imap_username: imapUsername,
-        imap_password: imapPassword,
+        graph_tenant_id: graphTenantId,
+        graph_client_id: graphClientId,
+        graph_user_principal_name: graphUpn,
         daily_send_limit: Number(dailyLimit) || 20,
         hourly_send_limit: Number(hourlyLimit) || 0,
       };
+      if (graphSecret) {
+        payload.graph_client_secret = graphSecret;
+      }
       if (isEdit && initial) {
-        const patch: Record<string, unknown> = { ...payload };
-        if (!smtpPassword) delete patch.smtp_password;
-        if (!imapPassword) delete patch.imap_password;
-        return api.updateEmailAccount(initial.id, patch);
+        return api.updateEmailAccount(initial.id, payload);
       }
       return api.createEmailAccount(payload);
     },
@@ -137,18 +128,6 @@ function AccountForm({
         </button>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
-        <label className="space-y-1">
-          <span className="font-medium">类型</span>
-          <select
-            value={provider}
-            onChange={(e) => setProvider(e.target.value as "smtp" | "graph")}
-            className="w-full rounded-md border bg-background px-3 py-2"
-            disabled={isEdit}
-          >
-            <option value="smtp">SMTP/IMAP</option>
-            <option value="graph">Microsoft Graph（共享邮箱）</option>
-          </select>
-        </label>
         <label className="space-y-1">
           <span className="font-medium">From 邮箱</span>
           <input
@@ -195,90 +174,52 @@ function AccountForm({
         </label>
       </div>
 
-      {provider === "smtp" ? (
-        <div className="space-y-4">
-          <h4 className="text-sm font-semibold pt-2">SMTP（发件）</h4>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
-            <label className="space-y-1 sm:col-span-2">
-              <span className="font-medium">SMTP Host</span>
-              <input
-                value={smtpHost}
-                onChange={(e) => setSmtpHost(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2"
-                placeholder="smtp.exmail.qq.com"
-              />
-            </label>
-            <label className="space-y-1">
-              <span className="font-medium">Port</span>
-              <input
-                value={smtpPort}
-                onChange={(e) => setSmtpPort(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2"
-              />
-            </label>
-            <label className="space-y-1 sm:col-span-2">
-              <span className="font-medium">SMTP 用户名</span>
-              <input
-                value={smtpUsername}
-                onChange={(e) => setSmtpUsername(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2"
-              />
-            </label>
-            <label className="space-y-1">
-              <span className="font-medium">授权码 / 密码</span>
-              <input
-                type="password"
-                value={smtpPassword}
-                onChange={(e) => setSmtpPassword(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2"
-                placeholder={isEdit ? "留空保持不变" : ""}
-              />
-            </label>
-          </div>
-          <h4 className="text-sm font-semibold pt-2">IMAP（收件 / 回信）</h4>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
-            <label className="space-y-1 sm:col-span-2">
-              <span className="font-medium">IMAP Host</span>
-              <input
-                value={imapHost}
-                onChange={(e) => setImapHost(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2"
-                placeholder="imap.exmail.qq.com"
-              />
-            </label>
-            <label className="space-y-1">
-              <span className="font-medium">Port</span>
-              <input
-                value={imapPort}
-                onChange={(e) => setImapPort(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2"
-              />
-            </label>
-            <label className="space-y-1 sm:col-span-2">
-              <span className="font-medium">IMAP 用户名</span>
-              <input
-                value={imapUsername}
-                onChange={(e) => setImapUsername(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2"
-              />
-            </label>
-            <label className="space-y-1">
-              <span className="font-medium">授权码 / 密码</span>
-              <input
-                type="password"
-                value={imapPassword}
-                onChange={(e) => setImapPassword(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2"
-                placeholder={isEdit ? "留空保持不变" : ""}
-              />
-            </label>
-          </div>
-        </div>
-      ) : (
+      <div className="space-y-3">
+        <h4 className="text-sm font-semibold pt-2">Microsoft Graph 凭据（可选）</h4>
         <p className="text-xs text-muted-foreground">
-          Graph 账号无需在此处填密码。共用 .env 中的 GRAPH_* 配置作为 client_credentials 凭据。
+          留空则共用 .env 中的 <code>GRAPH_*</code> 配置（推荐）。
+          在这里填值可以为单个账号覆盖默认的 Graph 凭据。
         </p>
-      )}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
+          <label className="space-y-1">
+            <span className="font-medium">Graph Tenant ID</span>
+            <input
+              value={graphTenantId}
+              onChange={(e) => setGraphTenantId(e.target.value)}
+              className="w-full rounded-md border bg-background px-3 py-2 font-mono"
+              placeholder="（留空用全局）"
+            />
+          </label>
+          <label className="space-y-1">
+            <span className="font-medium">Graph Client ID</span>
+            <input
+              value={graphClientId}
+              onChange={(e) => setGraphClientId(e.target.value)}
+              className="w-full rounded-md border bg-background px-3 py-2 font-mono"
+              placeholder="（留空用全局）"
+            />
+          </label>
+          <label className="space-y-1">
+            <span className="font-medium">Graph Client Secret</span>
+            <input
+              type="password"
+              value={graphSecret}
+              onChange={(e) => setGraphSecret(e.target.value)}
+              className="w-full rounded-md border bg-background px-3 py-2"
+              placeholder={isEdit ? "留空保持不变" : "（留空用全局）"}
+            />
+          </label>
+          <label className="space-y-1">
+            <span className="font-medium">Graph 用户 / UPN</span>
+            <input
+              value={graphUpn}
+              onChange={(e) => setGraphUpn(e.target.value)}
+              className="w-full rounded-md border bg-background px-3 py-2 font-mono"
+              placeholder="（留空用全局）"
+            />
+          </label>
+        </div>
+      </div>
 
       {error ? (
         <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
@@ -331,13 +272,13 @@ function AccountRow({
   onEdit: () => void;
   qc: ReturnType<typeof useQueryClient>;
 }) {
-  const [testing, setTesting] = useState<null | "smtp" | "imap" | "graph">(null);
+  const [testing, setTesting] = useState<null | "graph">(null);
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
   const remove = useMutation({
     mutationFn: () => api.deleteEmailAccount(account.id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["email-accounts"] }),
   });
-  const runTest = async (kind: "smtp" | "imap" | "graph") => {
+  const runTest = async (kind: "graph") => {
     setTesting(kind);
     setTestResult(null);
     try {
@@ -382,24 +323,17 @@ function AccountRow({
       </div>
       <div className="flex flex-wrap items-center gap-2">
         {account.provider_type === "smtp" ? (
-          <>
-            <button
-              type="button"
-              disabled={testing === "smtp"}
-              onClick={() => runTest("smtp")}
-              className="rounded-md border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-60"
-            >
-              {testing === "smtp" ? "测试中…" : "测试 SMTP"}
-            </button>
-            <button
-              type="button"
-              disabled={testing === "imap"}
-              onClick={() => runTest("imap")}
-              className="rounded-md border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-60"
-            >
-              {testing === "imap" ? "测试中…" : "测试 IMAP"}
-            </button>
-          </>
+          // Legacy rows: backend coerces "smtp" provider_type to graph,
+          // so the test endpoint only needs to be called once. Show a
+          // single Graph test button regardless.
+          <button
+            type="button"
+            disabled={testing === "graph"}
+            onClick={() => runTest("graph")}
+            className="rounded-md border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-60"
+          >
+            {testing === "graph" ? "测试中…" : "测试连接"}
+          </button>
         ) : (
           <button
             type="button"

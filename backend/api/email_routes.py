@@ -13,8 +13,8 @@ from api.hunt_store import load_hunt, now_iso, save_hunt
 from api.security import require_api_access
 from config.settings import get_settings
 from emailing.policy import expand_email_targets
-from emailing.readiness import ensure_imap_tested, ensure_smtp_ready, ensure_smtp_tested
-from emailing.reply_detector import run_reply_detection_once
+from emailing.readiness import ensure_inbound_tested, ensure_outbound_ready, ensure_outbound_tested
+from emailing.reply_detector import run_graph_reply_detection_once
 from emailing.scheduler import run_scheduler_once
 from emailing.store import EmailStore
 
@@ -34,19 +34,22 @@ def _default_account(store: EmailStore) -> dict[str, Any]:
     current = now_iso()
     payload = {
         "id": account_id,
-        "provider_type": settings.email_provider_type,
+        "provider_type": "graph",
         "from_name": settings.email_from_name,
         "from_email": settings.email_from_address,
         "reply_to": settings.email_reply_to or settings.email_from_address,
-        "smtp_host": settings.email_smtp_host,
-        "smtp_port": settings.email_smtp_port,
-        "smtp_username": settings.email_smtp_username,
-        "smtp_secret_encrypted": settings.email_smtp_password,
-        "imap_host": settings.email_imap_host,
-        "imap_port": settings.email_imap_port,
-        "imap_username": settings.email_imap_username,
-        "imap_secret_encrypted": settings.email_imap_password,
-        "use_tls": 1 if settings.email_use_tls else 0,
+        # Legacy SMTP/IMAP columns are kept on the row with empty values
+        # for schema back-compat. The Graph fields are what the sender
+        # actually reads.
+        "smtp_host": "",
+        "smtp_port": 587,
+        "smtp_username": "",
+        "smtp_secret_encrypted": "",
+        "imap_host": "",
+        "imap_port": 993,
+        "imap_username": "",
+        "imap_secret_encrypted": "",
+        "use_tls": 1,
         "status": "active",
         "daily_send_limit": settings.email_daily_send_limit,
         "hourly_send_limit": settings.email_hourly_send_limit,
@@ -157,7 +160,7 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
 
     settings = get_settings()
     try:
-        ensure_smtp_ready(settings)
+        ensure_outbound_ready(settings)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -290,7 +293,7 @@ async def start_email_campaign(campaign_id: str):
         raise HTTPException(status_code=404, detail="Campaign not found")
     settings = get_settings()
     try:
-        ensure_smtp_tested(settings)
+        ensure_outbound_tested(settings)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if str(campaign.get("email_account_id", "")) == "default":
@@ -328,7 +331,7 @@ async def get_email_sequence(sequence_id: str):
 async def run_email_scheduler():
     store = _store()
     try:
-        ensure_smtp_tested(get_settings())
+        ensure_outbound_tested(get_settings())
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return await run_scheduler_once(store)
@@ -339,8 +342,8 @@ async def run_email_reply_check():
     store = _store()
     settings = get_settings()
     try:
-        ensure_imap_tested(settings)
+        ensure_inbound_tested(settings)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     account = _default_account(store)
-    return await run_reply_detection_once(store, account)
+    return await run_graph_reply_detection_once(store, account)

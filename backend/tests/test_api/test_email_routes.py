@@ -60,16 +60,11 @@ def test_create_and_start_email_campaign(monkeypatch, tmp_path):
         "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
-        "email_smtp_host": "smtp.example.com",
-        "email_smtp_port": 587,
-        "email_smtp_username": "sales@example.com",
-        "email_smtp_password": "secret",
-        "email_smtp_last_test_at": "2026-04-04T10:00:00Z",
-        "email_imap_host": "",
-        "email_imap_port": 993,
-        "email_imap_username": "",
-        "email_imap_password": "",
-        "email_use_tls": True,
+        "graph_tenant_id": "tenant-1",
+                "graph_client_id": "client-1",
+                "graph_client_secret": "secret",
+                "graph_mailbox_upn": "sales@example.com",
+                "graph_last_test_at": "2026-04-04T10:00:00Z",
         "email_daily_send_limit": 50,
         "email_hourly_send_limit": 10,
         "email_language_mode": "auto_by_region",
@@ -138,16 +133,11 @@ def test_create_campaign_skips_blocked_template(monkeypatch, tmp_path):
         "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
-        "email_smtp_host": "smtp.example.com",
-        "email_smtp_port": 587,
-        "email_smtp_username": "sales@example.com",
-        "email_smtp_password": "secret",
-        "email_smtp_last_test_at": "2026-04-04T10:00:00Z",
-        "email_imap_host": "",
-        "email_imap_port": 993,
-        "email_imap_username": "",
-        "email_imap_password": "",
-        "email_use_tls": True,
+        "graph_tenant_id": "tenant-1",
+                "graph_client_id": "client-1",
+                "graph_client_secret": "secret",
+                "graph_mailbox_upn": "sales@example.com",
+                "graph_last_test_at": "2026-04-04T10:00:00Z",
         "email_daily_send_limit": 50,
         "email_hourly_send_limit": 10,
         "email_language_mode": "auto_by_region",
@@ -216,16 +206,11 @@ def test_create_campaign_skips_unapproved_sequences(monkeypatch, tmp_path):
         "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
-        "email_smtp_host": "smtp.example.com",
-        "email_smtp_port": 587,
-        "email_smtp_username": "sales@example.com",
-        "email_smtp_password": "secret",
-        "email_smtp_last_test_at": "2026-04-04T10:00:00Z",
-        "email_imap_host": "",
-        "email_imap_port": 993,
-        "email_imap_username": "",
-        "email_imap_password": "",
-        "email_use_tls": True,
+        "graph_tenant_id": "tenant-1",
+                "graph_client_id": "client-1",
+                "graph_client_secret": "secret",
+                "graph_mailbox_upn": "sales@example.com",
+                "graph_last_test_at": "2026-04-04T10:00:00Z",
         "email_daily_send_limit": 50,
         "email_hourly_send_limit": 10,
         "email_language_mode": "auto_by_region",
@@ -279,16 +264,11 @@ def test_create_campaign_includes_needs_review_when_approval_not_required(monkey
         "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
-        "email_smtp_host": "smtp.example.com",
-        "email_smtp_port": 587,
-        "email_smtp_username": "sales@example.com",
-        "email_smtp_password": "secret",
-        "email_smtp_last_test_at": "2026-04-04T10:00:00Z",
-        "email_imap_host": "",
-        "email_imap_port": 993,
-        "email_imap_username": "",
-        "email_imap_password": "",
-        "email_use_tls": True,
+        "graph_tenant_id": "tenant-1",
+                "graph_client_id": "client-1",
+                "graph_client_secret": "secret",
+                "graph_mailbox_upn": "sales@example.com",
+                "graph_last_test_at": "2026-04-04T10:00:00Z",
         "email_daily_send_limit": 50,
         "email_hourly_send_limit": 10,
         "email_language_mode": "auto_by_region",
@@ -343,16 +323,11 @@ def test_create_campaign_skips_previously_contacted_lead_email(monkeypatch, tmp_
         "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
-        "email_smtp_host": "smtp.example.com",
-        "email_smtp_port": 587,
-        "email_smtp_username": "sales@example.com",
-        "email_smtp_password": "secret",
-        "email_smtp_last_test_at": "2026-04-04T10:00:00Z",
-        "email_imap_host": "",
-        "email_imap_port": 993,
-        "email_imap_username": "",
-        "email_imap_password": "",
-        "email_use_tls": True,
+        "graph_tenant_id": "tenant-1",
+                "graph_client_id": "client-1",
+                "graph_client_secret": "secret",
+                "graph_mailbox_upn": "sales@example.com",
+                "graph_last_test_at": "2026-04-04T10:00:00Z",
         "email_daily_send_limit": 50,
         "email_hourly_send_limit": 10,
         "email_language_mode": "auto_by_region",
@@ -383,11 +358,24 @@ def test_run_email_scheduler_route(monkeypatch, tmp_path):
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_from_address": "sales@example.com",
-        "email_smtp_host": "smtp.example.com",
-        "email_smtp_port": 587,
-        "email_smtp_username": "sales@example.com",
-        "email_smtp_password": "secret",
-        "email_smtp_last_test_at": "2026-04-04T10:00:00Z",
+        "email_from_name": "Ai Hunter",
+        "email_reply_to": "",
+        "email_daily_send_limit": 50,
+        "email_hourly_send_limit": 10,
+        "email_language_mode": "auto_by_region",
+        "email_default_language": "en",
+        "email_fallback_language": "en",
+        "email_tone": "professional",
+        "email_step1_delay_days": 0,
+        "email_step2_delay_days": 3,
+        "email_step3_delay_days": 3,
+        "email_min_fit_score_to_send": 0.6,
+        "email_min_contactability_score_to_send": 0.45,
+        "graph_tenant_id": "tenant-1",
+                "graph_client_id": "client-1",
+                "graph_client_secret": "secret",
+                "graph_mailbox_upn": "sales@example.com",
+                "graph_last_test_at": "2026-04-04T10:00:00Z",
     })())
 
     called = {}
@@ -414,16 +402,11 @@ def test_run_email_reply_check_route(monkeypatch, tmp_path):
         "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
-        "email_smtp_host": "smtp.example.com",
-        "email_smtp_port": 587,
-        "email_smtp_username": "sales@example.com",
-        "email_smtp_password": "secret",
-        "email_imap_host": "imap.example.com",
-        "email_imap_port": 993,
-        "email_imap_username": "sales@example.com",
-        "email_imap_password": "imap-secret",
-        "email_imap_last_test_at": "2026-04-04T10:00:00Z",
-        "email_use_tls": True,
+        "graph_tenant_id": "tenant-1",
+                "graph_client_id": "client-1",
+                "graph_client_secret": "secret",
+                "graph_mailbox_upn": "sales@example.com",
+                "graph_last_test_at": "2026-04-04T10:00:00Z",
         "email_daily_send_limit": 50,
         "email_hourly_send_limit": 10,
     })())
@@ -435,7 +418,7 @@ def test_run_email_reply_check_route(monkeypatch, tmp_path):
         called["account_id"] = account["id"]
         return {"checked": 3, "matched": 1, "skipped": 2, "ignored": 1}
 
-    monkeypatch.setattr("api.email_routes.run_reply_detection_once", fake_run_reply_detection_once)
+    monkeypatch.setattr("api.email_routes.run_graph_reply_detection_once", fake_run_reply_detection_once)
 
     res = client.post("/api/v1/email-replies/check")
     assert res.status_code == 200
@@ -475,15 +458,7 @@ def test_create_campaign_requires_smtp_configuration(monkeypatch, tmp_path):
         "email_from_name": "Ai Hunter",
         "email_from_address": "",
         "email_reply_to": "",
-        "email_smtp_host": "",
-        "email_smtp_port": 0,
-        "email_smtp_username": "",
-        "email_smtp_password": "",
-        "email_imap_host": "",
-        "email_imap_port": 993,
-        "email_imap_username": "",
-        "email_imap_password": "",
-        "email_use_tls": True,
+        
         "email_daily_send_limit": 50,
         "email_hourly_send_limit": 10,
         "email_language_mode": "auto_by_region",
@@ -499,7 +474,7 @@ def test_create_campaign_requires_smtp_configuration(monkeypatch, tmp_path):
 
     res = client.post("/api/v1/hunts/hunt_1/email-campaigns", json={"name": "Blocked Campaign"})
     assert res.status_code == 409
-    assert "SMTP is not configured" in res.json()["detail"]
+    assert "Microsoft Graph is not configured" in res.json()["detail"]
 
 
 def test_start_campaign_requires_smtp_configuration(monkeypatch, tmp_path):
@@ -509,10 +484,7 @@ def test_start_campaign_requires_smtp_configuration(monkeypatch, tmp_path):
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_from_address": "",
-        "email_smtp_host": "",
-        "email_smtp_port": 0,
-        "email_smtp_username": "",
-        "email_smtp_password": "",
+        
     })())
 
     from emailing.store import EmailStore
@@ -540,7 +512,7 @@ def test_start_campaign_requires_smtp_configuration(monkeypatch, tmp_path):
 
     res = client.post("/api/v1/email-campaigns/cmp_1/start")
     assert res.status_code == 409
-    assert "SMTP is not configured" in res.json()["detail"]
+    assert "Microsoft Graph is not configured" in res.json()["detail"]
 
 
 def test_start_campaign_requires_smtp_test_success(monkeypatch, tmp_path):
@@ -550,11 +522,23 @@ def test_start_campaign_requires_smtp_test_success(monkeypatch, tmp_path):
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_from_address": "sales@example.com",
-        "email_smtp_host": "smtp.example.com",
-        "email_smtp_port": 587,
-        "email_smtp_username": "sales@example.com",
-        "email_smtp_password": "secret",
-        "email_smtp_last_test_at": "",
+        "email_from_name": "Ai Hunter",
+        "email_reply_to": "",
+        "email_daily_send_limit": 50,
+        "email_hourly_send_limit": 10,
+        "email_language_mode": "auto_by_region",
+        "email_default_language": "en",
+        "email_fallback_language": "en",
+        "email_tone": "professional",
+        "email_step1_delay_days": 0,
+        "email_step2_delay_days": 3,
+        "email_step3_delay_days": 3,
+        "email_min_fit_score_to_send": 0.6,
+        "email_min_contactability_score_to_send": 0.45,
+        "graph_tenant_id": "tenant-1",
+                "graph_client_id": "client-1",
+                "graph_client_secret": "secret",
+                "graph_mailbox_upn": "sales@example.com",
     })())
 
     from emailing.store import EmailStore
@@ -582,7 +566,7 @@ def test_start_campaign_requires_smtp_test_success(monkeypatch, tmp_path):
 
     res = client.post("/api/v1/email-campaigns/cmp_2/start")
     assert res.status_code == 409
-    assert "Please test SMTP in Settings" in res.json()["detail"]
+    assert "Please test Graph in Settings" in res.json()["detail"]
 
 
 def test_run_email_scheduler_requires_smtp_configuration(monkeypatch, tmp_path):
@@ -592,15 +576,12 @@ def test_run_email_scheduler_requires_smtp_configuration(monkeypatch, tmp_path):
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_from_address": "",
-        "email_smtp_host": "",
-        "email_smtp_port": 0,
-        "email_smtp_username": "",
-        "email_smtp_password": "",
+        
     })())
 
     res = client.post("/api/v1/email-scheduler/run")
     assert res.status_code == 409
-    assert "SMTP is not configured" in res.json()["detail"]
+    assert "Microsoft Graph is not configured" in res.json()["detail"]
 
 
 def test_run_email_scheduler_requires_smtp_test_success(monkeypatch, tmp_path):
@@ -610,16 +591,28 @@ def test_run_email_scheduler_requires_smtp_test_success(monkeypatch, tmp_path):
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
         "email_from_address": "sales@example.com",
-        "email_smtp_host": "smtp.example.com",
-        "email_smtp_port": 587,
-        "email_smtp_username": "sales@example.com",
-        "email_smtp_password": "secret",
-        "email_smtp_last_test_at": "",
+        "email_from_name": "Ai Hunter",
+        "email_reply_to": "",
+        "email_daily_send_limit": 50,
+        "email_hourly_send_limit": 10,
+        "email_language_mode": "auto_by_region",
+        "email_default_language": "en",
+        "email_fallback_language": "en",
+        "email_tone": "professional",
+        "email_step1_delay_days": 0,
+        "email_step2_delay_days": 3,
+        "email_step3_delay_days": 3,
+        "email_min_fit_score_to_send": 0.6,
+        "email_min_contactability_score_to_send": 0.45,
+        "graph_tenant_id": "tenant-1",
+                "graph_client_id": "client-1",
+                "graph_client_secret": "secret",
+                "graph_mailbox_upn": "sales@example.com",
     })())
 
     res = client.post("/api/v1/email-scheduler/run")
     assert res.status_code == 409
-    assert "Please test SMTP in Settings" in res.json()["detail"]
+    assert "Please test Graph in Settings" in res.json()["detail"]
 
 
 def test_run_email_reply_check_requires_imap_configuration(monkeypatch, tmp_path):
@@ -628,33 +621,31 @@ def test_run_email_reply_check_requires_imap_configuration(monkeypatch, tmp_path
 
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
-        "email_imap_host": "",
-        "email_imap_port": 0,
-        "email_imap_username": "",
-        "email_imap_password": "",
     })())
 
     res = client.post("/api/v1/email-replies/check")
     assert res.status_code == 409
-    assert "IMAP is not configured" in res.json()["detail"]
+    assert "Microsoft Graph is not configured" in res.json()["detail"]
 
 
 def test_run_email_reply_check_requires_imap_test_success(monkeypatch, tmp_path):
     app = create_app()
     client = TestClient(app)
 
+    # Graph config set but no test timestamp → should fail with the
+    # "verify Graph" message, not the config-missing message.
     monkeypatch.setattr("api.email_routes.get_settings", lambda: type("S", (), {
         "email_db_path": str(tmp_path / "email.db"),
-        "email_imap_host": "imap.example.com",
-        "email_imap_port": 993,
-        "email_imap_username": "sales@example.com",
-        "email_imap_password": "secret",
-        "email_imap_last_test_at": "",
+        "graph_tenant_id": "tenant-1",
+        "graph_client_id": "client-1",
+        "graph_client_secret": "secret",
+        "graph_mailbox_upn": "sales@example.com",
+        "graph_last_test_at": "",
     })())
 
     res = client.post("/api/v1/email-replies/check")
     assert res.status_code == 409
-    assert "Please test IMAP in Settings" in res.json()["detail"]
+    assert "Please test Graph in Settings" in res.json()["detail"]
 
 
 def test_email_routes_require_token_when_configured(monkeypatch, tmp_path):
@@ -671,16 +662,11 @@ def test_email_routes_require_token_when_configured(monkeypatch, tmp_path):
         "email_from_name": "Ai Hunter",
         "email_from_address": "sales@example.com",
         "email_reply_to": "sales@example.com",
-        "email_smtp_host": "smtp.example.com",
-        "email_smtp_port": 587,
-        "email_smtp_username": "sales@example.com",
-        "email_smtp_password": "secret",
-        "email_smtp_last_test_at": "2026-04-04T10:00:00Z",
-        "email_imap_host": "",
-        "email_imap_port": 993,
-        "email_imap_username": "",
-        "email_imap_password": "",
-        "email_use_tls": True,
+        "graph_tenant_id": "tenant-1",
+                "graph_client_id": "client-1",
+                "graph_client_secret": "secret",
+                "graph_mailbox_upn": "sales@example.com",
+                "graph_last_test_at": "2026-04-04T10:00:00Z",
         "email_daily_send_limit": 50,
         "email_hourly_send_limit": 10,
         "api_access_token": "secret-token",
