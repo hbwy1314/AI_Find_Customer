@@ -10,7 +10,6 @@ from urllib.parse import urlparse
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -183,6 +182,14 @@ class Settings(BaseSettings):
     email_review_max_blocking_issues: int = 0
     email_validation_max_revisions: int = 2
     email_review_auto_fix_rounds: int = 2
+    # How many emails each outreach sequence contains (1-3). Default 1:
+    # only the first company-intro email is generated and scheduled.
+    email_sequence_steps: int = 1
+    # When true, every lead gets its own fully independent email draft
+    # (per-company personalization) instead of reusing a group template
+    # with token substitution. Costs more LLM calls, produces emails
+    # that are actually tailored to each target company.
+    email_personalize_per_lead: bool = True
 
     # --- Langfuse (observability) ---
     langfuse_public_key: str = ""
@@ -235,6 +242,10 @@ class Settings(BaseSettings):
     automation_template_seed_prewarm_enabled: bool = True
     automation_consumer_poll_seconds: int = 5
     automation_consumer_retry_delay_seconds: int = 120
+    # A job that still fails after this many attempts is marked failed
+    # permanently instead of requeued again — protects the queue from
+    # infinite retry loops on non-transient errors.
+    automation_consumer_max_attempts: int = 5
     automation_consumer_status_poll_seconds: int = 15
     automation_consumer_request_timeout_seconds: int = 60
     automation_consumer_auto_start_campaign: bool = True
@@ -260,6 +271,15 @@ class Settings(BaseSettings):
     cookie_secure: bool = False        # auto-True when app_env == "production"
     cookie_samesite: str = "lax"
     trusted_hosts: list[str] = ["*"]
+    # Public-facing base URL used to build absolute links (e.g. unsubscribe
+    # links in outbound emails). Falls back to api.nineluan.com when empty.
+    public_base_url: str = ""
+
+    # --- Email unsubscribe (one-click links embedded in every email) ---
+    # HMAC secret for signing unsubscribe tokens. Empty = auto-generate on
+    # first use (persisted to the settings store). Reusing a stable secret
+    # across restarts means outstanding unsubscribe links keep working.
+    unsubscribe_token_secret: str = ""
 
     # --- Secrets at rest (Fernet 32-byte url-safe b64 key) ---
     secrets_encryption_key: str = ""
@@ -270,6 +290,12 @@ class Settings(BaseSettings):
     graph_client_secret: str = ""
     graph_mailbox_upn: str = ""        # shared mailbox, e.g. sales@company.com
     graph_default_scopes: str = "https://graph.microsoft.com/.default"
+    # Timestamp of the last successful Graph connectivity test (mirrors
+    # EMAIL_SMTP_LAST_TEST_AT / EMAIL_IMAP_LAST_TEST_AT). Recorded by the
+    # settings graph-test endpoint and cleared whenever any GRAPH_* field
+    # changes, so auto-send / reply detection stay gated on a verified
+    # connection regardless of which provider is active.
+    graph_last_test_at: str = ""
 
     @model_validator(mode="after")
     def _apply_production_defaults(self) -> "Settings":

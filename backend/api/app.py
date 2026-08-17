@@ -906,6 +906,9 @@ def create_app() -> FastAPI:
     app.include_router(email_accounts_router, prefix="/api/v1/email-accounts")
     app.include_router(notifications_router)
     app.include_router(sse_router, prefix="/api/v1")
+    # Public unsubscribe endpoints (no auth — recipients click from email).
+    from api.unsubscribe_routes import router as unsubscribe_router
+    app.include_router(unsubscribe_router)
     if settings.settings_api_enabled:
         app.include_router(settings_router)
 

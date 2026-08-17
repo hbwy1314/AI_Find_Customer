@@ -13,7 +13,6 @@ Application-permission design:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 import uuid
@@ -24,6 +23,7 @@ import httpx
 from msal import ConfidentialClientApplication
 
 from config.settings import get_settings
+from emailing.unsubscribe import append_footer
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,21 @@ def _mailbox_upn() -> str:
     return get_settings().graph_mailbox_upn.strip()
 
 
+def account_upn(account: dict[str, Any] | None) -> str:
+    """Mailbox UPN for an account row.
+
+    Each connected Graph account can carry its own
+    `graph_user_principal_name` (bulk-added Azure AD mailboxes), so
+    sending/receiving rotates across real mailboxes. Rows without one
+    fall back to the global shared mailbox (`GRAPH_MAILBOX_UPN`).
+    """
+    if account:
+        upn = str(account.get("graph_user_principal_name", "") or "").strip()
+        if upn:
+            return upn
+    return _mailbox_upn()
+
+
 # ---------------------------------------------------------------------------
 # Low-level HTTP
 # ---------------------------------------------------------------------------
@@ -134,6 +149,8 @@ async def send_via_graph(
     body_text: str,
     reply_to: str | None = None,
     thread_key: str | None = None,
+    list_unsubscribe_url: str | None = None,
+    list_unsubscribe_mailto: str | None = None,
 ) -> dict[str, Any]:
     """Send `body_text` to `to_email` using the shared Graph mailbox.
 
@@ -169,7 +186,7 @@ async def send_via_graph(
     if not to_email.strip():
         return _err(account, "missing_recipient", "invalid_recipient", thread_key=thread_key, subject=subject)
 
-    upn = _mailbox_upn()
+    upn = account_upn(account)
     if not upn:
         return _err(account, "graph_not_configured", "auth_error", thread_key=thread_key, subject=subject)
 
@@ -177,6 +194,8 @@ async def send_via_graph(
     two_step_result = await _send_two_step(
         account, upn=upn, to_email=to_email, subject=subject,
         body_text=body_text, reply_to=reply_to, thread_key=thread_key,
+        list_unsubscribe_url=list_unsubscribe_url,
+        list_unsubscribe_mailto=list_unsubscribe_mailto,
     )
     if two_step_result.get("ok"):
         return two_step_result
@@ -200,6 +219,8 @@ async def send_via_graph(
     fallback = await _send_single_step(
         account, upn=upn, to_email=to_email, subject=subject,
         body_text=body_text, reply_to=reply_to, thread_key=thread_key,
+        list_unsubscribe_url=list_unsubscribe_url,
+        list_unsubscribe_mailto=list_unsubscribe_mailto,
     )
     if fallback.get("ok"):
         return fallback
@@ -221,11 +242,18 @@ async def _send_two_step(
     body_text: str,
     reply_to: str | None,
     thread_key: str | None,
+    list_unsubscribe_url: str | None = None,
+    list_unsubscribe_mailto: str | None = None,
 ) -> dict[str, Any]:
     try:
         # ── Step 1: create the draft message ──────────────────────
         # Note: deliberately OMIT `from` so Graph assigns the shared
         # mailbox as the sender. See the docstring above for why.
+        # Inject the unsubscribe footer + RFC 8058 List-Unsubscribe
+        # headers (HTTPS link + mailto: fallback) so mail clients
+        # expose a one-click unsubscribe button.
+        if list_unsubscribe_url:
+            body_text = append_footer(body_text, list_unsubscribe_url)
         draft_payload = {
             "subject": subject,
             "body": {"contentType": "Text", "content": body_text or ""},
@@ -233,6 +261,15 @@ async def _send_two_step(
         }
         if reply_to:
             draft_payload["replyTo"] = [{"emailAddress": {"name": "", "address": reply_to}}]
+        if list_unsubscribe_url:
+            parts: list[str] = []
+            if list_unsubscribe_mailto:
+                parts.append(list_unsubscribe_mailto)
+            parts.append(list_unsubscribe_url)
+            draft_payload["internetMessageHeaders"] = [
+                {"name": "List-Unsubscribe", "value": ", ".join(f"<{p}>" for p in parts)},
+                {"name": "List-Unsubscribe-Post", "value": "List-Unsubscribe=One-Click"},
+            ]
         create_status, create_body = await _graph_request(
             "POST",
             f"/users/{upn}/messages",
@@ -331,6 +368,8 @@ async def _send_single_step(
     body_text: str,
     reply_to: str | None,
     thread_key: str | None,
+    list_unsubscribe_url: str | None = None,
+    list_unsubscribe_mailto: str | None = None,
 ) -> dict[str, Any]:
     """Single-shot sendMail — fallback when the two-step create+send fails.
 
@@ -342,6 +381,8 @@ async def _send_single_step(
     try:
         from_email = str(account.get("from_email") or upn)
         from_name = str(account.get("from_name") or "Ai Hunter")
+        if list_unsubscribe_url:
+            body_text = append_footer(body_text, list_unsubscribe_url)
         message: dict[str, Any] = {
             "subject": subject,
             "body": {"contentType": "Text", "content": body_text or ""},
@@ -350,6 +391,15 @@ async def _send_single_step(
         }
         if reply_to:
             message["replyTo"] = [{"emailAddress": {"name": "", "address": reply_to}}]
+        if list_unsubscribe_url:
+            parts = []
+            if list_unsubscribe_mailto:
+                parts.append(list_unsubscribe_mailto)
+            parts.append(list_unsubscribe_url)
+            message["internetMessageHeaders"] = [
+                {"name": "List-Unsubscribe", "value": ", ".join(f"<{p}>" for p in parts)},
+                {"name": "List-Unsubscribe-Post", "value": "List-Unsubscribe=One-Click"},
+            ]
         payload = {"message": message, "saveToSentItems": True}
         status_code, body = await _graph_request(
             "POST",
@@ -431,14 +481,19 @@ def _err(
 # ---------------------------------------------------------------------------
 
 async def fetch_graph_replies(
-    account: dict[str, Any] | None = None,  # kept for parity with imap_client; not used
+    account: dict[str, Any] | None = None,
     *,
     now_iso: str,
     recent_days: int = 14,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    """Return a list of reply dicts in the same shape as `fetch_imap_replies()`."""
-    upn = _mailbox_upn()
+    """Return a list of reply dicts in the same shape as `fetch_imap_replies()`.
+
+    Polls the account's own mailbox when the row carries a
+    `graph_user_principal_name`, otherwise the global shared mailbox —
+    replies land in whatever mailbox did the sending.
+    """
+    upn = account_upn(account)
     if not upn:
         return []
     try:

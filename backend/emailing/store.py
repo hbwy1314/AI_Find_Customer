@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from auth import secrets as secret_cipher
+
+logger = logging.getLogger(__name__)
 
 
 _DDL = """
@@ -92,6 +99,27 @@ CREATE TABLE IF NOT EXISTS email_messages (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_email_message_sequence_step ON email_messages(sequence_id, step_number);
 CREATE INDEX IF NOT EXISTS idx_email_message_status_schedule ON email_messages(status, scheduled_at);
+-- Test sends go through a separate table because they have no
+-- `lead_email_sequences` row (so we can't satisfy email_messages'
+-- implicit sequence_id link) and we don't want them mixing into
+-- reply detection. The `count_sent_today_for_account` helper folds
+-- this table's count into the daily total so test sends count
+-- against the user's daily_send_limit.
+CREATE TABLE IF NOT EXISTS email_test_send_log (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  to_email TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  body_text TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  provider_message_id TEXT DEFAULT '',
+  thread_key TEXT DEFAULT '',
+  ok INTEGER NOT NULL DEFAULT 1,
+  failure_reason TEXT DEFAULT '',
+  sent_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_test_send_account_sent ON email_test_send_log(account_id, sent_at);
 CREATE TABLE IF NOT EXISTS email_reply_events (
   id TEXT PRIMARY KEY,
   sequence_id TEXT NOT NULL,
@@ -104,6 +132,60 @@ CREATE TABLE IF NOT EXISTS email_reply_events (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reply_sequence_id ON email_reply_events(sequence_id);
+-- Unsubscribe records. `email` is the recipient address (lowercased).
+-- `scope` is one of: 'all', 'campaign:{id}', 'sequence:{id}'. A
+-- row with scope='all' acts as a global block; rows with finer scope
+-- only block that specific campaign/sequence. `token_hash` is the
+-- SHA256 of the unsubscribe token; we keep the hash (not the raw
+-- token) so a leaked DB doesn't let attackers forge valid unsubscribe
+-- requests on behalf of other recipients.
+CREATE TABLE IF NOT EXISTS email_unsubscribes (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'all',
+  token_hash TEXT DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'link',
+  unsubscribed_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_unsubscribe_email ON email_unsubscribes(email);
+CREATE INDEX IF NOT EXISTS idx_unsubscribe_scope ON email_unsubscribes(scope);
+-- Lightweight key-value store for app-level secrets we don't want to
+-- bake into the .env file (e.g. the unsubscribe-token HMAC secret,
+-- which is auto-generated on first use and must survive restarts).
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- ====================================================================
+-- Tables added for user auth + Microsoft Graph integration
+-- ====================================================================
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'user',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  csrf_token TEXT NOT NULL,
+  ip TEXT DEFAULT '',
+  user_agent TEXT DEFAULT '',
+  expires_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+CREATE TABLE IF NOT EXISTS app_bootstrap (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  initialized INTEGER NOT NULL DEFAULT 0,
+  last_admin_at TEXT DEFAULT ''
+);
 """
 
 
@@ -125,6 +207,62 @@ class EmailStore:
             self._ensure_column(conn, "lead_email_sequences", "template_group", "TEXT DEFAULT ''")
             self._ensure_column(conn, "lead_email_sequences", "template_usage_index", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "lead_email_sequences", "template_max_send_count", "INTEGER NOT NULL DEFAULT 0")
+            # Per-sequence outbound account. Set by campaign creation so a
+            # single campaign's volume rotates across all connected
+            # mailboxes; empty falls back to the campaign-level account.
+            self._ensure_column(conn, "lead_email_sequences", "email_account_id", "TEXT NOT NULL DEFAULT ''")
+            # New columns for encrypted secrets + Graph account metadata
+            self._ensure_column(conn, "email_accounts", "secrets_ciphertext", "BLOB DEFAULT X''")
+            self._ensure_column(conn, "email_accounts", "graph_tenant_id", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_accounts", "graph_user_principal_name", "TEXT DEFAULT ''")
+            # Manual rotation order set from the quotas page. Existing rows
+            # default to 0; new rows are appended at MAX(sort_order)+1.
+            self._ensure_column(conn, "email_accounts", "sort_order", "INTEGER NOT NULL DEFAULT 0")
+            # Ensure the singleton app_bootstrap row exists
+            conn.execute(
+                "INSERT OR IGNORE INTO app_bootstrap (id, initialized, last_admin_at) VALUES (1, 0, '')"
+            )
+        # Idempotent migration: move any pre-existing plaintext secrets into the
+        # encrypted blob so SMTP/IMAP keep working after the encryption column is added.
+        self._migrate_plaintext_secrets_to_ciphertext()
+
+    def _migrate_plaintext_secrets_to_ciphertext(self) -> None:
+        """One-shot migration: any row that still has plaintext
+        `smtp_secret_encrypted` / `imap_secret_encrypted` and an empty
+        `secrets_ciphertext` is migrated in-place.
+        """
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, smtp_secret_encrypted, imap_secret_encrypted, secrets_ciphertext
+                    FROM email_accounts
+                    WHERE (smtp_secret_encrypted != '' OR imap_secret_encrypted != '')
+                      AND (secrets_ciphertext IS NULL OR length(secrets_ciphertext) = 0)
+                    """
+                ).fetchall()
+                for row in rows:
+                    blob = secret_cipher.encrypt_dict(
+                        {
+                            "smtp_secret": str(row["smtp_secret_encrypted"] or ""),
+                            "imap_secret": str(row["imap_secret_encrypted"] or ""),
+                        }
+                    )
+                    conn.execute(
+                        """
+                        UPDATE email_accounts
+                        SET secrets_ciphertext = ?,
+                            smtp_secret_encrypted = '',
+                            imap_secret_encrypted = '',
+                            updated_at = updated_at
+                        WHERE id = ?
+                        """,
+                        (blob, row["id"]),
+                    )
+                if rows:
+                    logger.info("Migrated %d email_accounts rows to encrypted secrets_ciphertext", len(rows))
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to migrate plaintext secrets to encrypted ciphertext")
 
     def _ensure_column(self, conn: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
         columns = {
@@ -141,8 +279,21 @@ class EmailStore:
             "imap_host", "imap_port", "imap_username", "imap_secret_encrypted",
             "use_tls", "status", "daily_send_limit", "hourly_send_limit",
             "last_test_at", "created_at", "updated_at",
+            "secrets_ciphertext", "graph_tenant_id", "graph_user_principal_name",
+            "sort_order",
         ]
-        values = [payload.get(col, "") for col in cols]
+        # Per-column defaults: every text column defaults to "" (matches the
+        # existing convention) but sort_order needs an explicit int default
+        # so MAX(sort_order) doesn't end up as the empty string.
+        int_defaults = {"sort_order"}
+        values: list[Any] = []
+        for col in cols:
+            if col == "sort_order" and not payload.get(col) and payload.get(col) != 0:
+                values.append(0)
+            elif col in int_defaults:
+                values.append(int(payload.get(col) or 0))
+            else:
+                values.append(payload.get(col, ""))
         placeholders = ", ".join("?" for _ in cols)
         updates = ", ".join(f"{col}=excluded.{col}" for col in cols[1:])
         with self._connect() as conn:
@@ -151,6 +302,107 @@ class EmailStore:
                 f"ON CONFLICT(id) DO UPDATE SET {updates}",
                 values,
             )
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        # Manual sort_order wins; created_at is the stable tiebreaker so
+        # accounts that have never been reordered keep their original order.
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM email_accounts ORDER BY sort_order ASC, created_at ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_accounts_by_provider(self, provider_type: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM email_accounts WHERE provider_type = ? "
+                "ORDER BY sort_order ASC, created_at ASC",
+                (provider_type,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def reorder_accounts(self, account_ids: list[str]) -> None:
+        """Rewrite `sort_order` so the i-th id in the list has sort_order=i.
+
+        Atomic: either every id in the list gets a fresh index or none does.
+        Accounts that the caller didn't include keep their current value;
+        we only touch the rows that were sent. The caller is expected to
+        include every account in the new order — passing a partial list will
+        just leave the unmentioned rows at the tail of the rotation.
+        """
+        if not account_ids:
+            return
+        # De-dupe while preserving order (the caller already chose the order,
+        # but defensive dedupe avoids a UNIQUE / PK clash if duplicates slip in).
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for raw in account_ids:
+            aid = str(raw or "").strip()
+            if not aid or aid in seen:
+                continue
+            seen.add(aid)
+            ordered.append(aid)
+        if not ordered:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            for idx, aid in enumerate(ordered):
+                conn.execute(
+                    "UPDATE email_accounts SET sort_order = ?, updated_at = ? WHERE id = ?",
+                    (idx, now, aid),
+                )
+
+    def next_sort_order(self) -> int:
+        """Return MAX(sort_order)+1 (or 0 if the table is empty).
+
+        Coerce defensively because rows inserted before the column existed
+        (or rows that the caller inserted without setting sort_order) may
+        store it as an empty string after a round-trip through upsert.
+        """
+        with self._connect() as conn:
+            row = conn.execute("SELECT MAX(sort_order) AS m FROM email_accounts").fetchone()
+        if not row or row["m"] is None or row["m"] == "":
+            return 0
+        try:
+            return int(row["m"]) + 1
+        except (TypeError, ValueError):
+            return 0
+
+    def delete_account(self, account_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM email_accounts WHERE id = ?", (account_id,))
+
+    def set_account_secrets(self, account_id: str, secrets_dict: dict[str, Any]) -> None:
+        """Encrypt `secrets_dict` and write into `email_accounts.secrets_ciphertext`.
+
+        Pass an empty dict to clear.
+        """
+        blob = secret_cipher.encrypt_dict(secrets_dict) if secrets_dict else b""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE email_accounts SET secrets_ciphertext = ? WHERE id = ?",
+                (blob, account_id),
+            )
+
+    def get_account_secrets(self, account_id: str) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT secrets_ciphertext FROM email_accounts WHERE id = ?", (account_id,)
+            ).fetchone()
+        if not row:
+            return {}
+        return secret_cipher.decrypt_dict(row["secrets_ciphertext"])
+
+    def set_account_secret_value(self, account_id: str, key: str, value: str) -> None:
+        """Update a single key inside the encrypted secrets blob (read-modify-write)."""
+        if not key:
+            return
+        existing = self.get_account_secrets(account_id)
+        if value:
+            existing[key] = value
+        else:
+            existing.pop(key, None)
+        self.set_account_secrets(account_id, existing)
 
     def get_account(self, account_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -282,6 +534,15 @@ class EmailStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def find_message_by_thread_key(self, thread_key: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM email_messages WHERE thread_key = ? AND status = 'sent' "
+                "ORDER BY sent_at DESC LIMIT 1",
+                (thread_key,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_message_for_step(self, sequence_id: str, step_number: int) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -349,6 +610,146 @@ class EmailStore:
                 (status,),
             ).fetchone()
         return int(row[0]) if row else 0
+
+    def count_sent_today_for_account(self, account_id: str, *, now_iso: str) -> int:
+        """Count outbound traffic on this account since 00:00 UTC today.
+
+        Folds in both production sends (via email_messages → campaign
+        join) and test sends (via email_test_send_log). The UI's
+        "今日 / 上限" bar and the scheduler's per-account daily cap
+        both call this, so test sends correctly burn through the
+        same quota — important for shared mailboxes where you don't
+        want a flood of test-sends to eat the real campaign budget.
+        """
+        try:
+            now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        except ValueError:
+            now = datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        start_of_day = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        start_iso = start_of_day.isoformat()
+        with self._connect() as conn:
+            prod_row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM email_messages m
+                JOIN lead_email_sequences s ON s.id = m.sequence_id
+                JOIN email_campaigns c ON c.id = s.campaign_id
+                WHERE COALESCE(NULLIF(s.email_account_id, ''), c.email_account_id) = ?
+                  AND m.status = 'sent'
+                  AND m.sent_at >= ?
+                """,
+                (account_id, start_iso),
+            ).fetchone()
+            test_row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM email_test_send_log
+                WHERE account_id = ?
+                  AND sent_at >= ?
+                  AND ok = 1
+                """,
+                (account_id, start_iso),
+            ).fetchone()
+        return int(prod_row[0] if prod_row else 0) + int(test_row[0] if test_row else 0)
+
+    def sent_today_by_account(self, *, now_iso: str) -> dict[str, int]:
+        """Per-account sent-today map (prod sends + test sends).
+
+        Uses the same effective-account rule as
+        `count_sent_today_for_account`: a sequence-level
+        `email_account_id` wins over the campaign-level one.
+        """
+        try:
+            now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+        except ValueError:
+            now = datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        start_iso = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        counts: dict[str, int] = {}
+        with self._connect() as conn:
+            for row in conn.execute(
+                """
+                SELECT COALESCE(NULLIF(s.email_account_id, ''), c.email_account_id) AS acct,
+                       COUNT(*) AS c
+                FROM email_messages m
+                JOIN lead_email_sequences s ON s.id = m.sequence_id
+                JOIN email_campaigns c ON c.id = s.campaign_id
+                WHERE m.status = 'sent' AND m.sent_at >= ?
+                GROUP BY acct
+                """,
+                (start_iso,),
+            ).fetchall():
+                counts[str(row["acct"])] = int(row["c"])
+            for row in conn.execute(
+                """
+                SELECT account_id, COUNT(*) AS c
+                FROM email_test_send_log
+                WHERE sent_at >= ? AND ok = 1
+                GROUP BY account_id
+                """,
+                (start_iso,),
+            ).fetchall():
+                key = str(row["account_id"])
+                counts[key] = counts.get(key, 0) + int(row["c"])
+        return counts
+
+    def rebind_sequence_account(self, sequence_id: str, *, email_account_id: str, updated_at: str) -> None:
+        """Point a sequence at a different outbound account (quota rotation)."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE lead_email_sequences SET email_account_id = ?, updated_at = ? WHERE id = ?",
+                (email_account_id, updated_at, sequence_id),
+            )
+
+    def record_test_send(
+        self,
+        *,
+        account_id: str,
+        to_email: str,
+        subject: str,
+        body_text: str,
+        provider: str,
+        provider_message_id: str,
+        thread_key: str,
+        ok: bool,
+        failure_reason: str,
+        sent_at: str,
+    ) -> None:
+        """Insert a row into `email_test_send_log` after a test-send attempt.
+
+        Called from the test-send endpoint so the daily quota counter
+        picks it up. `ok=False` rows are still recorded (so the user
+        can see the failure in audit) but the count helper ignores
+        them via `WHERE ok = 1` — only successful test sends should
+        burn through the daily limit.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO email_test_send_log
+                  (id, account_id, to_email, subject, body_text, provider,
+                   provider_message_id, thread_key, ok, failure_reason,
+                   sent_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    account_id,
+                    to_email,
+                    subject,
+                    body_text,
+                    provider,
+                    provider_message_id,
+                    thread_key,
+                    1 if ok else 0,
+                    failure_reason,
+                    sent_at,
+                    sent_at,
+                ),
+            )
 
     def count_sequences_by_status(self, *statuses: str) -> int:
         if not statuses:
@@ -513,6 +914,22 @@ class EmailStore:
 
         template_summary: dict[str, dict[str, Any]] = {}
         with self._connect() as conn:
+            # One GROUP BY instead of one COUNT per sequence — this method
+            # runs on every campaign-summary poll, so the old per-sequence
+            # query turned a 200-lead campaign into 200+ round trips.
+            sent_by_sequence: dict[str, int] = {}
+            sequence_ids = [str(seq["id"]) for seq in sequences]
+            for chunk_start in range(0, len(sequence_ids), 500):
+                chunk = sequence_ids[chunk_start:chunk_start + 500]
+                placeholders = ", ".join("?" for _ in chunk)
+                for row in conn.execute(
+                    f"SELECT sequence_id, COUNT(*) AS c FROM email_messages "
+                    f"WHERE status = 'sent' AND sequence_id IN ({placeholders}) "
+                    f"GROUP BY sequence_id",
+                    chunk,
+                ).fetchall():
+                    sent_by_sequence[str(row["sequence_id"])] = int(row["c"])
+
             for sequence in sequences:
                 template_id = str(sequence.get("template_id") or "")
                 if not template_id:
@@ -538,12 +955,7 @@ class EmailStore:
                 summary["assigned_count"] += 1
                 if sequence.get("status") == "replied":
                     summary["replied_count"] += 1
-
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM email_messages WHERE sequence_id = ? AND status = 'sent'",
-                    (sequence["id"],),
-                ).fetchone()
-                summary["sent_count"] += int(row[0]) if row else 0
+                summary["sent_count"] += sent_by_sequence.get(str(sequence["id"]), 0)
 
         for summary in template_summary.values():
             assigned = int(summary["assigned_count"])
@@ -570,3 +982,241 @@ class EmailStore:
                 summary["recommended_action"] = "keep_collecting_data"
                 summary["reason"] = "Continue sending until enough reply data accumulates."
         return template_summary
+
+    # ====================================================================
+    # User auth (users / sessions / app_bootstrap) — single-tenant login
+    # ====================================================================
+
+    def count_users(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+        return int(row[0]) if row else 0
+
+    def get_user_by_id(self, user_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, email, password_hash, role, created_at FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_user_by_email(self, email: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, email, password_hash, role, created_at FROM users WHERE lower(email) = lower(?)",
+                (email,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_user(self, *, email: str, password_hash: str, role: str, created_at: str) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO users (email, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+                (email, password_hash, role, created_at),
+            )
+            return int(cur.lastrowid)
+
+    def create_session(
+        self,
+        *,
+        session_id: str,
+        user_id: int,
+        csrf_token: str,
+        ip: str,
+        user_agent: str,
+        expires_at: str,
+        last_seen_at: str,
+        created_at: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sessions
+                  (id, user_id, csrf_token, ip, user_agent, expires_at, last_seen_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, user_id, csrf_token, ip, user_agent, expires_at, last_seen_at, created_at),
+            )
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT s.id, s.user_id, s.csrf_token, s.ip, s.user_agent, s.expires_at, s.last_seen_at, s.created_at,
+                       u.email AS user_email, u.role AS user_role
+                FROM sessions s
+                JOIN users u ON u.id = s.user_id
+                WHERE s.id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def touch_session(self, session_id: str, last_seen_at: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET last_seen_at = ? WHERE id = ?",
+                (last_seen_at, session_id),
+            )
+
+    def delete_session(self, session_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
+    def purge_expired_sessions(self, now_iso: str) -> int:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM sessions WHERE expires_at < ?", (now_iso,))
+            return int(cur.rowcount or 0)
+
+    # --- app_bootstrap singleton ----------------------------------------
+
+    # --- unsubscribe records --------------------------------------------
+
+    def record_unsubscribe(
+        self,
+        *,
+        email: str,
+        scope: str = "all",
+        token_hash: str = "",
+        source: str = "link",
+    ) -> str:
+        """Record that ``email`` has unsubscribed.
+
+        Idempotent on (email, scope) — re-clicking the link is a no-op.
+        Returns the unsubscribe row id.
+        """
+        import secrets as _secrets
+
+        email_norm = (email or "").strip().lower()
+        scope_norm = (scope or "all").strip() or "all"
+        if not email_norm:
+            raise ValueError("email is required")
+        now = datetime.now(timezone.utc).isoformat()
+        row_id = _secrets.token_urlsafe(16)
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM email_unsubscribes WHERE email = ? AND scope = ?",
+                (email_norm, scope_norm),
+            ).fetchone()
+            if existing:
+                return str(existing["id"])
+            conn.execute(
+                "INSERT INTO email_unsubscribes "
+                "(id, email, scope, token_hash, source, unsubscribed_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (row_id, email_norm, scope_norm, token_hash, source, now, now),
+            )
+        return row_id
+
+    def is_unsubscribed(
+        self,
+        email: str,
+        *,
+        scope: str | None = None,
+    ) -> bool:
+        """Return True if the recipient is blocked from receiving future mail.
+
+        The check matches BOTH a global 'all' block (which overrides any
+        finer scope) AND a block whose scope equals the requested
+        ``scope`` (e.g. ``'campaign:abc'`` when sending for campaign abc).
+        Pass ``scope=None`` to check only the global block.
+        """
+        email_norm = (email or "").strip().lower()
+        if not email_norm:
+            return False
+        with self._connect() as conn:
+            # Global block wins regardless of scope.
+            row = conn.execute(
+                "SELECT 1 FROM email_unsubscribes WHERE email = ? AND scope = 'all' LIMIT 1",
+                (email_norm,),
+            ).fetchone()
+            if row:
+                return True
+            if scope:
+                row = conn.execute(
+                    "SELECT 1 FROM email_unsubscribes WHERE email = ? AND scope = ? LIMIT 1",
+                    (email_norm, scope),
+                ).fetchone()
+                if row:
+                    return True
+        return False
+
+    def list_unsubscribes(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Return recent unsubscribe records (most recent first)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM email_unsubscribes ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- app_settings (key-value, app-level secrets) ------------------
+
+    def get_app_setting(self, key: str, default: str = "") -> str:
+        """Read a string value from the `app_settings` table.
+
+        Returns `default` when the key is missing.
+        """
+        if not key:
+            return default
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM app_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if not row:
+            return default
+        return str(row["value"] or "")
+
+    def set_app_setting(self, key: str, value: str) -> None:
+        """Upsert a key-value pair in `app_settings`."""
+        if not key:
+            raise ValueError("key is required")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, value, now),
+            )
+
+    def is_signup_open(self) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT initialized FROM app_bootstrap WHERE id = 1").fetchone()
+        if not row:
+            return True  # bootstrap row missing → still open
+        return int(row["initialized"] or 0) == 0
+
+    def mark_signup_closed(self, *, last_admin_at: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE app_bootstrap SET initialized = 1, last_admin_at = ? WHERE id = 1",
+                (last_admin_at,),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton accessor (breaks circular import between api.app and
+# route modules that need the same store instance).
+# ---------------------------------------------------------------------------
+
+_email_store_singleton: EmailStore | None = None
+
+
+def get_email_store() -> EmailStore:
+    """Return the long-lived EmailStore singleton (creates one on first call)."""
+    global _email_store_singleton
+    if _email_store_singleton is None:
+        # Late import to avoid pulling settings at module-import time.
+        from config.settings import get_settings
+        settings = get_settings()
+        store = EmailStore(settings.email_db_path)
+        store.init_db()
+        _email_store_singleton = store
+    return _email_store_singleton
+
+
+def set_email_store(store: EmailStore) -> None:
+    """Override the singleton (used by FastAPI lifespan in api.app)."""
+    global _email_store_singleton
+    _email_store_singleton = store
