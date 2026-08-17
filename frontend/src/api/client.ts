@@ -1,17 +1,169 @@
 const API_BASE = "/api/v1";
+const AUTH_API_BASE = "/api/auth";
 const API_ACCESS_TOKEN = import.meta.env.VITE_API_ACCESS_TOKEN?.trim() ?? "";
 const API_TIMEOUT_MS = 15000;
+const CSRF_COOKIE_NAME = "aih_csrf";
+const AUTH_REQUIRED_EVENT = "aih:auth-required";
 
-function withApiAuth(headers?: HeadersInit): HeadersInit {
-  if (!API_ACCESS_TOKEN) {
-    return headers ?? {};
+function getCookie(name: string): string {
+  if (typeof document === "undefined") return "";
+  const cookies = document.cookie ? document.cookie.split("; ") : [];
+  for (const cookie of cookies) {
+    const eq = cookie.indexOf("=");
+    const key = eq >= 0 ? cookie.slice(0, eq) : cookie;
+    if (key === name) {
+      return eq >= 0 ? cookie.slice(eq + 1) : "";
+    }
   }
-  return {
-    ...(headers ?? {}),
-    "X-API-Key": API_ACCESS_TOKEN,
-  };
+  return "";
+}
+
+function withApiAuth(headers?: HeadersInit, method: string = "GET"): HeadersInit {
+  const base: Record<string, string> = { ...(headers as Record<string, string> | undefined ?? {}) };
+  if (API_ACCESS_TOKEN) {
+    base["X-API-Key"] = API_ACCESS_TOKEN;
+  }
+  // CSRF double-submit: when cookie auth is in use, mirror aih_csrf into a header
+  // for every non-GET request (the backend's CSRF check exempts the /api/auth/* paths).
+  if (method && method.toUpperCase() !== "GET") {
+    const csrf = getCookie(CSRF_COOKIE_NAME);
+    if (csrf) {
+      base["X-CSRF-Token"] = csrf;
+    }
+  }
+  return base;
 }
 const SETTINGS_API_BASE = "/api/settings";
+
+// ---------------------------------------------------------------------------
+// Auth + email-account types
+// ---------------------------------------------------------------------------
+
+export interface AuthUser {
+  id: number;
+  email: string;
+  role: string;
+}
+
+export interface EmailAccountRow {
+  id: string;
+  provider_type: string;
+  from_name: string;
+  from_email: string;
+  reply_to: string;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_username: string;
+  imap_host: string;
+  imap_port: number;
+  imap_username: string;
+  use_tls: number;
+  status: string;
+  daily_send_limit: number;
+  hourly_send_limit: number;
+  last_test_at: string;
+  created_at: string;
+  updated_at: string;
+  graph_tenant_id?: string;
+  graph_user_principal_name?: string;
+  has_smtp_password?: boolean;
+  has_imap_password?: boolean;
+  smtp_password_masked?: string;
+  imap_password_masked?: string;
+  sent_today?: number;
+  /** Manual rotation order set from the quotas page. Lower = earlier. */
+  sort_order?: number;
+}
+
+export interface EmailAccountList {
+  accounts: EmailAccountRow[];
+  count: number;
+}
+
+export interface EmailAccountPayload {
+  provider_type: "smtp" | "graph";
+  from_name?: string;
+  from_email?: string;
+  reply_to?: string;
+  smtp_host?: string;
+  smtp_port?: number;
+  smtp_username?: string;
+  smtp_password?: string;
+  imap_host?: string;
+  imap_port?: number;
+  imap_username?: string;
+  imap_password?: string;
+  use_tls?: boolean;
+  daily_send_limit?: number;
+  hourly_send_limit?: number;
+  status?: string;
+}
+
+export interface EmailAccountTestResult {
+  ok: boolean;
+  provider?: string;
+  error?: string;
+  error_type?: string;
+  host?: string;
+  username?: string;
+  upn?: string;
+  display_name?: string;
+  mailbox?: string;
+}
+
+export interface GraphConfigStatus {
+  tenant_configured: boolean;
+  client_configured: boolean;
+  mailbox: string;
+  scopes: string;
+  admin_consent_url: string;
+}
+
+export interface GraphUser {
+  id: string;
+  user_principal_name: string;
+  display_name: string;
+  mail: string;
+  email: string;
+  job_title: string;
+  department: string;
+  account_enabled: boolean;
+}
+
+export interface GraphBulkAddResponse {
+  created: { email: string; status: string; id: string }[];
+  skipped: { email: string; status: string }[];
+  created_count: number;
+  skipped_count: number;
+}
+
+export interface TestInboxItem {
+  id: string;
+  from_email: string;
+  from_name?: string;
+  subject: string;
+  received_at: string;
+  snippet: string;
+  conversation_id?: string;
+}
+
+export interface NotificationItem {
+  id: string;
+  sequence_id: string;
+  hunt_id: string;
+  campaign_id: string;
+  from_email: string;
+  subject: string;
+  snippet: string;
+  received_at: string;
+}
+
+function dispatchAuthRequired(): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT));
+}
+
+export { AUTH_REQUIRED_EVENT, getCookie };
 
 export interface HuntRequest {
   website_url: string;
@@ -26,6 +178,9 @@ export interface HuntRequest {
   enable_email_craft: boolean;
   email_template_examples: string[];
   email_template_notes: string;
+  /** Pin a specific connected mailbox (email_accounts.id). Omit to
+   *  use the auto-managed default account that follows Settings. */
+  email_account_id?: string;
 }
 
 export interface UploadedFile {
@@ -128,6 +283,8 @@ export interface HuntResult {
   round_feedback: Record<string, unknown> | null;
   keyword_search_stats: Record<string, unknown>;
   search_result_count: number;
+  email_template_examples: string[];
+  email_template_notes: string;
 }
 
 export interface LLMAgentCost {
@@ -285,6 +442,14 @@ export interface ImapTestResponse {
   message: string;
   host: string;
   username: string;
+}
+
+export interface GraphTestResponse {
+  status: string;
+  message: string;
+  mailbox: string;
+  upn: string;
+  display_name: string;
 }
 
 export interface SettingsApiResponse {
@@ -507,10 +672,76 @@ export interface AutomationMetrics {
 async function requestSettings<T>(path: string, options?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const method = (options?.method ?? "GET").toUpperCase();
   let res: Response;
   try {
     res = await fetch(`${SETTINGS_API_BASE}${path}`, {
+      headers: withApiAuth({ "Content-Type": "application/json" }, method),
+      credentials: "include",
+      ...options,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error(`Request timed out after ${API_TIMEOUT_MS / 1000}s`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+  if (res.status === 401) {
+    dispatchAuthRequired();
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || res.statusText);
+  }
+  if (res.status === 204) {
+    return undefined as T;
+  }
+  return res.json();
+}
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const method = (options?.method ?? "GET").toUpperCase();
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      headers: withApiAuth({ "Content-Type": "application/json" }, method),
+      credentials: "include",
+      ...options,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error(`Request timed out after ${API_TIMEOUT_MS / 1000}s`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+  if (res.status === 401) {
+    dispatchAuthRequired();
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || res.statusText);
+  }
+  return res.json();
+}
+
+async function requestAuth<T>(path: string, options?: RequestInit): Promise<T> {
+  // Auth endpoints have no CSRF requirement, but still need `credentials: include`
+  // so the Set-Cookie that the server emits is accepted by the browser.
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(`${AUTH_API_BASE}${path}`, {
       headers: { "Content-Type": "application/json" },
+      credentials: "include",
       ...options,
       signal: controller.signal,
     });
@@ -532,32 +763,77 @@ async function requestSettings<T>(path: string, options?: RequestInit): Promise<
   return res.json();
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
-  let res: Response;
-  try {
-    res = await fetch(`${API_BASE}${path}`, {
-      headers: withApiAuth({ "Content-Type": "application/json" }),
-      ...options,
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error(`Request timed out after ${API_TIMEOUT_MS / 1000}s`);
-    }
-    throw error;
-  } finally {
-    window.clearTimeout(timeout);
-  }
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || res.statusText);
-  }
-  return res.json();
-}
-
 export const api = {
+  // --- Auth ---
+  signupStatus: () => requestAuth<{ open: boolean; user_count: number }>("/signup-status"),
+  signup: (email: string, password: string) =>
+    requestAuth<{ user: AuthUser }>("/signup", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    }),
+  login: (email: string, password: string) =>
+    requestAuth<{ user: AuthUser }>("/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    }),
+  logout: () => requestAuth<{ ok: boolean }>("/logout", { method: "POST" }),
+  me: () => requestAuth<{ user: AuthUser; signup_open: boolean; via: string }>("/me"),
+  changePassword: (current_password: string, new_password: string) =>
+    requestAuth<{ ok: boolean }>("/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password, new_password }),
+    }),
+
+  // --- Connected mailboxes (multi-account, Graph + SMTP) ---
+  listEmailAccounts: () => request<EmailAccountList>("/email-accounts"),
+  createEmailAccount: (payload: EmailAccountPayload) =>
+    request<EmailAccountRow>("/email-accounts", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateEmailAccount: (id: string, patch: Partial<EmailAccountPayload>) =>
+    request<EmailAccountRow>(`/email-accounts/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteEmailAccount: (id: string) =>
+    request<{ ok: boolean; id: string }>(`/email-accounts/${id}`, { method: "DELETE" }),
+  reorderEmailAccounts: (accountIds: string[]) =>
+    request<{ ok: boolean; count: number; accounts: EmailAccountRow[] }>(
+      "/email-accounts/reorder",
+      { method: "POST", body: JSON.stringify({ account_ids: accountIds }) },
+    ),
+  testEmailAccount: (id: string, kind: "smtp" | "imap" | "graph") =>
+    request<EmailAccountTestResult>(`/email-accounts/${id}/test`, {
+      method: "POST",
+      body: JSON.stringify({ kind }),
+    }),
+  sendTestEmail: (id: string, to_email: string, subject: string = "", body: string = "") =>
+    request<{ account_id: string; to_email: string; subject: string; sent: EmailAccountTestResult }>(
+      `/email-accounts/${id}/test-send`,
+      {
+        method: "POST",
+        body: JSON.stringify({ to_email, subject, body }),
+      },
+    ),
+  fetchTestInbox: (id: string, recent_minutes: number = 10, limit: number = 10) =>
+    request<{ account_id: string; provider: string; since: string; items: TestInboxItem[] }>(
+      `/email-accounts/${id}/test-inbox?recent_minutes=${recent_minutes}&limit=${limit}`,
+    ),
+  graphConfig: () => request<GraphConfigStatus>("/email-accounts/graph/config"),
+  fetchRecentNotifications: (since?: string, limit = 20) =>
+    request<{ items: NotificationItem[]; unread: number; last_seen_at?: string | null }>(
+      `/notifications/recent${since ? `?since=${encodeURIComponent(since)}&limit=${limit}` : `?limit=${limit}`}`,
+    ),
+  markNotificationsSeen: () => request<{ ok: boolean; last_seen_at: string }>("/notifications/mark-seen", { method: "POST" }),
+  listGraphUsers: () =>
+    request<{ users: GraphUser[]; count: number }>("/email-accounts/graph/users"),
+  bulkAddGraphAccounts: (emails: string[], default_name: string = "") =>
+    request<GraphBulkAddResponse>("/email-accounts/graph/bulk-add", {
+      method: "POST",
+      body: JSON.stringify({ emails, default_name }),
+    }),
+
   createHunt: (data: HuntRequest) =>
     request<HuntResponse>("/hunts", {
       method: "POST",
@@ -663,6 +939,11 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  testGraphSettings: () =>
+    requestSettings<GraphTestResponse>("/email/graph-test", {
+      method: "POST",
+    }),
+
   testImapSettings: () =>
     requestSettings<ImapTestResponse>("/email/imap-test", {
       method: "POST",
@@ -681,11 +962,14 @@ export const api = {
   getHuntCost: (huntId: string) =>
     request<HuntCost>(`/hunts/${huntId}/cost`),
 
-  createEmailCampaign: (huntId: string, name: string) =>
-    request<{ campaign_id: string; status: string; sequence_count: number }>(`/hunts/${huntId}/email-campaigns`, {
-      method: "POST",
-      body: JSON.stringify({ name }),
-    }),
+  createEmailCampaign: (huntId: string, name: string, emailAccountId?: string) =>
+    request<{ campaign_id: string; status: string; sequence_count: number; email_account_id: string; provider_type: string }>(
+      `/hunts/${huntId}/email-campaigns`,
+      {
+        method: "POST",
+        body: JSON.stringify({ name, email_account_id: emailAccountId || null }),
+      },
+    ),
 
   listEmailCampaigns: (huntId: string) =>
     request<EmailCampaignListItem[]>(`/hunts/${huntId}/email-campaigns`),
