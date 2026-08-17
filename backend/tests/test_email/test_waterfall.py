@@ -15,9 +15,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from config.settings import get_settings
 from emailing.scheduler import run_scheduler_once
 from emailing.store import EmailStore
-from config.settings import get_settings
 
 
 @pytest.fixture

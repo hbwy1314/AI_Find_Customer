@@ -12,6 +12,7 @@ from email.utils import getaddresses, parsedate_to_datetime
 from typing import Any, Callable
 
 from api.hunt_store import load_hunt, save_hunt
+from auth import secrets as secret_cipher
 from emailing.store import EmailStore
 
 _AUTO_REPLY_SUBJECT_MARKERS = (
@@ -145,6 +146,16 @@ def _refresh_hunt_email_summary(store: EmailStore, hunt_id: str, campaign_id: st
 
 
 def _match_sent_message(store: EmailStore, inbound: dict[str, Any]) -> dict[str, Any] | None:
+    # Graph replies carry a stable `conversationId` that beats In-Reply-To.
+    conversation_id = str(inbound.get("conversation_id", "") or "").strip()
+    if conversation_id:
+        # thread_key was set to the Graph conversationId on send; we look it up
+        # via the provider_message_id index first, then by scanning thread_key
+        # (cheap because the table is small per campaign).
+        matched = store.find_message_by_thread_key(conversation_id)
+        if matched:
+            return matched
+
     candidates = []
     in_reply_to = _normalize_message_id(str(inbound.get("in_reply_to", "") or ""))
     if in_reply_to:
@@ -200,7 +211,8 @@ def fetch_imap_replies(account: dict[str, Any], *, now_iso: str, recent_days: in
     """Fetch recent inbound messages from IMAP for reply matching."""
     host = str(account.get("imap_host", "") or "").strip()
     username = str(account.get("imap_username", "") or "").strip()
-    password = str(account.get("imap_secret_encrypted", "") or "")
+    secrets = secret_cipher.decrypt_dict(account.get("secrets_ciphertext") or b"")
+    password = secrets.get("imap_secret", "") or str(account.get("imap_secret_encrypted", "") or "")
     port = int(account.get("imap_port", 993) or 993)
     use_tls = bool(account.get("use_tls", True))
     if not host or not username or not password:
@@ -256,20 +268,28 @@ def fetch_imap_replies(account: dict[str, Any], *, now_iso: str, recent_days: in
     return messages
 
 
-async def run_reply_detection_once(
+def process_inbound_messages(
     store: EmailStore,
-    account: dict[str, Any],
-    *,
-    now_iso: str | None = None,
-    fetcher: Callable[..., list[dict[str, Any]]] = fetch_imap_replies,
-) -> dict[str, int]:
-    """Poll inbox once, match replies to sent messages, and stop follow-ups."""
-    current = now_iso or _now_iso()
-    inbound_messages = await asyncio.to_thread(fetcher, account, now_iso=current)
+    inbound_messages: list[dict[str, Any]],
+    current: str,
+) -> dict[str, Any]:
+    """Run the reply-matching loop over a pre-fetched inbound list.
+
+    Shared by the IMAP path (`run_reply_detection_once`) and the Graph
+    path (`run_graph_reply_detection_once`) so both providers apply the
+    exact same dedup / auto-reply filtering / sequence-stopping logic.
+
+    Returns a dict with `checked / matched / skipped / ignored` counts
+    plus a `matches` list of dicts suitable for `render_reply_detected_text`:
+    each entry carries `{lead_email, lead_name, subject, snippet}`. The
+    caller (the email-reply background loop) decides whether to push
+    them to Feishu based on the user's settings.
+    """
     checked = 0
     matched = 0
     skipped = 0
     ignored = 0
+    matched_details: list[dict[str, str]] = []
     for inbound in inbound_messages:
         checked += 1
         raw_ref = str(inbound.get("raw_ref", "") or "")
@@ -308,8 +328,104 @@ async def run_reply_detection_once(
             replied_at=received_at,
             stop_reason="reply_detected",
         )
+        # Mark the specific recipient row that replied. For the
+        # multi-email waterfall, a reply on ANY recipient stops the
+        # whole sequence (so we don't keep trying other emails in
+        # the pool), but the bookkeeping still needs to know which
+        # email replied for analytics.
+        try:
+            recipient = store.find_recipient_by_email(
+                str(sequence["id"]), str(inbound.get("from_email", "") or "").strip().lower()
+            )
+            if recipient:
+                store.mark_recipient_replied(
+                    str(recipient["id"]), replied_at=received_at
+                )
+        except Exception:  # noqa: BLE001
+            # Don't let bookkeeping failures block the reply event.
+            pass
         store.cancel_future_pending_messages(str(sequence["id"]), updated_at=current)
         _refresh_hunt_email_summary(store, str(sequence["hunt_id"]), str(sequence["campaign_id"]))
+        # Capture what we need for a Feishu push notification. The
+        # caller decides whether to actually send one (gated by
+        # `automation_reply_notifications_enabled`).
+        _from_email = str(inbound.get("from_email", "") or "")
+        _subject = str(inbound.get("subject", "") or "")
+        _snippet = str(inbound.get("snippet", "") or "")
+        matched_details.append({
+            "lead_email": _from_email,
+            "lead_name": str(sequence.get("lead_name", "") or ""),
+            "subject": _subject,
+            "snippet": _snippet,
+        })
+        # SSE push so the browser bell updates without waiting for the
+        # 30s poll. Best-effort: never raise out of the detection loop.
+        try:
+            from api.sse import _broadcast_reply
+            _broadcast_reply({
+                "id": str(uuid.uuid4()),
+                "sequence_id": str(sequence["id"]),
+                "hunt_id": str(sequence.get("hunt_id", "") or ""),
+                "campaign_id": str(sequence.get("campaign_id", "") or ""),
+                "from_email": _from_email,
+                "subject": _subject,
+                "snippet": _snippet,
+                "received_at": received_at,
+            })
+        except Exception:
+            # SSE is best-effort; an import error or broadcast hiccup
+            # must never break the reply-detection loop.
+            import logging as _logging
+            _logging.getLogger(__name__).exception(
+                "[EmailReply] SSE broadcast failed for sequence %s", sequence["id"],
+            )
         matched += 1
 
-    return {"checked": checked, "matched": matched, "skipped": skipped, "ignored": ignored}
+    return {
+        "checked": checked,
+        "matched": matched,
+        "skipped": skipped,
+        "ignored": ignored,
+        "matches": matched_details,
+    }
+
+
+async def run_reply_detection_once(
+    store: EmailStore,
+    account: dict[str, Any],
+    *,
+    now_iso: str | None = None,
+    fetcher: Callable[..., list[dict[str, Any]]] = fetch_imap_replies,
+) -> dict[str, Any]:
+    """Poll an IMAP inbox once, match replies to sent messages, stop follow-ups.
+
+    This is the SMTP-provider entry point. For the Graph provider use
+    `run_graph_reply_detection_once` instead.
+    """
+    current = now_iso or _now_iso()
+    inbound_messages = await asyncio.to_thread(fetcher, account, now_iso=current)
+    return process_inbound_messages(store, inbound_messages, current)
+
+
+async def run_graph_reply_detection_once(
+    store: EmailStore,
+    account: dict[str, Any] | None = None,
+    *,
+    now_iso: str | None = None,
+    recent_days: int = 14,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Poll a Graph mailbox once and match replies to sent messages.
+
+    Graph-provider counterpart of `run_reply_detection_once`. With
+    `account=None` it polls the global shared mailbox (`GRAPH_MAILBOX_UPN`);
+    pass a connected account row to poll that account's own mailbox —
+    replies land in whichever mailbox did the sending.
+    """
+    from emailing import graph_client
+
+    current = now_iso or _now_iso()
+    inbound_messages = await graph_client.fetch_graph_replies(
+        account, now_iso=current, recent_days=recent_days, limit=limit
+    )
+    return process_inbound_messages(store, inbound_messages, current)

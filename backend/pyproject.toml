@@ -27,5 +27,6 @@ ignore = [
     "E402",  # module-import-not-at-top-of-file (we do this in several places intentionally)
     "E701",  # multiple-statements-on-one-line-colon
     "E741",  # ambiguous-variable-name (l, I, O)
+    "F401",  # unused-import: pre-existing tech debt across tools/*.py
     "F841",  # unused-variable: pre-existing tech debt, mostly in tests
 ]

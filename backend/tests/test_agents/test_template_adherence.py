@@ -15,8 +15,8 @@ template". These tests pin down the new behavior:
 from __future__ import annotations
 
 import asyncio
-import sys
 import os
+import sys
 import tempfile
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -34,7 +34,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from agents import email_craft_agent  # noqa: E402
 from config.settings import get_settings  # noqa: E402
 from emailing import template_pipeline  # noqa: E402
-
 
 # --- extract_required_tokens --------------------------------------------
 
