@@ -6,13 +6,13 @@ After=network.target
 Type=simple
 User=aihunter
 Group=aihunter
-WorkingDirectory=/opt/ai-hunter/backend
+WorkingDirectory=/opt/ai-hunter/repo/backend
 Environment=PYTHONUNBUFFERED=1
 # All runtime config (LLM/email/Graph keys, SESSION_SECRET, etc.) is loaded
 # from this file by pydantic-settings. NEVER commit a populated version.
 EnvironmentFile=-/etc/ai-hunter.env
-ExecStartPre=-/usr/bin/install -d -o aihunter -g aihunter /opt/ai-hunter/backend/data
-ExecStart=/opt/ai-hunter/backend/.venv/bin/python -m uvicorn api.app:app --host 127.0.0.1 --port 8000
+ExecStartPre=-/usr/bin/install -d -o aihunter -g aihunter /opt/ai-hunter/repo/backend/data
+ExecStart=/opt/ai-hunter/repo/backend/.venv/bin/python -m uvicorn api.app:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
 # Bound graceful shutdown so long-lived SSE / WebSocket clients don't
@@ -25,7 +25,7 @@ ProtectSystem=strict
 ProtectHome=true
 NoNewPrivileges=true
 PrivateTmp=true
-ReadWritePaths=/opt/ai-hunter/backend/data /opt/ai-hunter/backend/uploads /opt/ai-hunter/backend
+ReadWritePaths=/opt/ai-hunter/repo/backend/data /opt/ai-hunter/repo/backend/uploads /opt/ai-hunter/repo/backend
 
 [Install]
 WantedBy=multi-user.target
