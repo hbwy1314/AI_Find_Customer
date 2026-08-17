@@ -16,6 +16,79 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _advance_expired_recipients(store: EmailStore, current_iso: str) -> int:
+    """Flip ``waiting_reply`` recipients past the waterfall window to
+    ``skipped`` and clone the latest sent message into a new pending
+    row addressed to the next pending recipient.
+
+    Returns the number of recipients flipped. Called once per
+    scheduler pass so we react to "no reply" the next minute, not
+    the next day.
+
+    The window is taken from settings.email_recipient_waterfall_days
+    (default 3). 0 disables the waterfall — we then never advance
+    waiting recipients, and a single-email sequence behaves exactly
+    like the legacy code.
+    """
+    settings = get_settings()
+    raw_days = getattr(settings, "email_recipient_waterfall_days", 3)
+    # NB: `raw_days` may be 0 (disabled) — preserve the zero, don't
+    # fall back to 3 on falsy.
+    try:
+        days = int(raw_days)
+    except (TypeError, ValueError):
+        days = 3
+    if days <= 0:
+        return 0
+    threshold = (
+        datetime.fromisoformat(current_iso.replace("Z", "+00:00"))
+        if "T" in current_iso
+        else datetime.now(timezone.utc)
+    )
+    if threshold.tzinfo is None:
+        threshold = threshold.replace(tzinfo=timezone.utc)
+    cutoff = (threshold - timedelta(days=days)).isoformat()
+    expired = store.waiting_recipients_older_than(cutoff)
+    flipped = 0
+    for r in expired:
+        store.advance_waiting_recipient(str(r["id"]), updated_at=current_iso)
+        flipped += 1
+        # Pick the next pending recipient for this sequence. If none
+        # remain, the sequence is exhausted — nothing more to send.
+        next_recipient = store.next_pending_recipient(str(r["sequence_id"]))
+        if next_recipient is None:
+            # Mark the sequence as exhausted so the UI surfaces it.
+            try:
+                store.update_sequence_status(
+                    str(r["sequence_id"]),
+                    status="exhausted",
+                    updated_at=current_iso,
+                    stop_reason="all_recipients_tried",
+                    next_scheduled_at="",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            continue
+        # Update sequence's primary lead_email to the next recipient
+        # (so any subsequent steps we create — and the unsubscribe /
+        # dedup logic — use the new address).
+        store.update_sequence_lead_email(
+            str(r["sequence_id"]),
+            lead_email=str(next_recipient["email"]),
+            updated_at=current_iso,
+        )
+        # Clone the most-recent message for this sequence into a
+        # fresh pending row. The previous message stays as `sent`
+        # for history. The new row will be picked up on the next
+        # scheduler pass.
+        latest = store.latest_message_for_sequence(str(r["sequence_id"]))
+        if latest:
+            store.clone_pending_message_after(
+                str(latest["id"]), scheduled_at=current_iso
+            )
+    return flipped
+
+
 def _pick_fallback_account(
     store: EmailStore,
     current_account: dict[str, Any],
@@ -86,6 +159,13 @@ async def run_scheduler_once(
 ) -> dict[str, int]:
     """Send pending email jobs that are ready."""
     current = now_iso or _now_iso()
+    # WATERFALL STEP 1: flip any waiting_reply recipients whose
+    # `last_attempt_at` is older than the configured waterfall window
+    # to `skipped`. After this, `next_pending_recipient` will pick the
+    # next candidate in the pool. This runs first so a sequence
+    # that's been waiting gets a fresh shot on the very next pass.
+    _advance_expired_recipients(store, current)
+
     jobs = store.list_pending_messages_ready(current)
     sent = 0
     failed = 0
@@ -96,7 +176,7 @@ async def run_scheduler_once(
     sent_today_cache: dict[str, int] = {}
     for job in jobs:
         sequence = store.get_sequence(str(job.get("sequence_id", "")))
-        if not sequence or sequence.get("status") in {"replied", "stopped", "completed", "failed"}:
+        if not sequence or sequence.get("status") in {"replied", "stopped", "completed", "failed", "exhausted"}:
             skipped += 1
             continue
         campaign = store.get_campaign(str(sequence.get("campaign_id", "")))
@@ -188,7 +268,25 @@ async def run_scheduler_once(
                 _refresh_hunt_email_summary(store, str(sequence["hunt_id"]), str(sequence["campaign_id"]))
                 continue
 
-        recipient = str(sequence.get("lead_email", "") or "").strip()
+        # WATERFALL: resolve the actual recipient. The pool is checked
+        # first (multi-email mode); we fall back to sequence.lead_email
+        # for legacy single-recipient sequences that never registered
+        # a pool. If both are empty there's nothing to send — skip the
+        # job so it doesn't loop forever in pending.
+        recipient = ""
+        recipient_row = store.next_pending_recipient(str(sequence["id"]))
+        if recipient_row:
+            recipient = str(recipient_row.get("email", "") or "").strip()
+        if not recipient:
+            recipient = str(sequence.get("lead_email", "") or "").strip()
+        if not recipient:
+            store.mark_message_failed(
+                str(job["id"]),
+                failure_reason="no_recipient",
+                updated_at=current,
+            )
+            failed += 1
+            continue
         # Unsubscribe guard — required for CAN-SPAM/GDPR compliance. A
         # global 'all' opt-out stops every future send to this address;
         # a finer scope (campaign:{id}) stops just that campaign. Either
@@ -244,29 +342,115 @@ async def run_scheduler_once(
             )
             sent_today_cache[account_id] = sent_today_cache.get(account_id, 0) + 1
             step_number = int(job.get("step_number", 1) or 1)
-            next_message = store.get_message_for_step(str(sequence["id"]), step_number + 1)
-            next_scheduled = str(next_message.get("scheduled_at", "") or "") if next_message else ""
+            # WATERFALL: mark this recipient as waiting_reply so the
+            # scheduler will time it out and clone a fresh message
+            # for the next recipient if no reply arrives. Done BEFORE
+            # the status calculation so the exhaustion check below
+            # sees the recipient in waiting_reply state.
+            if recipient_row is not None:
+                store.mark_recipient_sent(
+                    str(recipient_row["id"]), sent_at=current
+                )
+            # Decide sequence status:
+            # - exhausted: pool is empty (no pending + no waiting)
+            # - completed (legacy): no recipient pool AND no next step
+            # - running: anything else
+            next_step_message = store.get_message_for_step(
+                str(sequence["id"]), step_number + 1
+            )
+            recipients = store.list_recipients(str(sequence["id"]))
+            if recipients:
+                if store.is_sequence_exhausted(str(sequence["id"])):
+                    new_status = "exhausted"
+                    stop_reason = "all_recipients_tried"
+                    next_sched = ""
+                else:
+                    new_status = "running"
+                    stop_reason = None
+                    next_sched = ""
+            elif next_step_message is not None:
+                new_status = "running"
+                stop_reason = None
+                next_sched = str(next_step_message.get("scheduled_at", "") or "")
+            else:
+                new_status = "completed"
+                stop_reason = None
+                next_sched = ""
             store.update_sequence_status(
                 str(sequence["id"]),
-                status="completed" if not next_message else "running",
+                status=new_status,
                 updated_at=current,
                 current_step=step_number,
                 last_sent_at=current,
-                next_scheduled_at=next_scheduled,
+                next_scheduled_at=next_sched,
+                stop_reason=stop_reason,
             )
             sent += 1
         else:
+            error_kind = str(result.get("error_type", "") or result.get("error", "") or "send_failed")
             store.mark_message_failed(
                 str(job["id"]),
-                failure_reason=str(result.get("error_type", "") or result.get("error", "") or "send_failed"),
+                failure_reason=error_kind,
                 updated_at=current,
             )
-            store.update_sequence_status(
-                str(sequence["id"]),
-                status="failed",
-                updated_at=current,
-                stop_reason=str(result.get("error_type", "") or "send_failed"),
-            )
+            # WATERFALL: don't park the whole sequence on a single
+            # send failure — just retire this recipient (e.g. bad
+            # address, mailbox full) and let the next pending one
+            # try. We only mark the sequence `failed` if this was a
+            # legacy single-recipient sequence (no pool). For pooled
+            # sequences the status decision is the same as the success
+            # branch — exhausted if pool is empty, running otherwise.
+            if recipient_row is not None:
+                store.mark_recipient_failed(
+                    str(recipient_row["id"]),
+                    reason=error_kind,
+                    updated_at=current,
+                )
+                recipients = store.list_recipients(str(sequence["id"]))
+                if recipients and store.is_sequence_exhausted(str(sequence["id"])):
+                    new_status = "exhausted"
+                    stop_reason = "all_recipients_failed"
+                else:
+                    new_status = "running"
+                    stop_reason = None
+                store.update_sequence_status(
+                    str(sequence["id"]),
+                    status=new_status,
+                    updated_at=current,
+                    stop_reason=stop_reason,
+                )
+                # If a next pending recipient exists, clone a fresh
+                # message for it in THIS pass so the scheduler
+                # immediately retries with the next candidate. Without
+                # this the sequence would look stalled until the
+                # next scheduler tick — bad for product UX and
+                # confusing in tests.
+                next_rec = store.next_pending_recipient(str(sequence["id"]))
+                if next_rec is not None:
+                    store.update_sequence_lead_email(
+                        str(sequence["id"]),
+                        lead_email=str(next_rec["email"]),
+                        updated_at=current,
+                    )
+                    latest = store.latest_message_for_sequence(str(sequence["id"]))
+                    if latest:
+                        new_msg_id = store.clone_pending_message_after(
+                            str(latest["id"]), scheduled_at=current
+                        )
+                        if new_msg_id:
+                            new_job = store.get_message(new_msg_id)
+                            if new_job:
+                                jobs.append(new_job)
+            else:
+                # Legacy single-recipient behavior: a failed send
+                # parks the sequence. Tests that exercise this path
+                # use `status="failed"` in the response.
+                store.update_sequence_status(
+                    str(sequence["id"]),
+                    status="failed",
+                    updated_at=current,
+                    stop_reason=error_kind,
+                )
             failed += 1
         _refresh_hunt_email_summary(store, str(sequence["hunt_id"]), str(sequence["campaign_id"]))
     return {"sent": sent, "failed": failed, "skipped": skipped}

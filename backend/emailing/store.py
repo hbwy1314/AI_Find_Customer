@@ -80,6 +80,30 @@ CREATE TABLE IF NOT EXISTS lead_email_sequences (
   updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sequence_campaign_lead ON lead_email_sequences(campaign_id, lead_key);
+-- Per-sequence recipient pool for the "waterfall" send strategy.
+-- A sequence can have 1..N recipients; the scheduler picks the next
+-- `pending` one, sends, marks it `waiting_reply`. After
+-- `email_recipient_waterfall_days` with no reply, the recipient is
+-- marked `skipped` and the scheduler advances to the next `pending`
+-- row. A reply from ANY recipient flips the whole sequence to
+-- `replied`. `position` is the order to try recipients in (lower
+-- first); callers pass the candidate list in the order they want
+-- them tried.
+CREATE TABLE IF NOT EXISTS lead_email_recipients (
+  id TEXT PRIMARY KEY,
+  sequence_id TEXT NOT NULL,
+  email TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  sent_at TEXT DEFAULT '',
+  last_attempt_at TEXT DEFAULT '',
+  replied_at TEXT DEFAULT '',
+  failure_reason TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recipient_sequence ON lead_email_recipients(sequence_id);
+CREATE INDEX IF NOT EXISTS idx_recipient_status_pos ON lead_email_recipients(sequence_id, status, position);
 CREATE TABLE IF NOT EXISTS email_messages (
   id TEXT PRIMARY KEY,
   sequence_id TEXT NOT NULL,
@@ -97,7 +121,11 @@ CREATE TABLE IF NOT EXISTS email_messages (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_email_message_sequence_step ON email_messages(sequence_id, step_number);
+-- Not unique per (sequence_id, step_number): waterfall creates a fresh
+-- message row for each recipient attempt of the same step. The unique
+-- index that used to be here was removed when the waterfall was
+-- introduced (see commit history).
+CREATE INDEX IF NOT EXISTS idx_email_message_sequence_step ON email_messages(sequence_id, step_number);
 CREATE INDEX IF NOT EXISTS idx_email_message_status_schedule ON email_messages(status, scheduled_at);
 -- Test sends go through a separate table because they have no
 -- `lead_email_sequences` row (so we can't satisfy email_messages'
@@ -202,6 +230,23 @@ class EmailStore:
     def init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(_DDL)
+            # Migration: the legacy DDL had `CREATE UNIQUE INDEX` on
+            # `email_messages(sequence_id, step_number)`. The waterfall
+            # feature intentionally creates multiple rows per (sequence,
+            # step) — one per recipient attempt — so the unique index
+            # must be downgraded. `CREATE INDEX IF NOT EXISTS` is a no-op
+            # when the index already exists, so we have to drop first.
+            legacy_unique = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' "
+                "AND name='idx_email_message_sequence_step' "
+                "AND sql LIKE '%UNIQUE%'"
+            ).fetchone()
+            if legacy_unique:
+                conn.execute("DROP INDEX idx_email_message_sequence_step")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_email_message_sequence_step "
+                    "ON email_messages(sequence_id, step_number)"
+                )
             self._ensure_column(conn, "lead_email_sequences", "generation_mode", "TEXT NOT NULL DEFAULT 'personalized'")
             self._ensure_column(conn, "lead_email_sequences", "template_id", "TEXT DEFAULT ''")
             self._ensure_column(conn, "lead_email_sequences", "template_group", "TEXT DEFAULT ''")
@@ -445,6 +490,184 @@ class EmailStore:
                 [payload[c] for c in cols],
             )
 
+    # --- waterfall recipient pool (per-sequence multi-email) ---------
+
+    def add_recipients(
+        self,
+        sequence_id: str,
+        emails: list[str],
+    ) -> list[dict[str, Any]]:
+        """Insert one row per email into lead_email_recipients for the
+        given sequence. Position is the list order (0 = first try).
+        Returns the inserted rows.
+
+        Empty / dedup-safe: skipped duplicates within the same input
+        and existing rows for the sequence.
+        """
+        seq_id = str(sequence_id or "").strip()
+        if not seq_id:
+            raise ValueError("sequence_id is required")
+        norm: list[str] = []
+        seen: set[str] = set()
+        for raw in emails or []:
+            e = (raw or "").strip().lower()
+            if not e or e in seen:
+                continue
+            seen.add(e)
+            norm.append(e)
+        if not norm:
+            return []
+        now = datetime.now(timezone.utc).isoformat()
+        inserted: list[dict[str, Any]] = []
+        with self._connect() as conn:
+            existing = {
+                row["email"]
+                for row in conn.execute(
+                    "SELECT email FROM lead_email_recipients WHERE sequence_id = ?",
+                    (seq_id,),
+                ).fetchall()
+            }
+            for pos, email in enumerate(norm):
+                if email in existing:
+                    continue
+                row_id = uuid.uuid4().hex
+                conn.execute(
+                    "INSERT INTO lead_email_recipients "
+                    "(id, sequence_id, email, position, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                    (row_id, seq_id, email, pos, now, now),
+                )
+                inserted.append(
+                    {
+                        "id": row_id,
+                        "sequence_id": seq_id,
+                        "email": email,
+                        "position": pos,
+                        "status": "pending",
+                    }
+                )
+        return inserted
+
+    def list_recipients(self, sequence_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM lead_email_recipients "
+                "WHERE sequence_id = ? ORDER BY position ASC, created_at ASC",
+                (sequence_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def next_pending_recipient(self, sequence_id: str) -> dict[str, Any] | None:
+        """Return the lowest-position pending recipient, or None.
+
+        If a recipient is `waiting_reply` (already sent) and we have
+        no other `pending` ones, we DON'T pick the waiting one again
+        — the scheduler will time-out that one and flip it to
+        `skipped` before continuing. This is the "waterfall" loop.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM lead_email_recipients "
+                "WHERE sequence_id = ? AND status = 'pending' "
+                "ORDER BY position ASC, created_at ASC LIMIT 1",
+                (sequence_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def mark_recipient_sent(
+        self, recipient_id: str, *, sent_at: str
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE lead_email_recipients "
+                "SET status = 'waiting_reply', sent_at = ?, last_attempt_at = ?, updated_at = ? "
+                "WHERE id = ?",
+                (sent_at, sent_at, sent_at, recipient_id),
+            )
+
+    def mark_recipient_failed(
+        self, recipient_id: str, *, reason: str, updated_at: str
+    ) -> None:
+        """A send failed (transient or permanent). Park the recipient
+        in `failed` so we don't retry it on the same day. The scheduler
+        will pick the next pending one (or skip if this was the last)."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE lead_email_recipients "
+                "SET status = 'failed', failure_reason = ?, last_attempt_at = ?, updated_at = ? "
+                "WHERE id = ?",
+                (reason, updated_at, updated_at, recipient_id),
+            )
+
+    def advance_waiting_recipient(
+        self, recipient_id: str, *, updated_at: str
+    ) -> None:
+        """A waiting_reply recipient has been waiting too long with no
+        reply — mark it `skipped` so the scheduler moves to the next."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE lead_email_recipients "
+                "SET status = 'skipped', updated_at = ? WHERE id = ?",
+                (updated_at, recipient_id),
+            )
+
+    def mark_recipient_replied(
+        self, recipient_id: str, *, replied_at: str
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE lead_email_recipients "
+                "SET status = 'replied', replied_at = ?, updated_at = ? WHERE id = ?",
+                (replied_at, replied_at, recipient_id),
+            )
+
+    def find_recipient_by_email(
+        self, sequence_id: str, email: str
+    ) -> dict[str, Any] | None:
+        """Look up a recipient row by email (for reply-detector)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM lead_email_recipients "
+                "WHERE sequence_id = ? AND email = ? LIMIT 1",
+                (sequence_id, (email or "").strip().lower()),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def waiting_recipients_older_than(
+        self, threshold_iso: str
+    ) -> list[dict[str, Any]]:
+        """Return all waiting_reply recipients whose ``sent_at`` is
+        before the threshold — these are due to be flipped to ``skipped``
+        (waterfall window elapsed, no reply).
+
+        We use ``sent_at`` (not ``last_attempt_at``) because the
+        waterfall window measures "time since we sent" — failed
+        recipients have a stale ``last_attempt_at`` but no actual
+        delivery to time out from, and they're already retired via
+        ``mark_recipient_failed``.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM lead_email_recipients "
+                "WHERE status = 'waiting_reply' "
+                "AND sent_at != '' AND sent_at < ? "
+                "ORDER BY sent_at ASC",
+                (threshold_iso,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def is_sequence_exhausted(self, sequence_id: str) -> bool:
+        """True when no `pending` or `waiting_reply` rows remain
+        (i.e. all recipients have been sent, replied, or skipped)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT "
+                "  SUM(CASE WHEN status IN ('pending','waiting_reply') THEN 1 ELSE 0 END) AS active "
+                "FROM lead_email_recipients WHERE sequence_id = ?",
+                (sequence_id,),
+            ).fetchone()
+        return not (row and (row["active"] or 0))
+
     def get_sequence(self, sequence_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM lead_email_sequences WHERE id = ?", (sequence_id,)).fetchone()
@@ -512,6 +735,72 @@ class EmailStore:
                 f"UPDATE lead_email_sequences SET {', '.join(fields)} WHERE id = ?",
                 values,
             )
+
+    def update_sequence_lead_email(
+        self, sequence_id: str, *, lead_email: str, updated_at: str
+    ) -> None:
+        """Set the sequence's primary recipient. Used by the waterfall
+        to point step 1 (and any subsequent steps) at the new
+        recipient after a previous one was skipped."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE lead_email_sequences SET lead_email = ?, updated_at = ? "
+                "WHERE id = ?",
+                (lead_email, updated_at, sequence_id),
+            )
+
+    def clone_pending_message_after(
+        self, source_message_id: str, *, scheduled_at: str
+    ) -> str | None:
+        """Copy a sent/failed message into a fresh pending row for the
+        same step but the sequence's CURRENT lead_email (which the
+        caller has already updated to the next recipient). Returns
+        the new message id, or None if the source is missing.
+
+        Used by the waterfall advancement: the previous message stays
+        as `sent` (history), and a new `pending` row is created so
+        the scheduler picks it up on the next pass.
+        """
+        with self._connect() as conn:
+            src = conn.execute(
+                "SELECT * FROM email_messages WHERE id = ?",
+                (source_message_id,),
+            ).fetchone()
+            if not src:
+                return None
+            new_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO email_messages "
+                "(id, sequence_id, step_number, goal, locale, subject, body_text, "
+                " status, scheduled_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (
+                    new_id,
+                    src["sequence_id"],
+                    src["step_number"],
+                    src["goal"],
+                    src["locale"],
+                    src["subject"],
+                    src["body_text"],
+                    scheduled_at,
+                    scheduled_at,
+                    scheduled_at,
+                ),
+            )
+        return new_id
+
+    def latest_message_for_sequence(self, sequence_id: str) -> dict[str, Any] | None:
+        """Return the most-recently-created message for the sequence,
+        regardless of status. Used by the waterfall to find the row
+        that was sent to the now-skipped recipient (so we can clone
+        it for the next recipient)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM email_messages WHERE sequence_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (sequence_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def create_message(self, payload: dict[str, Any]) -> None:
         cols = list(payload.keys())

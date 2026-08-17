@@ -170,6 +170,18 @@ class Settings(BaseSettings):
     # Hard ceiling on outbound requests/second to stay well below
     # Hunter's 50/s limit and avoid bursts tripping their WAF.
     hunter_requests_per_second: int = 10
+
+    # --- Waterfall send strategy (multi-email per lead) -----------------
+    # When a sequence has multiple candidate recipients, the scheduler
+    # tries them one at a time. After the first one has been sitting in
+    # ``waiting_reply`` for this many days with no reply, it flips to
+    # ``skipped`` and the scheduler advances to the next ``pending``
+    # recipient. Set 0 to disable the waterfall (single-email legacy
+    # behavior).
+    email_recipient_waterfall_days: int = 3
+    # Hard cap on the number of recipients per sequence. A lead with 10
+    # candidate emails will only ever have the first N tried.
+    email_recipient_max_per_lead: int = 3
     email_daily_send_limit: int = 20
     email_hourly_send_limit: int = 10
     email_language_mode: str = "auto_by_region"
