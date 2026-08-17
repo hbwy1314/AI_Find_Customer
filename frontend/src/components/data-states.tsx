@@ -120,8 +120,9 @@ export function ErrorState({
 export interface EmptyStateProps {
   /** Short title. */
   title: string;
-  /** Optional supporting line. */
-  message?: string;
+  /** Optional supporting line. Accepts a string or JSX so callers
+   *  can drop in a link / inline action. */
+  message?: React.ReactNode;
   /** Lucide icon name. Defaults to Inbox. */
   icon?: React.ReactNode;
   /** Optional CTA button (e.g. "Create a hunt"). */

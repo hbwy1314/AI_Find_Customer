@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Mail, Pencil, Plus, Trash2 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import { api, type EmailAccountRow } from "../api/client";
+import { EmptyState, LoadingState } from "@/components/data-states";
 
 function GraphConfigCard() {
   const { data, isLoading } = useQuery({
@@ -484,9 +485,12 @@ export function ConnectedMailboxesPage() {
         </div>
         <div className="p-6 space-y-3">
           {isLoading ? (
-            <div className="text-sm text-muted-foreground">加载中…</div>
+            <LoadingState message="正在加载邮箱…" variant="skeleton" skeletonCount={2} />
           ) : !data || data.accounts.length === 0 ? (
-            <div className="text-sm text-muted-foreground">还没有邮箱，点上方 “添加邮箱” 创建第一个。</div>
+            <EmptyState
+              title="还没有邮箱"
+              message='点上方 "添加邮箱" 创建第一个。'
+            />
           ) : (
             data.accounts.map((acc) => (
               <AccountRow
