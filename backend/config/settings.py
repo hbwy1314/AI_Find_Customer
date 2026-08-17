@@ -157,6 +157,19 @@ class Settings(BaseSettings):
     email_business_hours_end: str = "18:00"
     email_weekdays_only: bool = True
     email_timezone: str = "Asia/Shanghai"
+
+    # --- External lead-source APIs (Hunter.io for email finding/verification) ---
+    # ``hunter_api_key`` is also exposed in the settings UI; we declare it
+    # here too so ``get_settings().hunter_api_key`` works without
+    # round-tripping through the settings_routes model.
+    hunter_api_key: str = ""
+    # Soft monthly quota (Hunter charges per API call beyond the free
+    # tier). 0 = unlimited. ``hunter_client`` raises ``HunterQuotaExhausted``
+    # once we hit this and stops calling Hunter for the rest of the month.
+    hunter_monthly_quota: int = 500
+    # Hard ceiling on outbound requests/second to stay well below
+    # Hunter's 50/s limit and avoid bursts tripping their WAF.
+    hunter_requests_per_second: int = 10
     email_daily_send_limit: int = 20
     email_hourly_send_limit: int = 10
     email_language_mode: str = "auto_by_region"

@@ -416,7 +416,7 @@ export const SEARCH_FIELDS: FieldDef[] = [
 ];
 
 export const EMAIL_FIELDS: FieldDef[] = [
-  { key: "hunter_api_key", label: "Hunter.io API Key", placeholder: "", secret: true, hint: "企业邮箱发现" },
+  { key: "hunter_api_key", label: "Hunter.io API Key", placeholder: "", secret: true, hint: "用于 Hunter.io Domain Search / Email Finder / Verifier（填了才生效；不填时仅用本地正则）" },
 ];
 
 export const CONCURRENCY_FIELDS: FieldDef[] = [
