@@ -10,28 +10,36 @@ import socket
 from argparse import Namespace
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
+from api.auth_routes import router as auth_router
 from api.automation_routes import router as automation_router
-from api.hunt_store import load_all_hunts
+from api.email_accounts_routes import router as email_accounts_router
 from api.email_routes import (
     CreateCampaignRequest,
     create_email_campaign,
-    router as email_router,
     start_email_campaign,
 )
+from api.email_routes import (
+    router as email_router,
+)
+from api.hunt_store import load_all_hunts
+from api.notifications_routes import router as notifications_router
 from api.routes import (
     HuntRequest,
     TemplateSeedRequest,
-    _prepare_template_seed,
     _hunts,
+    _prepare_template_seed,
     create_hunt_internal,
+    request_hunt_cancel,
     router,
     start_background_workers,
     stop_background_workers,
-    request_hunt_cancel,
 )
 from api.settings_routes import router as settings_router
 from api.sse import sse_router
@@ -49,10 +57,10 @@ from automation.notifier import (
 )
 from automation.runtime import update_worker_state
 from config.settings import get_settings
-from emailing.readiness import ensure_imap_tested, ensure_smtp_tested
+from emailing.readiness import ensure_imap_tested, ensure_outbound_tested
 from emailing.reply_detector import run_reply_detection_once
 from emailing.scheduler import run_scheduler_once
-from emailing.store import EmailStore
+from emailing.store import EmailStore, set_email_store
 from scripts.headless_worker import JobCancelledError, _campaign_name
 
 # Configure logging for the entire application
@@ -70,6 +78,7 @@ logging.getLogger("LiteLLM Router").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 import litellm  # noqa: E402
+
 litellm.suppress_debug_info = True
 litellm.set_verbose = False
 
@@ -135,6 +144,8 @@ def _template_seed_request_from_payload(payload: dict[str, object]) -> TemplateS
         uploaded_file_ids=list(payload.get("uploaded_file_ids", []) or payload.get("uploaded_files", []) or []),
         email_template_examples=list(payload.get("email_template_examples", []) or []),
         email_template_notes=str(payload.get("email_template_notes", "") or ""),
+        email_account_id=(str(payload.get("email_account_id")).strip() or None)
+        if payload.get("email_account_id") else None,
     )
 
 
@@ -318,20 +329,46 @@ async def _run_embedded_consumer_job(args: Namespace, payload: dict[str, object]
         campaign_summary: dict[str, object] | None = None
         if args.auto_start_campaign and payload.get("enable_email_craft"):
             ensure_not_cancelled()
-            report("create_campaign", "Creating campaign from approved email sequences", hunt_id=hunt_id)
-            created_campaign = await create_email_campaign(
-                hunt_id,
-                CreateCampaignRequest(name=_campaign_name(args.campaign_name_prefix, hunt_id)),
-            )
-            campaign_id = str(created_campaign.campaign_id)
-            sequence_count = int(created_campaign.sequence_count or 0)
-            if sequence_count > 0:
-                ensure_not_cancelled()
-                report("start_campaign", "Starting campaign and handing off to scheduler", hunt_id=hunt_id)
-                campaign_summary = await start_email_campaign(campaign_id)
+            if not sequences:
+                # A hunt that found no leads produces no email sequences.
+                # That is a valid outcome, not an error: skip campaign
+                # creation and complete the job. Calling
+                # create_email_campaign here would raise 400 "No generated
+                # email sequences" and requeue the job forever.
+                report(
+                    "campaign_skipped",
+                    "Hunt produced no email sequences; nothing to send",
+                    hunt_id=hunt_id,
+                )
+                campaign_summary = {
+                    "campaign_id": "",
+                    "status": "skipped_no_sequences",
+                    "sequence_count": 0,
+                }
             else:
-                report("campaign_draft", "Campaign created but no send-ready sequences were available", hunt_id=hunt_id)
-                campaign_summary = {"campaign_id": campaign_id, "status": "draft", "sequence_count": 0}
+                report("create_campaign", "Creating campaign from approved email sequences", hunt_id=hunt_id)
+                # Plumb the user-pinned account (if any) through to the
+                # campaign. None / empty falls back to the auto-managed
+                # default account, which follows `Settings.email_provider_type`.
+                pinned_account_id = payload.get("email_account_id")
+                if isinstance(pinned_account_id, str):
+                    pinned_account_id = pinned_account_id.strip() or None
+                created_campaign = await create_email_campaign(
+                    hunt_id,
+                    CreateCampaignRequest(
+                        name=_campaign_name(args.campaign_name_prefix, hunt_id),
+                        email_account_id=pinned_account_id,
+                    ),
+                )
+                campaign_id = str(created_campaign.campaign_id)
+                sequence_count = int(created_campaign.sequence_count or 0)
+                if sequence_count > 0:
+                    ensure_not_cancelled()
+                    report("start_campaign", "Starting campaign and handing off to scheduler", hunt_id=hunt_id)
+                    campaign_summary = await start_email_campaign(campaign_id)
+                else:
+                    report("campaign_draft", "Campaign created but no send-ready sequences were available", hunt_id=hunt_id)
+                    campaign_summary = {"campaign_id": campaign_id, "status": "draft", "sequence_count": 0}
 
         final_result: dict[str, object] = {
             "hunt_id": hunt_id,
@@ -433,24 +470,46 @@ async def _run_automation_consumer_once() -> bool:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        available_at = (
-            datetime.now(timezone.utc)
-            + timedelta(seconds=max(1, int(settings.automation_consumer_retry_delay_seconds)))
-        ).isoformat()
-        queue.requeue(
-            job_id,
-            available_at=available_at,
-            error_message=str(exc),
-            updated_at=_now_iso(),
-            hunt_id=_extract_hunt_id_from_error(str(exc)),
-        )
-        update_worker_state(
-            "consumer",
-            active_job_id="",
-            last_activity_at=_now_iso(),
-            last_error=str(exc),
-        )
-        logger.exception("[AutomationConsumer] job=%s failed and was requeued: %s", job_id[:8], exc)
+        attempts_used = int(job.get("attempt_count", 0) or 0)
+        max_attempts = max(1, int(getattr(settings, "automation_consumer_max_attempts", 5) or 5))
+        if attempts_used >= max_attempts:
+            # Permanent failures (e.g. an endpoint 400/409) must not
+            # requeue forever — the attempt budget is exhausted, so mark
+            # the job failed and surface the error in the console.
+            queue.mark_failed(
+                job_id,
+                error_message=f"stopped after {attempts_used} attempts: {exc}",
+                finished_at=_now_iso(),
+            )
+            update_worker_state(
+                "consumer",
+                active_job_id="",
+                last_activity_at=_now_iso(),
+                last_error=str(exc),
+            )
+            logger.error(
+                "[AutomationConsumer] job=%s permanently failed after %s attempt(s): %s",
+                job_id[:8], attempts_used, exc,
+            )
+        else:
+            available_at = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=max(1, int(settings.automation_consumer_retry_delay_seconds)))
+            ).isoformat()
+            queue.requeue(
+                job_id,
+                available_at=available_at,
+                error_message=str(exc),
+                updated_at=_now_iso(),
+                hunt_id=_extract_hunt_id_from_error(str(exc)),
+            )
+            update_worker_state(
+                "consumer",
+                active_job_id="",
+                last_activity_at=_now_iso(),
+                last_error=str(exc),
+            )
+            logger.exception("[AutomationConsumer] job=%s failed and was requeued: %s", job_id[:8], exc)
     return True
 
 
@@ -488,7 +547,11 @@ async def _email_scheduler_loop() -> None:
             if not bool(settings.email_auto_send_enabled):
                 await asyncio.sleep(60)
                 continue
-            ensure_smtp_tested(settings)
+            # Provider-aware gate: checks GRAPH_* + a verified Graph test
+            # when the outbound provider is graph, EMAIL_SMTP_* otherwise.
+            # The old unconditional SMTP check made every scheduler
+            # iteration throw on Graph-only deployments.
+            ensure_outbound_tested(settings)
             store = EmailStore(settings.email_db_path)
             store.init_db()
             result = await run_scheduler_once(store)
@@ -502,26 +565,105 @@ async def _email_scheduler_loop() -> None:
 
 
 async def _email_reply_loop() -> None:
-    """Poll inbox for replies and stop follow-up sequences."""
+    """Poll inbox for replies and stop follow-up sequences.
+
+    Dispatches on `email_provider_type`:
+      - "smtp"  → IMAP via the `default` email_accounts row
+      - "graph" → Microsoft Graph (Application permission) shared mailbox
+    """
     while True:
         try:
             settings = get_settings()
             if not bool(settings.email_reply_detection_enabled):
                 await asyncio.sleep(max(30, int(settings.email_reply_check_interval_seconds)))
                 continue
-            ensure_imap_tested(settings)
             store = EmailStore(settings.email_db_path)
             store.init_db()
-            account = store.get_account("default")
-            if account:
-                result = await run_reply_detection_once(store, account)
+            provider = (settings.email_provider_type or "smtp").lower()
+            if provider == "graph":
+                from emailing import graph_client
+                from emailing.reply_detector import run_graph_reply_detection_once
+
+                # Poll every distinct Graph mailbox: each connected account
+                # may send from its own UPN, so replies land there. Falls
+                # back to the global shared mailbox when configured.
+                poll_accounts: list[dict[str, Any] | None] = []
+                seen_upns: set[str] = set()
+                for acct in store.list_accounts_by_provider("graph"):
+                    if str(acct.get("status", "active")) != "active":
+                        continue
+                    upn = graph_client.account_upn(acct)
+                    if not upn or upn in seen_upns:
+                        continue
+                    seen_upns.add(upn)
+                    poll_accounts.append(acct)
+                global_upn = graph_client.account_upn(None)
+                if global_upn and global_upn not in seen_upns:
+                    poll_accounts.append(None)
+                if not poll_accounts:
+                    poll_accounts = [None]
+
+                result = {"checked": 0, "matched": 0, "skipped": 0, "ignored": 0, "matches": []}
+                for poll_account in poll_accounts:
+                    part = await run_graph_reply_detection_once(store, poll_account)
+                    for key in ("checked", "matched", "skipped", "ignored"):
+                        result[key] += int(part.get(key, 0) or 0)
+                    result["matches"].extend(part.get("matches", []) or [])
                 if result["matched"]:
-                    logger.info("[EmailReply] checked=%s matched=%s skipped=%s", result["checked"], result["matched"], result["skipped"])
+                    logger.info(
+                        "[EmailReply][graph] checked=%s matched=%s skipped=%s",
+                        result["checked"], result["matched"], result["skipped"],
+                    )
+                await _maybe_notify_reply_matches(result.get("matches", []))
+            else:
+                ensure_imap_tested(settings)
+                account = store.get_account("default")
+                if account:
+                    result = await run_reply_detection_once(store, account)
+                    if result["matched"]:
+                        logger.info(
+                            "[EmailReply][smtp] checked=%s matched=%s skipped=%s",
+                            result["checked"], result["matched"], result["skipped"],
+                        )
+                    await _maybe_notify_reply_matches(result.get("matches", []))
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("[EmailReply] polling iteration failed")
         await asyncio.sleep(max(30, int(settings.email_reply_check_interval_seconds)))
+
+
+async def _maybe_notify_reply_matches(matches: list[dict[str, str]]) -> None:
+    """Push a single batched Feishu notification for newly matched replies.
+
+    Gated by `automation_reply_notifications_enabled` (default True) and
+    by the presence of a Feishu webhook URL. If the webhook is missing,
+    no-op — the in-app notification bell still surfaces the same events.
+
+    Multiple matches in a single poll cycle are collapsed into one
+    message so a busy day doesn't translate to a notification flood.
+    """
+    if not matches:
+        return
+    settings = get_settings()
+    if not bool(getattr(settings, "automation_reply_notifications_enabled", True)):
+        return
+    webhook_url = str(getattr(settings, "automation_feishu_webhook_url", "") or "").strip()
+    if not webhook_url:
+        return
+    try:
+        from automation.notifier import render_reply_detected_text, send_feishu_text
+        text = render_reply_detected_text(matches)
+        if not text:
+            return
+        await asyncio.to_thread(send_feishu_text, webhook_url, text)
+        logger.info(
+            "[EmailReply] Feishu reply-alert sent for %d match(es)", len(matches),
+        )
+    except Exception:
+        # Notification is best-effort; never let a webhook hiccup stop
+        # the reply-detection loop from continuing on the next cycle.
+        logger.exception("[EmailReply] Feishu reply-alert push failed")
 
 
 async def _automation_notify_loop() -> None:
@@ -657,6 +799,10 @@ async def lifespan(app: FastAPI):
     app.state.automation_notify_task = None
     app.state.automation_consumer_task = None
     app.state.template_seed_task = None
+    email_store = EmailStore(settings.email_db_path)
+    email_store.init_db()
+    set_email_store(email_store)
+    app.state.email_store = email_store
     queue = HuntJobQueue(settings.automation_queue_db_path)
     queue.init_db()
     recovered_jobs = queue.recover_interrupted_running_jobs(updated_at=_now_iso())
@@ -738,9 +884,27 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # TrustedHost: in production restrict to the host portion of public_base_url
+    # (set automatically by Settings._apply_production_defaults).
+    trusted_hosts = settings.trusted_hosts or ["*"]
+    if trusted_hosts != ["*"]:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
+
+    # Trust X-Forwarded-Proto from nginx so cookies get Secure when behind HTTPS.
+    class ProxyHeadersMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            forwarded_proto = request.headers.get("x-forwarded-proto")
+            if forwarded_proto:
+                request.scope["scheme"] = forwarded_proto.split(",")[0].strip()
+            return await call_next(request)
+    app.add_middleware(ProxyHeadersMiddleware)
+
+    app.include_router(auth_router, prefix="/api/auth")
     app.include_router(router, prefix="/api/v1")
     app.include_router(automation_router)
     app.include_router(email_router)
+    app.include_router(email_accounts_router, prefix="/api/v1/email-accounts")
+    app.include_router(notifications_router)
     app.include_router(sse_router, prefix="/api/v1")
     if settings.settings_api_enabled:
         app.include_router(settings_router)
