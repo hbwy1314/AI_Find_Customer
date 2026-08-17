@@ -236,3 +236,49 @@ async def test_reply_detector_ignores_bounce_from_mailer_daemon(tmp_path: Path, 
     seq = store.get_sequence("seq_1")
     assert seq is not None
     assert seq["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_graph_reply_detection_matches_conversation_and_stops_sequence(tmp_path: Path, monkeypatch):
+    """Graph path: replies arrive via fetch_graph_replies and match on
+    conversationId == sent message thread_key, stopping the sequence."""
+    from emailing.reply_detector import run_graph_reply_detection_once
+
+    store = EmailStore(str(tmp_path / "email.db"))
+    _seed_store(store)
+
+    monkeypatch.setattr("emailing.reply_detector.load_hunt", lambda hunt_id: {"result": {}})
+    monkeypatch.setattr("emailing.reply_detector.save_hunt", lambda hunt_id, hunt: None)
+
+    async def fake_fetch_graph_replies(account, *, now_iso, recent_days=14, limit=100):
+        return [{
+            "raw_ref": "graph:conv-1",
+            "message_id": "<graph-reply-1@example.com>",
+            "conversation_id": "thread-1",  # matches msg_1 thread_key
+            "in_reply_to": "",
+            "references": [],
+            "from_email": "buyer@acme.com",
+            "from_name": "Jane",
+            "subject": "Re: Hello",
+            "received_at": "2026-03-10T00:00:00Z",
+            "snippet": "Interested, let's talk.",
+            "headers": {},
+        }]
+
+    monkeypatch.setattr(
+        "emailing.graph_client.fetch_graph_replies", fake_fetch_graph_replies
+    )
+
+    result = await run_graph_reply_detection_once(store, now_iso="2026-03-10T00:05:00Z")
+
+    assert {"checked": 1, "matched": 1, "skipped": 0, "ignored": 0} == {k: result[k] for k in ("checked", "matched", "skipped", "ignored")}
+    seq = store.get_sequence("seq_1")
+    assert seq is not None
+    assert seq["status"] == "replied"
+    assert seq["stop_reason"] == "reply_detected"
+    pending = store.get_message("msg_2")
+    assert pending is not None
+    assert pending["status"] == "cancelled"
+    events = store.list_reply_events_for_sequence("seq_1")
+    assert len(events) == 1
+    assert events[0]["from_email"] == "buyer@acme.com"
