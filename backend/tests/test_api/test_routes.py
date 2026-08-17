@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from httpx import AsyncClient, ASGITransport
+from httpx import ASGITransport, AsyncClient
 
 from api.app import create_app
 from api.routes import _hunts, _sequence_is_send_approved, stop_background_workers
@@ -756,7 +756,7 @@ class TestListHunts:
 
 # ── _slim_state unit tests ───────────────────────────────────────────────
 
-from api.routes import _slim_state, ResumeRequest, _MAX_SEARCH_RESULTS_ON_RESUME
+from api.routes import _MAX_SEARCH_RESULTS_ON_RESUME, ResumeRequest, _slim_state
 
 
 def _make_prior_result(**overrides) -> dict:

@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import json
+
 import pytest
 
-from scripts.headless_worker import ApiError, JobCancelledError, _headers, _normalize_base_url, build_hunt_payload, run_cycle, run_hunt_payload
+from scripts.headless_worker import (
+    ApiError,
+    JobCancelledError,
+    _headers,
+    _normalize_base_url,
+    build_hunt_payload,
+    run_cycle,
+    run_hunt_payload,
+)
 
 
 class _Args:

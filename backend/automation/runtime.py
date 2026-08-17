@@ -5,7 +5,6 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-
 _RUNTIME_STATE: dict[str, dict[str, Any]] = {
     "consumer": {
         "enabled": False,

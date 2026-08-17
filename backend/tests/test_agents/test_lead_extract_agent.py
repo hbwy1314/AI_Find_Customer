@@ -1,12 +1,22 @@
 """Tests for agents/lead_extract_agent.py — ReAct-based extraction, dedup, node integration."""
 
+import asyncio
 import json
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agents.lead_extract_agent import lead_extract_node, _scrape_and_extract, _verify_lead_emails, _apply_evidence_to_scores, _quick_gate_candidate, _has_concrete_customs_data, _normalize_decision_maker_emails, _is_generic_mailbox, _candidate_budget
-import asyncio
+from agents.lead_extract_agent import (
+    _apply_evidence_to_scores,
+    _candidate_budget,
+    _has_concrete_customs_data,
+    _is_generic_mailbox,
+    _normalize_decision_maker_emails,
+    _quick_gate_candidate,
+    _scrape_and_extract,
+    _verify_lead_emails,
+    lead_extract_node,
+)
 
 
 def _base_state(**overrides):

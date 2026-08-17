@@ -5,9 +5,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from api.hunt_store import load_all_hunts
 from automation.job_queue import HuntJobQueue
 from automation.runtime import get_runtime_state
-from api.hunt_store import load_all_hunts
 from config.settings import get_settings
 from emailing.store import EmailStore
 

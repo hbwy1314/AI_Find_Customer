@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from api.hunt_store import load_hunt, now_iso
-from api.routes import _hunts, request_hunt_cancel, _unique_leads_count
+from api.routes import _hunts, _unique_leads_count, request_hunt_cancel
 from api.security import require_api_access
 from automation.job_queue import HuntJobQueue
 from automation.metrics import collect_automation_metrics, collect_automation_status

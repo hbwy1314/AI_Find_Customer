@@ -78,15 +78,15 @@ if MINIMAX_KEY and MINIMAX_BASE:
     MODEL = os.getenv("REASONING_MODEL", "anthropic/MiniMax-M2.5")
     os.environ["ANTHROPIC_API_KEY"] = MINIMAX_KEY
     os.environ["ANTHROPIC_API_BASE"] = MINIMAX_BASE
-    logger.info(f"Using MiniMax M2.5 via Anthropic-compatible endpoint")
+    logger.info("Using MiniMax M2.5 via Anthropic-compatible endpoint")
 elif OPENROUTER_KEY:
     MODEL = "openrouter/google/gemini-flash-1.5-8b"
     os.environ["OPENROUTER_API_KEY"] = OPENROUTER_KEY
-    logger.info(f"Using OpenRouter (gemini-flash-1.5-8b) as fallback")
+    logger.info("Using OpenRouter (gemini-flash-1.5-8b) as fallback")
 elif ANTHROPIC_KEY:
     MODEL = "claude-3-5-haiku-20241022"
     os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_KEY
-    logger.info(f"Using native Anthropic (claude-3-5-haiku) as final fallback")
+    logger.info("Using native Anthropic (claude-3-5-haiku) as final fallback")
 else:
     MODEL = os.getenv("REASONING_MODEL", "anthropic/MiniMax-M2.5")
     logger.warning("No recognized API key found. Will attempt with env defaults.")

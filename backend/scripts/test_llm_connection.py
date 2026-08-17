@@ -28,7 +28,7 @@ async def test_connection():
     print("="*50)
     
     # 1. Check Configuration
-    print(f"\n[1] Checking Configuration:")
+    print("\n[1] Checking Configuration:")
     print(f"    - Default Model:   {settings.llm_model}")
     print(f"    - Reasoning Model: {settings.reasoning_model}")
     print(f"    - ZAI Key:        {'SET (starts with ' + settings.zai_api_key[:5] + '...)' if settings.zai_api_key else 'NOT SET'}")
@@ -51,7 +51,7 @@ async def test_connection():
                 os.environ["ZAI_API_KEY"] = settings.zai_api_key
             
             from litellm import acompletion
-            print(f"    Calling...")
+            print("    Calling...")
             response = await acompletion(
                 model=model,
                 messages=[{"role": "user", "content": "Say 'ZAI OK'"}],

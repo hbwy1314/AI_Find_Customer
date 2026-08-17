@@ -4,11 +4,11 @@ import asyncio
 import json
 
 import pytest
-from httpx import AsyncClient, ASGITransport
+from httpx import ASGITransport, AsyncClient
 
 from api.app import create_app
 from api.routes import _hunts, _sse_queues
-from api.sse import _sse_event, _event_generator
+from api.sse import _event_generator, _sse_event
 
 
 @pytest.fixture

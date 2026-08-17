@@ -9,13 +9,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from api.hunt_store import load_hunt, save_hunt, now_iso
+from api.hunt_store import load_hunt, now_iso, save_hunt
 from api.security import require_api_access
 from config.settings import get_settings
+from emailing.policy import expand_email_targets
 from emailing.readiness import ensure_imap_tested, ensure_smtp_ready, ensure_smtp_tested
 from emailing.reply_detector import run_reply_detection_once
 from emailing.scheduler import run_scheduler_once
-from emailing.policy import expand_email_targets
 from emailing.store import EmailStore
 
 router = APIRouter(prefix="/api/v1", tags=["email"])

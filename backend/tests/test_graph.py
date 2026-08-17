@@ -3,7 +3,7 @@
 import pytest
 from langgraph.graph import END
 
-from graph.builder import build_graph, _noop_node
+from graph.builder import _noop_node, build_graph
 from graph.state import HuntState
 
 

@@ -17,7 +17,6 @@ from config.settings import Settings, get_settings
 from tools.llm_errors import format_llm_error
 from tools.llm_rate_limiter import get_llm_rate_limiter
 
-
 # Suppress litellm's verbose logging by default
 litellm.suppress_debug_info = True
 logger = logging.getLogger(__name__)

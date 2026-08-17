@@ -4,9 +4,9 @@ import pytest
 
 from observability.cost_tracker import (
     HuntCostTracker,
+    _registry,
     get_tracker,
     remove_tracker,
-    _registry,
 )
 
 

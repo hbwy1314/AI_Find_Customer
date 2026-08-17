@@ -16,13 +16,13 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
 import litellm
 
 from config.settings import Settings, get_settings
-from tools.llm_errors import format_llm_error
 from tools.llm_client import _inject_api_keys, normalize_model_name
+from tools.llm_errors import format_llm_error
 from tools.llm_rate_limiter import get_llm_rate_limiter
 
 logger = logging.getLogger(__name__)

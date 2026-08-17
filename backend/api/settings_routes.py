@@ -10,9 +10,9 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
+from automation.notifier import send_feishu_text
 from config.settings import get_settings
 from config.settings_store import is_configured, read_settings, update_settings
-from automation.notifier import send_feishu_text
 from emailing.imap_client import test_imap_connection
 from emailing.smtp_client import test_smtp_connection
 

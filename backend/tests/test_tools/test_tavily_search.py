@@ -1,6 +1,6 @@
 """Tests for tools/tavily_search.py — mock TavilyClient, verify result parsing."""
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 

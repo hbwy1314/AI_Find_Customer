@@ -1,9 +1,14 @@
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock
 
-from api.app import _notify_feishu_async, _run_automation_consumer_once, _run_template_seed_prewarm_once
+import pytest
+
+from api.app import (
+    _notify_feishu_async,
+    _run_automation_consumer_once,
+    _run_template_seed_prewarm_once,
+)
 from automation.job_queue import HuntJobQueue
 
 

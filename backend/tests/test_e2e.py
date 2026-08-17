@@ -5,18 +5,17 @@ Insight → KeywordGen → Search → LeadExtract → Evaluate → (loop or fini
 """
 
 import json
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from graph.builder import build_graph
-from graph.evaluate import evaluate_progress, should_continue_hunting
+from agents.email_craft_agent import email_craft_node
 from agents.insight_agent import insight_node
 from agents.keyword_gen_agent import keyword_gen_node
-from agents.search_agent import search_node
 from agents.lead_extract_agent import lead_extract_node
-from agents.email_craft_agent import email_craft_node
-
+from agents.search_agent import search_node
+from graph.builder import build_graph
+from graph.evaluate import evaluate_progress, should_continue_hunting
 
 # ── Fake LLM responses ─────────────────────────────────────────────────
 

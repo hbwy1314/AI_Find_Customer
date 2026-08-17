@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agents.keyword_gen_agent import keyword_gen_node, _build_prompt, _detect_local_languages
+from agents.keyword_gen_agent import _build_prompt, _detect_local_languages, keyword_gen_node
 
 
 def _base_state(**overrides):

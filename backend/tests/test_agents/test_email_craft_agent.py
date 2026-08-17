@@ -1,18 +1,21 @@
 """Tests for agents/email_craft_agent.py — ReAct-based email gen, locale mapping, multi-language."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from agents.email_craft_agent import (
-    email_craft_node, _craft_for_lead, _get_locale,
-    _get_locale_rules, _build_email_tools, _rule_validate_emails_payload,
     _auto_improve_reviewed_sequence,
+    _build_email_tools,
+    _craft_for_lead,
+    _get_locale,
+    _get_locale_rules,
+    _rule_validate_emails_payload,
+    email_craft_node,
 )
 from emailing.template_pipeline import build_fallback_template_profile
-import asyncio
-
 
 FAKE_EMAIL_RESPONSE = json.dumps({
     "locale": "de_DE",

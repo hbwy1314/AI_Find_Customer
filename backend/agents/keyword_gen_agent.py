@@ -6,10 +6,10 @@ import json
 import logging
 from typing import Any
 
+from agents.search_agent import _REGION_GEO
 from config.settings import get_settings
 from graph.state import HuntState
 from tools.llm_client import LLMTool
-from agents.search_agent import _REGION_GEO
 
 logger = logging.getLogger(__name__)
 

@@ -1,17 +1,16 @@
 """Tests for agents/insight_agent.py — mock react_loop, verify insight output."""
 
 import json
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from agents.insight_agent import (
-    insight_node,
+    _build_user_prompt,
     _parse_uploaded_file,
     _pre_parse_documents,
-    _build_user_prompt,
+    insight_node,
 )
-
 
 FAKE_INSIGHT_JSON = json.dumps({
     "company_name": "SolarTech GmbH",

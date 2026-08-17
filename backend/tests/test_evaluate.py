@@ -12,7 +12,6 @@ from graph.evaluate import (
     should_continue_hunting,
 )
 
-
 # ── Helper function tests ───────────────────────────────────────────────
 
 

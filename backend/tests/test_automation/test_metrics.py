@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from api.hunt_store import load_all_hunts, save_hunt
 from automation.job_queue import HuntJobQueue
 from automation.metrics import collect_automation_metrics, collect_automation_status
-from api.hunt_store import load_all_hunts, save_hunt
 from emailing.store import EmailStore
 
 

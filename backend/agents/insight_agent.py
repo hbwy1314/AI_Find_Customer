@@ -29,10 +29,10 @@ from urllib.parse import urljoin, urlparse
 
 from config.settings import get_settings
 from graph.state import HuntState
+from tools.excel_parser import ExcelParserTool
 from tools.google_search import GoogleSearchTool
 from tools.jina_reader import JinaReaderTool
 from tools.pdf_parser import PDFParserTool
-from tools.excel_parser import ExcelParserTool
 from tools.react_runner import ToolDef, react_loop
 
 logger = logging.getLogger(__name__)
@@ -592,7 +592,10 @@ async def insight_node(state: HuntState) -> dict:
     )
 
     from tools.llm_output import (
-        parse_json, validate_dict, INSIGHT_REQUIRED, INSIGHT_DEFAULTS,
+        INSIGHT_DEFAULTS,
+        INSIGHT_REQUIRED,
+        parse_json,
+        validate_dict,
     )
 
     fallback_insight = {

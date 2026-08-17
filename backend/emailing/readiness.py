@@ -107,6 +107,15 @@ def ensure_smtp_tested(settings: Any) -> None:
         raise ValueError(str(status["message"]))
 
 
+def ensure_outbound_tested(settings: Any) -> None:
+    """Backwards-compat shim: ensure_smtp_tested was renamed to
+    ensure_outbound_tested when the project added Graph support and
+    the concept of an "outbound" check stopped being SMTP-specific.
+
+    Kept as an alias so old callers (and tests) keep working."""
+    ensure_smtp_tested(settings)
+
+
 def ensure_imap_tested(settings: Any) -> None:
     ensure_imap_ready(settings)
     status = imap_test_readiness(settings)

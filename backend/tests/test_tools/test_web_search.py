@@ -7,8 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from config.settings import Settings
-from tools.web_search import WebSearchTool, _RoundRobinPool, _parse_keys
-
+from tools.web_search import WebSearchTool, _parse_keys, _RoundRobinPool
 
 # ── _parse_keys ───────────────────────────────────────────────────────────────
 

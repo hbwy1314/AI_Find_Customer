@@ -33,13 +33,13 @@ from tools.contact_extractor import (
     merge_contact_info,
     sanitize_phone_list,
 )
+from tools.customs_router import find_customs_data as route_customs_data
 from tools.email_finder import extract_emails_from_text
 from tools.email_verifier import EmailVerifierTool
 from tools.google_search import GoogleSearchTool
 from tools.jina_reader import JinaReaderTool
 from tools.llm_client import LLMTool
 from tools.llm_output import parse_json
-from tools.customs_router import find_customs_data as route_customs_data
 from tools.react_runner import ToolDef, react_loop
 from tools.url_filter import classify_url
 
@@ -1018,7 +1018,7 @@ async def _scrape_and_extract(
             return None
 
         # Parse + validate the final JSON answer
-        from tools.llm_output import parse_json, validate_dict, LEAD_REQUIRED, LEAD_DEFAULTS
+        from tools.llm_output import LEAD_DEFAULTS, LEAD_REQUIRED, parse_json, validate_dict
         parsed = parse_json(raw_result, context=f"LeadExtract:{domain}")
         if parsed is None:
             logger.warning("[LeadExtract] Invalid JSON from %s", domain)

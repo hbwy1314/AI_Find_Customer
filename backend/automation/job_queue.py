@@ -8,7 +8,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-
 _DDL = """
 CREATE TABLE IF NOT EXISTS hunt_jobs (
   id TEXT PRIMARY KEY,

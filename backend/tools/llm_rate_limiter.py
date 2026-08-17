@@ -8,7 +8,6 @@ import time
 from collections import deque
 from collections.abc import Callable
 
-
 logger = logging.getLogger(__name__)
 
 _WINDOW_SECONDS = 60.0

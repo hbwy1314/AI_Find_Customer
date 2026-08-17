@@ -6,6 +6,7 @@ from typing import Optional
 
 import httpx
 
+
 class BraveSearchTool:
     """Search the web via Brave Search API and return structured results.
 

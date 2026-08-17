@@ -10,7 +10,6 @@ from tools.contact_extractor import (
     sanitize_phone_list,
 )
 
-
 # ── Phone number extraction ────────────────────────────────────────────
 
 

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tools.email_verifier import EmailVerifierTool, _has_valid_syntax, _get_mx_records
+from tools.email_verifier import EmailVerifierTool, _get_mx_records, _has_valid_syntax
 
 
 class TestHasValidSyntax:

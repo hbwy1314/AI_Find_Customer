@@ -16,19 +16,17 @@ from pathlib import Path
 from typing import Any
 from urllib import error, request
 
-
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from config.settings import get_settings
 from automation.notifier import (
     render_hunt_completed_text,
     render_hunt_failed_text,
     render_hunt_started_text,
     send_feishu_text,
 )
-
+from config.settings import get_settings
 
 logger = logging.getLogger("headless_worker")
 
