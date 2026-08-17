@@ -117,17 +117,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-node${{ matrix.node-version }}-
 
-      - name: Install dependencies
-        run: npm ci
-
       # Workaround for npm optional-dependency bug:
       # https://github.com/npm/cli/issues/4828 — `npm ci` occasionally
       # doesn't install the @rollup/rollup-linux-x64-gnu platform
       # binary on ubuntu-latest, which makes vite build fail with
-      # "Cannot find module @rollup/rollup-linux-x64-gnu". A plain
-      # `npm rebuild` re-resolves the optional native packages.
-      - name: Rebuild native modules
-        run: npm rebuild @rollup/rollup-linux-x64-gnu || true
+      # "Cannot find module @rollup/rollup-linux-x64-gnu". Wiping
+      # node_modules and reinstalling reliably re-fetches the
+      # optional native package.
+      - name: Install dependencies (with rollup optional native fixup)
+        run: |
+          rm -rf node_modules
+          npm ci
+          # Belt-and-suspenders: explicitly install the missing optional
+          # dependency so the next 'npm ci' on the same lockfile always
+          # has it.
+          npm install --no-save --include=optional @rollup/rollup-linux-x64-gnu || true
 
       - name: TypeScript check
         run: npx tsc -b --noEmit
