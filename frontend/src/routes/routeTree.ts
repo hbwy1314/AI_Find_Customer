@@ -6,19 +6,24 @@ import { NewHuntPage } from "./new-hunt";
 import { HuntDetailPage } from "./hunt-detail";
 import { AutomationJobPage } from "./automation-job";
 import { SettingsPage } from "./settings";
+import { LLMSettingsPage } from "./settings-llm";
+import { SmtpSettingsPage } from "./settings-smtp";
+import { GraphSettingsPage } from "./settings-graph";
+import { SearchSettingsPage } from "./settings-search";
+import { NotificationsSettingsPage } from "./settings-notifications";
+import { PerformanceSettingsPage } from "./settings-performance";
+import { EmailTestPage } from "./settings-email-test";
 import { WorkflowSettingsPage } from "./settings-workflow";
 
-// Placeholder pages for routes already linked from root.tsx /
-// settings.tsx but whose real implementations are still in-flight
-// WIP. Each placeholder renders a "coming soon" card so type-
-// checked navigation still resolves. Replace with the real page
-// once the WIP lands on main.
+// Placeholder pages for routes that the navigation
+// (root.tsx / settings.tsx) already links to but whose real
+// implementations are still in-flight WIP. Each placeholder
+// renders a "coming soon" card so type-checked navigation
+// resolves to a sensible destination rather than a 404.
 //
 // Note: this file is .ts (not .tsx) so we build the placeholder
-// markup with createElement rather than JSX. Keeps the import
-// surface flat — no .tsx file is forced on us just for the
-// placeholders.
-function PlaceholderCard({ title }: { title: string }): ReactNode {
+// markup with createElement rather than JSX.
+function PlaceholderCard({ title, hint }: { title: string; hint?: string }): ReactNode {
   return createElement(
     "div",
     { className: "max-w-3xl mx-auto p-6" },
@@ -29,8 +34,8 @@ function PlaceholderCard({ title }: { title: string }): ReactNode {
       createElement(
         "p",
         { className: "mt-2 text-muted-foreground" },
-        "This page is part of an in-flight rewrite and hasn't been committed yet. " +
-          "The route is registered so existing navigation links resolve to a sensible destination.",
+        hint ??
+          "此页面是正在进行的重构的一部分，尚未提交到主分支。路径已注册，因此导航链接不会显示 404。",
       ),
     ),
   );
@@ -73,12 +78,58 @@ const settingsRoute = createRoute({
   component: SettingsPage,
 });
 
+const llmSettingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/llm",
+  component: LLMSettingsPage,
+});
+
+const smtpSettingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/smtp",
+  component: SmtpSettingsPage,
+});
+
+const graphSettingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/graph",
+  component: GraphSettingsPage,
+});
+
+const searchSettingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/search",
+  component: SearchSettingsPage,
+});
+
+const notificationsSettingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/notifications",
+  component: NotificationsSettingsPage,
+});
+
+const performanceSettingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/performance",
+  component: PerformanceSettingsPage,
+});
+
+const emailTestRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/email-test",
+  component: EmailTestPage,
+});
+
 const workflowSettingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/workflow",
   component: WorkflowSettingsPage,
 });
 
+// Placeholders for routes already linked from the nav / hub
+// but whose real implementations are WIP. Keep these so the
+// type-checked <Link to="..."> calls compile, and so navigating
+// to them doesn't 404.
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/login",
@@ -112,6 +163,14 @@ export const routeTree = rootRoute.addChildren([
   automationJobRoute,
   quotasRoute,
   settingsRoute,
+  llmSettingsRoute,
+  smtpSettingsRoute,
+  graphSettingsRoute,
+  searchSettingsRoute,
+  notificationsSettingsRoute,
+  performanceSettingsRoute,
+  emailTestRoute,
   workflowSettingsRoute,
   connectedMailboxesRoute,
 ]);
+
