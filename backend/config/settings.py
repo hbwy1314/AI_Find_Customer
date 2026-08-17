@@ -182,6 +182,26 @@ class Settings(BaseSettings):
     # Hard cap on the number of recipients per sequence. A lead with 10
     # candidate emails will only ever have the first N tried.
     email_recipient_max_per_lead: int = 3
+
+    # --- Template adherence (Phase 4) -----------------------------------
+    # The user-reported pain point: "AI-generated emails have no
+    # relation to my original template". We now extract required
+    # phrases from the user-provided examples and check the generated
+    # email retains at least ``email_template_min_token_match_ratio``
+    # of them. If the LLM output still drifts after one auto-fix
+    # round, we fall back to the raw template body (with placeholder
+    # substitution) so the user's voice always wins.
+    email_template_min_token_match_ratio: float = 0.5
+    # Toggle the raw-template fallback. Operators who trust the LLM
+    # to follow the template can disable this and accept whatever
+    # the model produces (with the token check still in place for
+    # visibility in the review summary).
+    email_template_fallback_enabled: bool = True
+    # Manual override for required tokens (comma-separated). When set,
+    # bypasses the auto-extraction from examples. Useful for
+    # repeatable, well-known phrases the operator wants preserved
+    # across all generations ("Best regards, Acme Corp" etc.).
+    email_template_required_tokens_override: str = ""
     email_daily_send_limit: int = 20
     email_hourly_send_limit: int = 10
     email_language_mode: str = "auto_by_region"

@@ -21,9 +21,13 @@ from emailing.policy import choose_email_target, expand_email_targets
 from emailing.template_pipeline import compose_template_plan, extract_template_profile
 from graph.state import HuntState
 from tools.llm_client import LLMTool
-from tools.llm_output import parse_json
+from tools.llm_output import (
+    EMAIL_SEQUENCE_DEFAULTS,
+    EMAIL_SEQUENCE_REQUIRED,
+    parse_json,
+    validate_dict,
+)
 from tools.react_runner import ToolDef, react_loop
-from tools.llm_output import validate_dict, EMAIL_SEQUENCE_REQUIRED, EMAIL_SEQUENCE_DEFAULTS
 
 logger = logging.getLogger(__name__)
 
@@ -215,51 +219,129 @@ _COUNTRY_LOCALE_MAP = {
     "in": "hi_IN", "gr": "el_GR",
 }
 
-# ── ReAct system prompt ───────────────────────────────────────────────────────
-EMAIL_REACT_SYSTEM = """You are an expert B2B email copywriter specialising in international business communication.
+# ── Sequence step definitions (single source of truth for N-email support) ──
+# Each step: sequence_number, email_type, suggested_send_day, objective.
+# `Settings.email_sequence_steps` (1-3) decides how many of these are used.
+_EMAIL_STEP_SPECS: list[dict[str, Any]] = [
+    {
+        "sequence_number": 1,
+        "email_type": "company_intro",
+        "suggested_send_day": 0,
+        "objective": "establish relevance and open the conversation with a low-friction CTA.",
+    },
+    {
+        "sequence_number": 2,
+        "email_type": "product_showcase",
+        "suggested_send_day": 3,
+        "objective": "deepen relevance using product/application fit or proof points.",
+    },
+    {
+        "sequence_number": 3,
+        "email_type": "partnership_proposal",
+        "suggested_send_day": 7,
+        "objective": "polite follow-up that probes distributor/buyer fit without pressure.",
+    },
+]
 
-Your task: write a 3-email outreach sequence for a potential buyer/distributor, then validate and refine it.
+
+def _configured_sequence_steps() -> int:
+    """Number of emails per sequence from settings, clamped to 1..3."""
+    try:
+        return max(1, min(3, int(getattr(get_settings(), "email_sequence_steps", 1) or 1)))
+    except Exception:
+        return 1
+
+
+def _active_step_specs(steps: int | None = None) -> list[dict[str, Any]]:
+    if steps is None:
+        steps = _configured_sequence_steps()
+    return _EMAIL_STEP_SPECS[: max(1, min(3, int(steps or 1)))]
+
+
+def _personalize_per_lead_enabled(settings: Any = None) -> bool:
+    """Whether every lead gets its own independent draft (no template reuse)."""
+    if settings is None:
+        settings = get_settings()
+    value = getattr(settings, "email_personalize_per_lead", True)
+    if isinstance(value, bool):
+        return value
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return True
+
+
+# Placeholder tokens the LLM likes to leave in closings when it doesn't
+# know the sender's name. The validator flags them and the rewrite loop
+# replaces them with the configured signature.
+_PLACEHOLDER_TOKENS = (
+    "[your name]",
+    "[your company]",
+    "[your company name]",
+    "[name]",
+    "[full name]",
+    "[signature]",
+    "[sender name]",
+    "[subject]",
+    "[company name]",
+)
+
+
+def _sender_signature(settings: Any = None) -> str:
+    """The exact closing signature emails must be signed with.
+
+    Prefers `EMAIL_SIGNATURE_BLOCK` (free-form, may be multi-line, e.g.
+    name + title + company), falls back to `EMAIL_FROM_NAME`. Injected
+    into the craft prompt so the model stops emitting `[Your Name]`.
+    """
+    if settings is None:
+        settings = get_settings()
+    block = str(getattr(settings, "email_signature_block", "") or "").strip()
+    if block:
+        return block
+    name = str(getattr(settings, "email_from_name", "") or "").strip()
+    if name and not name.lower().startswith("<magicmock"):
+        return name
+    return "Ai Hunter"
+
+
+# ── ReAct system prompt ───────────────────────────────────────────────────────
+def _build_react_system(steps: int | None = None) -> str:
+    """Build the ReAct system prompt for a sequence of `steps` emails."""
+    specs = _active_step_specs(steps)
+    n = len(specs)
+    task_noun = "a single outreach email" if n == 1 else f"a {n}-email outreach sequence"
+    draft_target = "the email" if n == 1 else f"all {n} emails"
+    schema_entries = ",\n".join(
+        "    {\n"
+        f"      \"sequence_number\": {spec['sequence_number']},\n"
+        f"      \"email_type\": \"{spec['email_type']}\",\n"
+        "      \"subject\": \"...\",\n"
+        "      \"body_text\": \"...\",\n"
+        f"      \"suggested_send_day\": {spec['suggested_send_day']},\n"
+        "      \"personalization_points\": [\"...\"],\n"
+        "      \"cultural_adaptations\": [\"...\"]\n"
+        "    }"
+        for spec in specs
+    )
+    return f"""You are an expert B2B email copywriter specialising in international business communication.
+
+Your task: write {task_noun} for a potential buyer/distributor, then validate and refine it.
 
 ## Workflow (follow this order):
 1. THINK — analyse the lead profile, locale, industry, and cultural context.
-2. DRAFT — write all 3 emails.
+2. DRAFT — write {draft_target}.
 3. VALIDATE — call validate_emails with your draft JSON to check language, formality, salutation, and cultural fit.
 4. REVISE — if validation returns issues, fix them and call validate_emails again (max 2 validation rounds).
 5. OUTPUT — once validation passes, output the final JSON.
 
 ## Final output MUST be this exact JSON structure:
-{
+{{
   "locale": "<locale>",
   "emails": [
-    {
-      "sequence_number": 1,
-      "email_type": "company_intro",
-      "subject": "...",
-      "body_text": "...",
-      "suggested_send_day": 0,
-      "personalization_points": ["..."],
-      "cultural_adaptations": ["..."]
-    },
-    {
-      "sequence_number": 2,
-      "email_type": "product_showcase",
-      "subject": "...",
-      "body_text": "...",
-      "suggested_send_day": 3,
-      "personalization_points": ["..."],
-      "cultural_adaptations": ["..."]
-    },
-    {
-      "sequence_number": 3,
-      "email_type": "partnership_proposal",
-      "subject": "...",
-      "body_text": "...",
-      "suggested_send_day": 7,
-      "personalization_points": ["..."],
-      "cultural_adaptations": ["..."]
-    }
+{schema_entries}
   ]
-}
+}}
 
 ## Rules:
 1. Write ALL subject and body_text in the target locale language.
@@ -273,7 +355,15 @@ Your task: write a 3-email outreach sequence for a potential buyer/distributor, 
    - 2-3 short body paragraphs
    - blank line
    - closing line
-7. Output ONLY the JSON object — no extra text."""
+7. Close every email with the sender signature given in the prompt. NEVER
+   emit placeholder tokens such as [Your Name], [Name], [Your Company] —
+   if a signature is provided, sign with it exactly.
+8. Output ONLY the JSON object — no extra text."""
+
+
+# Backwards-compatible constant (3-email variant). Runtime paths call
+# `_build_react_system()` so `Settings.email_sequence_steps` takes effect.
+EMAIL_REACT_SYSTEM = _build_react_system(3)
 
 
 EMAIL_FEWSHOT_EXAMPLES = """
@@ -367,14 +457,14 @@ EMAIL_REWRITER_SYSTEM = """You are an expert international B2B email editor.
 
 You will receive:
 - the target locale and language requirements
-- the current 3-email sequence JSON
+- the current email sequence JSON
 - a list of validation issues and rewrite instructions
 
 Your task is to revise the sequence so it:
 - fixes every issue
 - preserves factual accuracy
 - remains natural for the local business culture
-- keeps the 3-email progression distinct
+- keeps the progression between emails distinct (when there is more than one)
 - changes only the minimum text necessary to fix the listed issues
 - preserves any part of the sequence that already works
 - does not invent claims, certifications, customers, or performance statements
@@ -384,20 +474,25 @@ Your task is to revise the sequence so it:
 Return JSON only in the same schema as the original sequence."""
 
 
-EMAIL_TEMPLATE_PERSONALIZER_SYSTEM = """You adapt a reusable outbound email sequence to a specific target lead.
+EMAIL_TEMPLATE_PERSONALIZER_SYSTEM = """You rewrite an outbound email so it is genuinely tailored to one specific target company.
 
 You will receive:
-- the source lead the template was originally written for
-- the target lead and recipient details
+- the source lead the draft was originally written for
+- the target lead and recipient details (company, website, industry, description, contact)
 - the reusable template profile and template plan
-- the current 3-email seed sequence
+- the current draft email sequence
 
 Your task:
-- keep the overall sequence structure, tone, CTA style, and locale
-- increase buyer-specific relevance for the target lead
-- replace generic or source-lead-specific references with accurate target-lead details
+- rewrite the email BODY so it speaks to the target company's actual business:
+  reference their product range, distribution/wholesale role, market, or
+  website details from the lead profile — not just their company name
+- keep the same tone, CTA style, locale, and plain-text layout
+- replace ALL source-lead-specific references with accurate target-lead details
 - preserve factual accuracy and avoid inventing claims
-- keep the 3-step progression distinct
+- keep the email structure (number of emails, sequence_number, email_type,
+  suggested_send_day) unchanged
+- keep the sender signature/closing exactly as provided — never introduce
+  placeholders like [Your Name] or [Your Company]
 
 Return JSON only in the same schema as the original sequence."""
 
@@ -445,6 +540,167 @@ def _locale_for_language(language_code: str, fallback_locale: str = "en_US") -> 
 def _slugify_template_segment(value: str, fallback: str = "general") -> str:
     normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
     return normalized or fallback
+
+
+def _required_tokens_for_template(
+    template_profile: dict[str, Any] | None,
+    settings: Any,
+) -> list[str]:
+    """Resolve the active set of required tokens for template adherence.
+
+    Priority:
+      1. ``email_template_required_tokens_override`` setting (manual,
+         comma-separated). Useful when the operator knows the exact
+         phrases they want preserved.
+      2. ``template_profile["required_tokens"]`` (auto-extracted by
+         ``extract_required_tokens`` from the user examples).
+      3. Empty list — no adherence check.
+
+    Returns the deduped list, order preserved.
+    """
+    override = str(getattr(settings, "email_template_required_tokens_override", "") or "").strip()
+    if override:
+        manual = [token.strip() for token in override.split(",") if token.strip()]
+        if manual:
+            return manual
+    if not isinstance(template_profile, dict):
+        return []
+    raw = template_profile.get("required_tokens") or []
+    if not isinstance(raw, list):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in raw:
+        token = str(item or "").strip()
+        if not token or token.lower() in seen:
+            continue
+        seen.add(token.lower())
+        out.append(token)
+    return out
+
+
+def _email_token_match_ratio(body_text: str, required_tokens: list[str]) -> tuple[float, list[str]]:
+    """Return ``(matched_ratio, missing_tokens)`` for a body against
+    the required-token list. A token matches if it appears anywhere
+    in ``body_text`` (case-insensitive substring)."""
+    if not required_tokens:
+        return 1.0, []
+    body = (body_text or "").lower()
+    missing: list[str] = []
+    hits = 0
+    for token in required_tokens:
+        if str(token or "").strip().lower() in body:
+            hits += 1
+        else:
+            missing.append(token)
+    return (hits / len(required_tokens)) if required_tokens else 1.0, missing
+
+
+def _fallback_email_from_template(
+    raw_template_example: str,
+    *,
+    lead: dict[str, Any],
+    target: dict[str, str],
+    fallback_subject: str,
+    fallback_locale: str,
+) -> dict[str, Any]:
+    """Last-resort template adherence: build a single email from the
+    user's raw example by replacing buyer- and contact-specific
+    placeholders. Used when the LLM keeps drifting away from the
+    template after one revision attempt.
+
+    Placeholders we recognise (case-insensitive):
+      {company_name} {industry} {contact_name} {contact_title}
+    Anything else stays as-is so the user can still recognise their
+    own template voice in the output.
+    """
+    text = str(raw_template_example or "").strip()
+    if not text:
+        return {
+            "subject": fallback_subject,
+            "body_text": "",
+            "suggested_send_day": 0,
+            "email_type": "introduction",
+            "personalization_points": [],
+            "_template_fallback": True,
+        }
+    subject_line = fallback_subject or "Quick note"
+    body_text = text
+    lead_company = str(lead.get("company_name", "") or "").strip()
+    lead_industry = str(lead.get("industry", "") or "").strip()
+    target_name = str(target.get("target_name", "") or "").strip()
+    target_title = str(target.get("target_title", "") or "").strip()
+
+    # Heuristic split: first non-empty line is the subject, rest is body.
+    # The user examples may or may not carry a subject line. Try to
+    # detect it via the first short line.
+    lines = [line for line in text.splitlines() if line.strip()]
+    if lines and len(lines[0]) <= 80 and not lines[0].lower().startswith(("hi ", "dear ", "hello", "hey ")):
+        subject_line = lines[0].strip()
+        body_text = "\n".join(lines[1:]).strip() or text
+
+    replacements: list[tuple[str, str]] = []
+    for needle, value in (
+        ("{company_name}", lead_company),
+        ("{industry}", lead_industry),
+        ("{contact_name}", target_name),
+        ("{contact_title}", target_title),
+    ):
+        if value and needle.lower() in body_text.lower():
+            # Case-preserving replace: we only know the lowercase
+            # version of the needle, so do a global case-insensitive
+            # replace via regex.
+            body_text = re.sub(re.escape(needle), value, body_text, flags=re.IGNORECASE)
+    for needle, value in (
+        ("{company_name}", lead_company),
+        ("{industry}", lead_industry),
+    ):
+        if value and needle.lower() in subject_line.lower():
+            subject_line = re.sub(re.escape(needle), value, subject_line, flags=re.IGNORECASE)
+
+    return {
+        "subject": subject_line,
+        "body_text": body_text,
+        "suggested_send_day": 0,
+        "email_type": "introduction",
+        "personalization_points": [p for p in (lead_company, lead_industry, target_title) if p],
+        "_template_fallback": True,
+        "locale": fallback_locale,
+    }
+
+
+def _build_raw_template_fallback(
+    raw_examples: list[str],
+    *,
+    lead: dict[str, Any],
+    target: dict[str, str],
+    step_specs: list[dict[str, Any]],
+    locale: str,
+) -> list[dict[str, Any]]:
+    """Materialize a full N-step sequence from raw user examples by
+    mapping each step to a (possibly truncated) example. Used when
+    the LLM output fails the template-adherence check and we want to
+    fall back to the user's literal voice.
+    """
+    if not raw_examples:
+        return []
+    sequence: list[dict[str, Any]] = []
+    for index, spec in enumerate(step_specs):
+        example = raw_examples[index % len(raw_examples)]
+        if not example:
+            continue
+        day = int(spec.get("suggested_send_day", index * 3) or 0)
+        email = _fallback_email_from_template(
+            example,
+            lead=lead,
+            target=target,
+            fallback_subject=spec.get("objective", "Quick note"),
+            fallback_locale=locale,
+        )
+        email["suggested_send_day"] = day
+        email["email_type"] = spec.get("email_type", email.get("email_type", "introduction"))
+        sequence.append(email)
+    return sequence
 
 
 def _derive_template_group(
@@ -599,15 +855,20 @@ async def _personalize_template_sequence(
     return None
 
 
-def _rule_validate_emails_payload(emails_list: list[dict[str, Any]]) -> dict[str, Any]:
+def _rule_validate_emails_payload(
+    emails_list: list[dict[str, Any]],
+    steps: int | None = None,
+) -> dict[str, Any]:
     issues: list[str] = []
     suggestions: list[str] = []
 
-    if len(emails_list) != 3:
-        issues.append(f"Expected exactly 3 emails, got {len(emails_list)}")
-        suggestions.append("Generate all 3 emails: company_intro, product_showcase, partnership_proposal")
+    specs = _active_step_specs(steps)
+    n = len(specs)
+    if len(emails_list) != n:
+        issues.append(f"Expected exactly {n} email(s), got {len(emails_list)}")
+        suggestions.append("Generate: " + ", ".join(spec["email_type"] for spec in specs))
 
-    expected = [("company_intro", 0), ("product_showcase", 3), ("partnership_proposal", 7)]
+    expected = [(spec["email_type"], spec["suggested_send_day"]) for spec in specs]
     previous_subject = ""
     for i, (etype, eday) in enumerate(expected):
         if i >= len(emails_list):
@@ -633,6 +894,14 @@ def _rule_validate_emails_payload(emails_list: list[dict[str, Any]]) -> dict[str
 
         lowered_body = body.lower()
         lowered_subject = str(em.get("subject", "") or "").lower()
+        placeholder_hits = [t for t in _PLACEHOLDER_TOKENS if t in lowered_body or t in lowered_subject]
+        if placeholder_hits:
+            issues.append(
+                f"Email {i + 1}: contains placeholder text ({', '.join(placeholder_hits)})"
+            )
+            suggestions.append(
+                f"Email {i + 1}: replace the placeholder with the real sender signature from the prompt"
+            )
         if not any(token in lowered_body for token in ["you", "your", "您", "贵公司", "votre", "ihr", "su ", "sua ", "vos", "tu empresa"]):
             issues.append(f"Email {i + 1}: lacks clear buyer-oriented language")
             suggestions.append(f"Email {i + 1}: explain why this recipient/company is relevant")
@@ -731,6 +1000,7 @@ async def _rewrite_email_sequence(
     issues: list[str],
     suggestions: list[str],
 ) -> dict[str, Any] | None:
+    email_count = len(current_sequence.get("emails", []) or []) or _configured_sequence_steps()
     rewrite_prompt = (
         f"<locale>\n"
         f"locale: {locale}\n"
@@ -744,7 +1014,7 @@ async def _rewrite_email_sequence(
         f"<issues>\n{json.dumps(issues, ensure_ascii=False)}\n</issues>\n\n"
         f"<rewrite_instructions>\n{json.dumps(suggestions, ensure_ascii=False)}\n</rewrite_instructions>\n\n"
         f"<hard_constraints>\n"
-        f"- Keep exactly 3 emails.\n"
+        f"- Keep exactly {email_count} email(s).\n"
         f"- Preserve sequence_number, email_type, and suggested_send_day unless an issue explicitly requires changing them.\n"
         f"- Keep correct personalization that is already present.\n"
         f"- Make the minimum necessary edits instead of rewriting everything.\n"
@@ -819,6 +1089,8 @@ async def _auto_improve_reviewed_sequence(
     max_blocking_issues: int,
     validation_max_revisions: int = 1,
     max_rounds: int = 2,
+    required_tokens: list[str] | None = None,
+    min_token_match_ratio: float = 0.5,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     current = copy.deepcopy(current_sequence)
     last_review = _review_email_sequence(
@@ -829,6 +1101,8 @@ async def _auto_improve_reviewed_sequence(
         template_plan=template_plan,
         min_score=min_score,
         max_blocking_issues=max_blocking_issues,
+        required_tokens=required_tokens,
+        min_token_match_ratio=min_token_match_ratio,
     )
     improvement_summary: dict[str, Any] = {
         "attempted": False,
@@ -902,6 +1176,8 @@ async def _auto_improve_reviewed_sequence(
             template_plan=template_plan,
             min_score=min_score,
             max_blocking_issues=max_blocking_issues,
+            required_tokens=required_tokens,
+            min_token_match_ratio=min_token_match_ratio,
         )
         if int(next_review.get("score", 0) or 0) > int(last_review.get("score", 0) or 0):
             improvement_summary["improved"] = True
@@ -1180,6 +1456,8 @@ def _review_email_sequence(
     template_plan: dict[str, Any],
     min_score: int,
     max_blocking_issues: int,
+    required_tokens: list[str] | None = None,
+    min_token_match_ratio: float = 0.5,
 ) -> dict[str, Any]:
     score = 100
     issues: list[str] = []
@@ -1242,6 +1520,36 @@ def _review_email_sequence(
             issues.append("Sequence does not mention the target company at all.")
             suggestions.append("Add at least one company-specific relevance reference.")
 
+    # Template adherence: when the template profile carries required
+    # tokens (extracted from the user's historical emails), each
+    # generated email should retain at least a configurable fraction
+    # of them. Drift below the threshold flags the sequence for
+    # auto-fix and, if that fails, raw-template fallback.
+    tokens = list(required_tokens or [])
+    worst_ratio = 1.0
+    worst_missing: list[str] = []
+    if tokens and emails:
+        for index, email in enumerate(emails[:3]):
+            body = str(email.get("body_text", "") or "")
+            ratio, missing = _email_token_match_ratio(body, tokens)
+            if ratio < worst_ratio:
+                worst_ratio = ratio
+                worst_missing = missing
+        if worst_ratio < min_token_match_ratio:
+            # Heavy penalty — this is the user's voice, not the LLM's.
+            penalty = int(round(40 * (min_token_match_ratio - worst_ratio) * 2))
+            score -= max(penalty, 12)
+            preview = ", ".join(f"\"{m}\"" for m in worst_missing[:5])
+            issues.append(
+                f"Sequence is drifting from the user's template voice "
+                f"({int(round(worst_ratio * 100))}% of required tokens retained; "
+                f"missing: {preview})."
+            )
+            suggestions.append(
+                "Re-anchor the email to the template: keep the required phrases "
+                "and the user's historical opening/closing tone."
+            )
+
     status = "approved"
     if score < min_score or len(issues) > max_blocking_issues:
         status = "needs_review"
@@ -1255,6 +1563,12 @@ def _review_email_sequence(
         "max_blocking_issues": max_blocking_issues,
         "blocking_issue_count": len(issues),
         "locale": locale,
+        "template_adherence": {
+            "required_tokens": tokens,
+            "min_token_match_ratio": min_token_match_ratio,
+            "worst_ratio": worst_ratio,
+            "worst_missing": worst_missing,
+        } if tokens else None,
     }
 def _build_email_tools(llm: LLMTool, locale: str) -> list[ToolDef]:
     """Build the ReAct tool definitions for email validation."""
@@ -1266,7 +1580,7 @@ def _build_email_tools(llm: LLMTool, locale: str) -> list[ToolDef]:
     rule_checks = "\n".join(f"  - {c}" for c in rules["checks"])
 
     async def tool_validate_emails(emails_json: str = "") -> str:
-        """Validate a 3-email sequence for language correctness, formality, salutation format,
+        """Validate the drafted email sequence for language correctness, formality, salutation format,
         and cultural appropriateness. Returns a validation report with issues and suggestions.
         Call this after drafting and after each revision.
 
@@ -1345,13 +1659,15 @@ def _build_email_tools(llm: LLMTool, locale: str) -> list[ToolDef]:
             "expected_closing": closing,
         })
 
+    step_count = _configured_sequence_steps()
+    email_noun = "email" if step_count == 1 else "emails"
     return [
         ToolDef(
             name="validate_emails",
             description=(
-                f"Validate the 3-email sequence for {lang_name} language correctness, "
+                f"Validate the email sequence for {lang_name} language correctness, "
                 f"formality ({formality}), salutation format, cultural appropriateness, "
-                f"and structural requirements (3 emails, correct types, 100-200 words each). "
+                f"and structural requirements ({step_count} {email_noun}, correct types, 100-200 words each). "
                 f"Returns pass/fail with specific issues and suggestions. "
                 f"Call after drafting and after each revision."
             ),
@@ -1436,10 +1752,19 @@ async def _craft_for_lead(
                 notes=email_template_notes,
             )
 
+        step_specs = _active_step_specs()
+        objectives_block = "\n".join(
+            f"Email {spec['sequence_number']}: {spec['objective']}" for spec in step_specs
+        )
+        sequence_noun = "email" if len(step_specs) == 1 else f"{len(step_specs)}-email sequence"
+        signature = _sender_signature(settings)
+
         user_prompt = (
             f"## Your Company\n"
             f"Name: {company_name}\n"
-            f"Products: {products}\n\n"
+            f"Products: {products}\n"
+            f"Sender signature — every email MUST close with exactly this (no placeholders like [Your Name]):\n"
+            f"{signature}\n\n"
             f"Summary: {insight.get('summary', '')}\n"
             f"Industries: {', '.join(insight.get('industries', []))}\n"
             f"Value propositions: {'; '.join(insight.get('value_propositions', []))}\n"
@@ -1476,9 +1801,7 @@ async def _craft_for_lead(
             f"Tone guidance: {strategy_brief.get('tone_guidance', '')}\n"
             f"Personalization hooks: {json.dumps(strategy_brief.get('personalization_hooks', []), ensure_ascii=False)}\n\n"
             f"## Sequence Objectives\n"
-            f"Email 1: establish relevance and open the conversation with a low-friction CTA.\n"
-            f"Email 2: deepen relevance using product/application fit or proof points.\n"
-            f"Email 3: polite follow-up that probes distributor/buyer fit without pressure.\n\n"
+            f"{objectives_block}\n\n"
             f"## Style Examples\n"
             f"{EMAIL_FEWSHOT_EXAMPLES}\n\n"
             f"## Template Guidance\n"
@@ -1486,7 +1809,7 @@ async def _craft_for_lead(
             f"Template notes: {email_template_notes}\n"
             f"Template profile: {json.dumps(template_profile, ensure_ascii=False)}\n"
             f"Template plan: {json.dumps(template_plan, ensure_ascii=False)}\n\n"
-            f"Write the 3-email sequence in {rules['language']}. "
+            f"Write the {sequence_noun} in {rules['language']}. "
             f"Preserve the user's historical style when examples are present, "
             f"but adapt the content to this buyer and the template plan. "
             f"Call validate_emails after drafting, then revise if needed."
@@ -1496,7 +1819,7 @@ async def _craft_for_lead(
 
         try:
             raw = await react_loop(
-                system=EMAIL_REACT_SYSTEM,
+                system=_build_react_system(len(step_specs)),
                 user_prompt=user_prompt,
                 tools=tools,
                 settings=None,
@@ -1511,7 +1834,7 @@ async def _craft_for_lead(
             logger.warning("[EmailCraft] ReAct loop failed for %s: %s", lead.get("company_name"), e)
             return None
 
-        from tools.llm_output import validate_dict, EMAIL_SEQUENCE_REQUIRED, EMAIL_SEQUENCE_DEFAULTS
+        from tools.llm_output import EMAIL_SEQUENCE_DEFAULTS, EMAIL_SEQUENCE_REQUIRED, validate_dict
         parsed = parse_json(raw, context="EmailCraftAgent")
         if parsed is None:
             logger.warning("[EmailCraft] Unparseable output for %s", lead.get("company_name"))
@@ -1535,6 +1858,14 @@ async def _craft_for_lead(
             return None
 
         emails = format_email_sequence_bodies(validated["emails"])
+        # Resolve template-adherence expectations up-front so we pass
+        # the same set to the initial review and to any auto-improve
+        # round. This is the user's voice — if the LLM drifts, we
+        # detect and either re-anchor or fall back to the raw template.
+        required_tokens = _required_tokens_for_template(template_profile, settings)
+        min_token_match_ratio = float(
+            getattr(settings, "email_template_min_token_match_ratio", 0.5) or 0.5
+        )
         review_summary = _review_email_sequence(
             lead,
             locale=locale,
@@ -1543,6 +1874,8 @@ async def _craft_for_lead(
             template_plan=template_plan,
             min_score=int(settings.email_review_min_score or 75),
             max_blocking_issues=int(settings.email_review_max_blocking_issues or 0),
+            required_tokens=required_tokens,
+            min_token_match_ratio=min_token_match_ratio,
         )
         optimized_sequence = {"locale": validated.get("locale", locale), "emails": emails}
         optimized_sequence, review_summary, review_optimization = await _auto_improve_reviewed_sequence(
@@ -1558,8 +1891,60 @@ async def _craft_for_lead(
             max_blocking_issues=int(settings.email_review_max_blocking_issues or 0),
             validation_max_revisions=max(0, int(getattr(settings, "email_validation_max_revisions", 2) or 2)),
             max_rounds=max(0, int(getattr(settings, "email_review_auto_fix_rounds", 2) or 2)),
+            required_tokens=required_tokens,
+            min_token_match_ratio=min_token_match_ratio,
         )
         emails = format_email_sequence_bodies(list(optimized_sequence.get("emails", []) or emails))
+
+        # Final template-adherence gate: if the LLM output still
+        # doesn't carry enough of the user's required phrases after
+        # auto-improve, fall back to the raw template. The user's
+        # voice wins over a fluent but off-brand LLM rewrite. Can
+        # be disabled via ``email_template_fallback_enabled``.
+        template_fallback_used = False
+        if (
+            bool(getattr(settings, "email_template_fallback_enabled", True))
+            and required_tokens
+            and email_template_examples
+        ):
+            worst_ratio = 1.0
+            for email in emails:
+                body = str(email.get("body_text", "") or "")
+                ratio, _ = _email_token_match_ratio(body, required_tokens)
+                if ratio < worst_ratio:
+                    worst_ratio = ratio
+            if worst_ratio < min_token_match_ratio:
+                fallback_emails = _build_raw_template_fallback(
+                    list(email_template_examples),
+                    lead=lead,
+                    target=target,
+                    step_specs=step_specs,
+                    locale=locale,
+                )
+                if fallback_emails:
+                    logger.info(
+                        "[EmailCraft] %s → template fallback (%.0f%% < %.0f%% threshold)",
+                        lead.get("company_name"),
+                        worst_ratio * 100,
+                        min_token_match_ratio * 100,
+                    )
+                    emails = format_email_sequence_bodies(fallback_emails)
+                    template_fallback_used = True
+                    # Re-score the fallback so the rest of the pipeline
+                    # (auto_send_eligible, review_status) sees a clean
+                    # state.
+                    review_summary = _review_email_sequence(
+                        lead,
+                        locale=locale,
+                        emails=emails,
+                        template_profile=template_profile,
+                        template_plan=template_plan,
+                        min_score=int(settings.email_review_min_score or 75),
+                        max_blocking_issues=int(settings.email_review_max_blocking_issues or 0),
+                        required_tokens=required_tokens,
+                        min_token_match_ratio=min_token_match_ratio,
+                    )
+
         logger.info("[EmailCraft] %s → %d emails in %s", lead.get("company_name"), len(emails), locale)
 
         return {
@@ -1613,6 +1998,54 @@ async def email_craft_node(state: HuntState) -> dict:
         agent="email_craft",
         hunt_round=hunt_round,
     )
+
+    # ── Per-lead personalization mode ─────────────────────────────────────
+    # Every lead gets its own fully independent ReAct draft (no template
+    # reuse), so each email is written for that specific company instead
+    # of a group template with name substitution.
+    if _personalize_per_lead_enabled(settings):
+        craft_items: list[tuple[dict[str, Any], dict[str, str], list[dict[str, str]]]] = []
+        for lead in leads:
+            target = choose_email_target(lead)
+            if not target.get("target_email"):
+                logger.info("[EmailCraftAgent] Skipping %s — no sendable email target", lead.get("company_name"))
+                continue
+            craft_items.append((lead, target, expand_email_targets(lead)))
+
+        async def _craft_personalized(item: tuple[dict[str, Any], dict[str, str], list[dict[str, str]]]) -> dict[str, Any] | None:
+            lead, target, targets = item
+            result = await _craft_for_lead(
+                lead,
+                insight,
+                llm,
+                semaphore,
+                email_template_examples=email_template_examples,
+                email_template_notes=email_template_notes,
+                prepared_template_seed=prepared_template_seed,
+                react_max_iterations=settings.react_max_iterations,
+                hunt_id=hunt_id,
+                hunt_round=hunt_round,
+            )
+            if result is None:
+                return None
+            result["targets"] = targets
+            result["generation_mode"] = "personalized"
+            return result
+
+        try:
+            results = await asyncio.gather(*(_craft_personalized(item) for item in craft_items))
+        finally:
+            await llm.close()
+
+        email_sequences = [r for r in results if isinstance(r, dict)]
+        logger.info(
+            "[EmailCraftAgent] Completed (personalized per lead) — %d/%d email sequences generated",
+            len(email_sequences), len(leads),
+        )
+        return {
+            "email_sequences": email_sequences,
+            "current_stage": "email_craft",
+        }
 
     grouped_leads: dict[str, list[tuple[dict[str, Any], dict[str, str]]]] = {}
     for lead in leads:
