@@ -1,4 +1,3 @@
-import { createElement, type ReactNode } from "react";
 import { createRootRoute, createRoute } from "@tanstack/react-router";
 import { RootLayout } from "./root";
 import { DashboardPage } from "./dashboard";
@@ -6,6 +5,8 @@ import { NewHuntPage } from "./new-hunt";
 import { HuntDetailPage } from "./hunt-detail";
 import { AutomationJobPage } from "./automation-job";
 import { QuotasPage } from "./quotas";
+import { LoginPage } from "./login";
+import { SignupPage } from "./signup";
 import { SettingsLayout } from "./settings-layout";
 import { SettingsPage } from "./settings";
 import { LLMSettingsPage } from "./settings-llm";
@@ -18,34 +19,9 @@ import { EmailTestPage } from "./settings-email-test";
 import { WorkflowSettingsPage } from "./settings-workflow";
 import { ConnectedMailboxesPage } from "./connected-mailboxes";
 
-// Placeholder pages for routes that the navigation
-// (root.tsx / settings.tsx) already links to but whose real
-// implementations are still in-flight WIP. Each placeholder
-// renders a "coming soon" card so type-checked navigation
-// resolves to a sensible destination rather than a 404.
-//
-// Note: this file is .ts (not .tsx) so we build the placeholder
-// markup with createElement rather than JSX.
-function PlaceholderCard({ title, hint }: { title: string; hint?: string }): ReactNode {
-  return createElement(
-    "div",
-    { className: "max-w-3xl mx-auto p-6" },
-    createElement(
-      "div",
-      { className: "rounded-lg border bg-card p-8 text-card-foreground shadow-sm" },
-      createElement("h1", { className: "text-2xl font-bold tracking-tight" }, title),
-      createElement(
-        "p",
-        { className: "mt-2 text-muted-foreground" },
-        hint ??
-          "此页面是正在进行的重构的一部分，尚未提交到主分支。路径已注册，因此导航链接不会显示 404。",
-      ),
-    ),
-  );
-}
-
-function LoginPlaceholder(): ReactNode { return createElement(PlaceholderCard, { title: "登录" }); }
-function SignupPlaceholder(): ReactNode { return createElement(PlaceholderCard, { title: "注册" }); }
+// All routes in this file are real pages that exist in the
+// repository. The /settings/* routes are children of a
+// SettingsLayout that renders a left sidebar + right <Outlet />.
 
 const rootRoute = createRootRoute({ component: RootLayout });
 
@@ -141,20 +117,18 @@ const connectedMailboxesRoute = createRoute({
   component: ConnectedMailboxesPage,
 });
 
-// Placeholders for routes already linked from the nav / hub
-// but whose real implementations are WIP. Keep these so the
-// type-checked <Link to="..."> calls compile, and so navigating
-// to them doesn't 404.
+// Real login + signup pages — these existed in main and were
+// already linked from the auth flow, so just register them.
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/login",
-  component: LoginPlaceholder,
+  component: LoginPage,
 });
 
 const signupRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/signup",
-  component: SignupPlaceholder,
+  component: SignupPage,
 });
 
 const quotasRoute = createRoute({
