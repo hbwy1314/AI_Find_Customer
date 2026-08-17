@@ -5,6 +5,7 @@ import { DashboardPage } from "./dashboard";
 import { NewHuntPage } from "./new-hunt";
 import { HuntDetailPage } from "./hunt-detail";
 import { AutomationJobPage } from "./automation-job";
+import { QuotasPage } from "./quotas";
 import { SettingsLayout } from "./settings-layout";
 import { SettingsPage } from "./settings";
 import { LLMSettingsPage } from "./settings-llm";
@@ -15,6 +16,7 @@ import { NotificationsSettingsPage } from "./settings-notifications";
 import { PerformanceSettingsPage } from "./settings-performance";
 import { EmailTestPage } from "./settings-email-test";
 import { WorkflowSettingsPage } from "./settings-workflow";
+import { ConnectedMailboxesPage } from "./connected-mailboxes";
 
 // Placeholder pages for routes that the navigation
 // (root.tsx / settings.tsx) already links to but whose real
@@ -44,8 +46,6 @@ function PlaceholderCard({ title, hint }: { title: string; hint?: string }): Rea
 
 function LoginPlaceholder(): ReactNode { return createElement(PlaceholderCard, { title: "登录" }); }
 function SignupPlaceholder(): ReactNode { return createElement(PlaceholderCard, { title: "注册" }); }
-function QuotasPlaceholder(): ReactNode { return createElement(PlaceholderCard, { title: "发件配额" }); }
-function MailboxesPlaceholder(): ReactNode { return createElement(PlaceholderCard, { title: "已连接邮箱" }); }
 
 const rootRoute = createRootRoute({ component: RootLayout });
 
@@ -138,7 +138,7 @@ const workflowSettingsRoute = createRoute({
 const connectedMailboxesRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "/mailboxes",
-  component: MailboxesPlaceholder,
+  component: ConnectedMailboxesPage,
 });
 
 // Placeholders for routes already linked from the nav / hub
@@ -160,7 +160,7 @@ const signupRoute = createRoute({
 const quotasRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/quotas",
-  component: QuotasPlaceholder,
+  component: QuotasPage,
 });
 
 export const routeTree = rootRoute.addChildren([
