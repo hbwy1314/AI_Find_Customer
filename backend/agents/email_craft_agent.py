@@ -287,6 +287,67 @@ _PLACEHOLDER_TOKENS = (
 )
 
 
+# Defensive localization: the locale validator prompt instructs the LLM to
+# write issues/suggestions in Simplified Chinese, but some models still
+# respond in English. These two functions catch the most common patterns
+# so the user-facing UI stays in Chinese.
+_VALIDATOR_PHRASE_MAP: tuple[tuple[str, str], ...] = (
+    # Email N → 第 N 封 (sentence-start or after punctuation)
+    (r"\bEmail\s*([123])\b", r"第 \1 封"),
+    # Common validator phrases — order matters: more specific first
+    (r"\b(?:grammar|grammatical)\s+(?:issue|error|problem)s?\b", "语法问题"),
+    (r"\bgrammatical(?:ly)?\b", "语法上"),
+    (r"\bgrammar\b", "语法"),
+    (r"\bspelling\s+(?:issue|error|problem)s?\b", "拼写问题"),
+    (r"\bspelling\b", "拼写"),
+    (r"\bsubject line\b", "主题行"),
+    (r"\bsubject\b", "主题"),
+    (r"\bclosing statement\b", "结尾段落"),
+    (r"\bcall to action\b", "行动号召"),
+    (r"\bCTA\b", "行动号召"),
+    (r"\bbuyer[- ]oriented\b", "面向买方的"),
+    (r"\bproof points?\b", "佐证要点"),
+    (r"\bgeneric (marketing )?claims?\b", "泛化营销话术"),
+    (r"\btoo short\b", "过短"),
+    (r"\btoo long\b", "过长"),
+    (r"\btoo aggressive\b", "过于激进"),
+    (r"\btoo generic\b", "过于泛化"),
+    (r"\brepeats?\b", "重复"),
+    (r"\bcompelling\b", "有吸引力"),
+    (r"\bspecific\b", "具体"),
+    (r"\bbrief\b", "简洁"),
+    (r"\bconcrete\b", "具体"),
+    (r"\brevise\b", "修改"),
+    (r"\benhance\b", "加强"),
+    (r"\bsalutation\b", "称呼"),
+    (r"\bformality\b", "语气"),
+    (r"\bclarity\b", "清晰度"),
+    (r"\bnaturalness\b", "自然度"),
+)
+
+
+def _localize_validator_text(text: str) -> str:
+    """Best-effort fallback to convert an English validator string to Chinese.
+
+    The locale validator prompt tells the LLM to write in Simplified
+    Chinese, but not all models comply. When that happens this function
+    applies a small set of regex replacements so the user-facing UI stays
+    readable.
+    """
+    if not text:
+        return text
+    out = str(text)
+    for pattern, replacement in _VALIDATOR_PHRASE_MAP:
+        out = re.sub(pattern, replacement, out, flags=re.IGNORECASE)
+    return out
+
+
+def _localize_validator_list(items: list[str] | None) -> list[str]:
+    if not items:
+        return list(items or [])
+    return [_localize_validator_text(str(item)) for item in items]
+
+
 def _sender_signature(settings: Any = None) -> str:
     """The exact closing signature emails must be signed with.
 
@@ -865,8 +926,8 @@ def _rule_validate_emails_payload(
     specs = _active_step_specs(steps)
     n = len(specs)
     if len(emails_list) != n:
-        issues.append(f"Expected exactly {n} email(s), got {len(emails_list)}")
-        suggestions.append("Generate: " + ", ".join(spec["email_type"] for spec in specs))
+        issues.append(f"序列需要恰好包含 {n} 封邮件，当前为 {len(emails_list)} 封")
+        suggestions.append("请按以下类型生成：" + "、".join(spec["email_type"] for spec in specs))
 
     expected = [(spec["email_type"], spec["suggested_send_day"]) for spec in specs]
     previous_subject = ""
@@ -875,41 +936,41 @@ def _rule_validate_emails_payload(
             break
         em = emails_list[i]
         if em.get("email_type") != etype:
-            issues.append(f"Email {i + 1}: email_type should be '{etype}', got '{em.get('email_type')}'")
+            issues.append(f"第 {i + 1} 封：email_type 应为 '{etype}'，当前为 '{em.get('email_type')}'")
         if em.get("suggested_send_day") != eday:
-            issues.append(f"Email {i + 1}: suggested_send_day should be {eday}")
+            issues.append(f"第 {i + 1} 封：suggested_send_day 应为 {eday}")
         if not str(em.get("subject", "") or "").strip():
-            issues.append(f"Email {i + 1}: subject is empty")
+            issues.append(f"第 {i + 1} 封：主题为空")
         body = str(em.get("body_text", "") or "")
         formatted_body = format_plaintext_email_body(body)
         wc = len(body.split())
         if wc < 50:
-            issues.append(f"Email {i + 1}: body_text too short ({wc} words, min 50)")
-            suggestions.append(f"Email {i + 1}: expand to 100-200 words")
+            issues.append(f"第 {i + 1} 封：正文过短（{wc} 词，至少 50 词）")
+            suggestions.append(f"第 {i + 1} 封：扩写至 100-200 词")
         elif wc > 300:
-            issues.append(f"Email {i + 1}: body_text too long ({wc} words, max 300)")
+            issues.append(f"第 {i + 1} 封：正文过长（{wc} 词，最多 300 词）")
         if wc >= 50 and "\n\n" not in formatted_body:
-            issues.append(f"Email {i + 1}: plain-text layout lacks paragraph breaks")
-            suggestions.append(f"Email {i + 1}: use salutation, 2-3 short paragraphs, and a separate closing line")
+            issues.append(f"第 {i + 1} 封：纯文本缺少段落分隔")
+            suggestions.append(f"第 {i + 1} 封：使用问候语、2-3 个短段落，并单独一行收尾")
 
         lowered_body = body.lower()
         lowered_subject = str(em.get("subject", "") or "").lower()
         placeholder_hits = [t for t in _PLACEHOLDER_TOKENS if t in lowered_body or t in lowered_subject]
         if placeholder_hits:
             issues.append(
-                f"Email {i + 1}: contains placeholder text ({', '.join(placeholder_hits)})"
+                f"第 {i + 1} 封：包含占位文本（{', '.join(placeholder_hits)}）"
             )
             suggestions.append(
-                f"Email {i + 1}: replace the placeholder with the real sender signature from the prompt"
+                f"第 {i + 1} 封：请用 prompt 中真实的发件人签名替换占位"
             )
         if not any(token in lowered_body for token in ["you", "your", "您", "贵公司", "votre", "ihr", "su ", "sua ", "vos", "tu empresa"]):
-            issues.append(f"Email {i + 1}: lacks clear buyer-oriented language")
-            suggestions.append(f"Email {i + 1}: explain why this recipient/company is relevant")
+            issues.append(f"第 {i + 1} 封：缺少面向买方的明确表达")
+            suggestions.append(f"第 {i + 1} 封：说明此收件人/公司为何值得联系")
         if any(phrase in lowered_body for phrase in ["leading provider", "world-class", "best-in-class", "industry-leading"]) and wc < 120:
-            issues.append(f"Email {i + 1}: relies on generic marketing claims")
-            suggestions.append(f"Email {i + 1}: replace generic superlatives with concrete proof points")
+            issues.append(f"第 {i + 1} 封：依赖泛化营销话术")
+            suggestions.append(f"第 {i + 1} 封：用具体佐证要点替换泛化吹捧")
         if previous_subject and previous_subject == lowered_subject:
-            issues.append(f"Email {i + 1}: subject repeats previous email")
+            issues.append(f"第 {i + 1} 封：主题与上一封重复")
         previous_subject = lowered_subject
 
     if len(emails_list) == 3:
@@ -917,11 +978,11 @@ def _rule_validate_emails_payload(
         email_2 = str(emails_list[1].get("body_text", "") or "").lower()
         email_3 = str(emails_list[2].get("body_text", "") or "").lower()
         if email_1[:120] == email_2[:120]:
-            issues.append("Email 2 repeats Email 1 instead of deepening relevance")
-            suggestions.append("Use Email 2 to add product/application fit or proof points")
+            issues.append("第 2 封与第 1 封内容重复，未加深相关性")
+            suggestions.append("第 2 封应补充产品/应用匹配度或具体佐证")
         if any(token in email_3 for token in ["urgent", "last chance", "final notice"]):
-            issues.append("Email 3 CTA is too aggressive for cold outreach")
-            suggestions.append("Use a lighter follow-up or qualification CTA in Email 3")
+            issues.append("第 3 封的 CTA 对冷启动过于激进")
+            suggestions.append("第 3 封建议改为更轻量的跟进或资格确认式 CTA")
 
     return {
         "passed": len(issues) == 0,
@@ -958,7 +1019,11 @@ async def _locale_validate_emails_payload(
         f'"formality_correct": true/false, "salutation_correct": true/false, "business_etiquette_ok": true/false, '
         f'"local_naturalness_ok": true/false, "commercial_quality": true/false, "sequence_progression": true/false, '
         f'"issues": ["..."], "suggestions": ["..."]}}\n'
-        f"Be specific: mention which email number has which problem."
+        f"Be specific: mention which email number has which problem.\n"
+        f"\n"
+        f"CRITICAL OUTPUT LANGUAGE: All string values inside the JSON — especially the 'issues' and "
+        f"'suggestions' arrays — MUST be written in Simplified Chinese (简体中文), regardless of the "
+        f"language of the emails being validated. Reference each email as '第 N 封' (e.g. 第 1 封, 第 2 封, 第 3 封)."
     )
     try:
         raw = await llm.generate(
@@ -971,6 +1036,11 @@ async def _locale_validate_emails_payload(
             raise TypeError("locale validator returned non-string output")
         parsed = parse_json(raw, context="locale_validate_emails")
         if isinstance(parsed, dict):
+            # Defensive: if the LLM still returns English issues/suggestions
+            # (prompt not always followed), run the phrase-level fallback
+            # so the UI stays in Chinese.
+            parsed["issues"] = _localize_validator_list(parsed.get("issues"))
+            parsed["suggestions"] = _localize_validator_list(parsed.get("suggestions"))
             return parsed
     except Exception as exc:
         logger.debug("[EmailCraft] Locale validator failed for %s: %s", locale, exc)
@@ -1043,10 +1113,19 @@ def _review_issue_requires_manual_review(issue: str) -> bool:
     if not normalized:
         return False
     manual_only_markers = (
+        # English (historical)
         "missing a subject",
         "missing a cta strategy",
         "missing tone guidance",
         "expected exactly 3 emails",
+        # Chinese (current reviewer output)
+        "缺少主题",
+        "缺少 cta 策略",
+        "缺少 cta",
+        "缺少语气",
+        "缺少语气指引",
+        "序列需要恰好包含 3 封",
+        "序列需要恰好包含 3",
     )
     return any(marker in normalized for marker in manual_only_markers)
 
@@ -1203,7 +1282,7 @@ async def _validate_and_revise_sequence(
     last_summary = {
         "passed": False,
         "status": "needs_review",
-        "issues": ["Validation did not run"],
+        "issues": ["校验未运行"],
         "suggestions": [],
     }
     for _ in range(max_revisions + 1):
@@ -1220,23 +1299,23 @@ async def _validate_and_revise_sequence(
         suggestions.extend(locale_result.get("suggestions", []))
 
         if not locale_result.get("grammar_ok", True):
-            issues.append("Grammar FAILED: emails contain grammar issues")
+            issues.append("语法未通过：邮件存在语法问题")
         if not locale_result.get("spelling_ok", True):
-            issues.append("Spelling FAILED: emails contain spelling issues")
+            issues.append("拼写未通过：邮件存在拼写问题")
         if not locale_result.get("language_correct", True):
-            issues.append(f"Language FAILED: emails are not fully in {rules['language']}")
+            issues.append(f"语言未通过：邮件未完全使用 {rules['language']}")
         if not locale_result.get("formality_correct", True):
-            issues.append(f"Formality FAILED: expected {rules['formality']} tone")
+            issues.append(f"语气未通过：应为 {rules['formality']} 语气")
         if not locale_result.get("salutation_correct", True):
-            issues.append(f"Salutation FAILED: expected '{rules['salutation']}'")
+            issues.append(f"称呼未通过：应为 '{rules['salutation']}'")
         if not locale_result.get("business_etiquette_ok", True):
-            issues.append("Business etiquette FAILED: wording does not fit local business email habits")
+            issues.append("商务礼仪未通过：措辞不符合当地商务邮件习惯")
         if not locale_result.get("local_naturalness_ok", True):
-            issues.append("Local naturalness FAILED: wording feels translated or culturally unnatural")
+            issues.append("本地化自然度未通过：措辞有翻译腔或不符合当地文化")
         if not locale_result.get("commercial_quality", True):
-            issues.append("Commercial quality FAILED: sequence is too generic or not buyer-relevant enough")
+            issues.append("商业质量未通过：序列过于泛化或对买方缺乏针对性")
         if not locale_result.get("sequence_progression", True):
-            issues.append("Sequence progression FAILED: emails do not clearly build on each other")
+            issues.append("序列递进未通过：邮件之间缺乏清晰的递进关系")
 
         dedup_issues = list(dict.fromkeys(str(item) for item in issues if str(item).strip()))
         dedup_suggestions = list(dict.fromkeys(str(item) for item in suggestions if str(item).strip()))
@@ -1465,8 +1544,8 @@ def _review_email_sequence(
 
     if len(emails) != 3:
         score -= 40
-        issues.append("Expected exactly 3 emails in the sequence.")
-        suggestions.append("Regenerate the full 3-step sequence before sending.")
+        issues.append("序列需要恰好包含 3 封邮件。")
+        suggestions.append("请重新生成完整的 3 步序列再发送。")
 
     required_days = [0, 3, 7]
     previous_subject = ""
@@ -1476,37 +1555,37 @@ def _review_email_sequence(
         wc = len(body.split())
         if not subject:
             score -= 15
-            issues.append(f"Email {index + 1} is missing a subject.")
+            issues.append(f"第 {index + 1} 封缺少主题。")
         if wc < 50:
             score -= 20
-            issues.append(f"Email {index + 1} body is too short ({wc} words).")
-            suggestions.append(f"Expand Email {index + 1} to at least 50 words.")
+            issues.append(f"第 {index + 1} 封正文过短（{wc} 词）。")
+            suggestions.append(f"请将第 {index + 1} 封扩展到至少 50 词。")
         elif wc > 260:
             score -= 10
-            issues.append(f"Email {index + 1} body is too long ({wc} words).")
-            suggestions.append(f"Tighten Email {index + 1} for faster readability.")
+            issues.append(f"第 {index + 1} 封正文过长（{wc} 词）。")
+            suggestions.append(f"请精简第 {index + 1} 封以提升可读性。")
         if wc >= 50 and "\n\n" not in format_plaintext_email_body(body):
             score -= 8
-            issues.append(f"Email {index + 1} plain-text layout is too dense.")
-            suggestions.append(f"Format Email {index + 1} with visible paragraph breaks and a separate closing.")
+            issues.append(f"第 {index + 1} 封纯文本排版过于密集。")
+            suggestions.append(f"请在第 {index + 1} 封中加入明显的段落分隔与单独一行收尾。")
 
         expected_day = required_days[index] if index < len(required_days) else None
         if expected_day is not None and email.get("suggested_send_day") != expected_day:
             score -= 5
-            issues.append(f"Email {index + 1} send day should be {expected_day}.")
+            issues.append(f"第 {index + 1} 封的发送日应为 {expected_day}。")
 
         lowered_subject = subject.lower()
         if previous_subject and lowered_subject == previous_subject:
             score -= 8
-            issues.append(f"Email {index + 1} repeats the previous subject line.")
+            issues.append(f"第 {index + 1} 封的主题与上一封重复。")
         previous_subject = lowered_subject
 
     if not str(template_plan.get("cta_strategy", "") or "").strip():
         score -= 8
-        issues.append("Template plan is missing a CTA strategy.")
+        issues.append("模板计划缺少 CTA 策略。")
     if not str(template_profile.get("tone", "") or "").strip():
         score -= 5
-        issues.append("Template profile is missing tone guidance.")
+        issues.append("模板画像缺少语气指引。")
 
     company_name = str(lead.get("company_name", "") or "").strip()
     if company_name:
@@ -1517,8 +1596,8 @@ def _review_email_sequence(
         )
         if personalization_hits == 0:
             score -= 10
-            issues.append("Sequence does not mention the target company at all.")
-            suggestions.append("Add at least one company-specific relevance reference.")
+            issues.append("整组序列未提及目标公司。")
+            suggestions.append("请至少加入一条与该公司相关的切入点。")
 
     # Template adherence: when the template profile carries required
     # tokens (extracted from the user's historical emails), each
@@ -1539,15 +1618,14 @@ def _review_email_sequence(
             # Heavy penalty — this is the user's voice, not the LLM's.
             penalty = int(round(40 * (min_token_match_ratio - worst_ratio) * 2))
             score -= max(penalty, 12)
-            preview = ", ".join(f"\"{m}\"" for m in worst_missing[:5])
+            preview = "、".join(f"「{m}」" for m in worst_missing[:5])
             issues.append(
-                f"Sequence is drifting from the user's template voice "
-                f"({int(round(worst_ratio * 100))}% of required tokens retained; "
-                f"missing: {preview})."
+                f"序列正在偏离用户模板的语气"
+                f"（仅保留 {int(round(worst_ratio * 100))}% 的必含词，缺失：{preview}）。"
             )
             suggestions.append(
-                "Re-anchor the email to the template: keep the required phrases "
-                "and the user's historical opening/closing tone."
+                "请将邮件重新对齐到模板：保留必含短语，"
+                "并使用用户历史邮件的开场/收尾语气。"
             )
 
     status = "approved"
@@ -1588,18 +1666,18 @@ def _build_email_tools(llm: LLMTool, locale: str) -> list[ToolDef]:
             emails_json: JSON string of the emails array (list of email objects).
         """
         if not emails_json or not emails_json.strip():
-            return json.dumps({"passed": False, "issues": ["No emails provided"], "suggestions": []})
+            return json.dumps({"passed": False, "issues": ["未提供邮件内容"], "suggestions": []})
 
         from tools.llm_output import parse_json as _parse
         try:
             submitted = _parse(emails_json, context="validate_emails")
             if submitted is None:
-                return json.dumps({"passed": False, "issues": ["Could not parse emails_json as JSON"], "suggestions": []})
+                return json.dumps({"passed": False, "issues": ["无法解析 emails_json 为 JSON"], "suggestions": []})
             emails_list = submitted.get("emails", submitted) if isinstance(submitted, dict) else submitted
             if not isinstance(emails_list, list):
                 emails_list = []
         except Exception as e:
-            return json.dumps({"passed": False, "issues": [f"Parse error: {e}"], "suggestions": []})
+            return json.dumps({"passed": False, "issues": [f"解析失败：{e}"], "suggestions": []})
         rule_result = _rule_validate_emails_payload(emails_list)
         issues = list(rule_result["issues"])
         suggestions = list(rule_result["suggestions"])
@@ -1622,7 +1700,11 @@ def _build_email_tools(llm: LLMTool, locale: str) -> list[ToolDef]:
             f'"commercial_quality": true/false, "sequence_progression": true/false, '
             f'"issues": ["..."], "suggestions": ["..."]}}\n'
             f"Also verify: buyer relevance, concrete seller value, low-friction CTA, and that the 3 emails progress instead of repeating.\n"
-            f"Be specific: mention which email number has which problem."
+            f"Be specific: mention which email number has which problem.\n"
+            f"\n"
+            f"CRITICAL OUTPUT LANGUAGE: All string values inside the JSON — especially the 'issues' and "
+            f"'suggestions' arrays — MUST be written in Simplified Chinese (简体中文), regardless of the "
+            f"language of the emails being validated. Reference each email as '第 N 封' (e.g. 第 1 封, 第 2 封, 第 3 封)."
         )
         try:
             raw = await llm.generate(
@@ -1634,18 +1716,18 @@ def _build_email_tools(llm: LLMTool, locale: str) -> list[ToolDef]:
             from tools.llm_output import parse_json as _parse2
             llm_result = _parse2(raw, context="validate_emails_llm")
             if llm_result and isinstance(llm_result, dict):
-                issues.extend(llm_result.get("issues", []))
-                suggestions.extend(llm_result.get("suggestions", []))
+                issues.extend(_localize_validator_list(llm_result.get("issues", [])))
+                suggestions.extend(_localize_validator_list(llm_result.get("suggestions", [])))
                 if not llm_result.get("language_correct", True):
-                    issues.append(f"Language FAILED: emails are not fully in {lang_name}")
+                    issues.append(f"语言未通过：邮件未完全使用 {lang_name}")
                 if not llm_result.get("formality_correct", True):
-                    issues.append(f"Formality FAILED: expected {formality} tone")
+                    issues.append(f"语气未通过：应为 {formality} 语气")
                 if not llm_result.get("salutation_correct", True):
-                    issues.append(f"Salutation FAILED: expected '{salutation}'")
+                    issues.append(f"称呼未通过：应为 '{salutation}'")
                 if not llm_result.get("commercial_quality", True):
-                    issues.append("Commercial quality FAILED: sequence is too generic or not buyer-relevant enough")
+                    issues.append("商业质量未通过：序列过于泛化或对买方缺乏针对性")
                 if not llm_result.get("sequence_progression", True):
-                    issues.append("Sequence progression FAILED: emails do not clearly build on each other")
+                    issues.append("序列递进未通过：邮件之间缺乏清晰的递进关系")
         except Exception as e:
             logger.debug("[EmailCraft] LLM validation call failed: %s", e)
 

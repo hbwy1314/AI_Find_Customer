@@ -347,18 +347,18 @@ function formatTemplateAction(action: string): string {
 }
 
 function buildSequencePreviewText(sequence: EmailSequence): string {
-  const companyName = String(asRecord(sequence.lead).company_name || "Unknown company");
+  const companyName = String(asRecord(sequence.lead).company_name || "未知公司");
   const locale = sequence.locale || "en_US";
   const blocks = sequence.emails.map((email) => (
     [
       `#${email.sequence_number} ${formatEmailType(email.email_type)}`,
-      `Subject: ${email.subject}`,
-      `Send day: ${email.suggested_send_day}`,
+      `主题：${email.subject}`,
+      `发送日：${email.suggested_send_day}`,
       "",
       email.body_text,
     ].join("\n")
   ));
-  return [`Company: ${companyName}`, `Locale: ${locale}`, "", ...blocks].join("\n\n");
+  return [`公司：${companyName}`, `语言：${locale}`, "", ...blocks].join("\n\n");
 }
 
 function formatSendStatus(status: string): string {
@@ -871,13 +871,13 @@ function EmailSequencePreviewSheet({
               <Badge className={sequence.auto_send_eligible ? "bg-emerald-600 hover:bg-emerald-600" : "bg-amber-600 hover:bg-amber-600"}>
                 {sequence.auto_send_eligible ? "可建发送流程" : "需人工复核"}
               </Badge>
-              <Badge variant="outline">Score {String(reviewSummary.score || 0)}</Badge>
+              <Badge variant="outline">评分 {String(reviewSummary.score || 0)}</Badge>
               <Badge variant="outline">{formatTemplateSource(String(templateProfile.source || "auto_generated"))}</Badge>
               <Badge variant="outline">{formatGenerationMode(String(sequence.generation_mode || "personalized"))}</Badge>
               {sequence.template_reused ? <Badge variant="outline">复用模板</Badge> : <Badge variant="outline">模板首稿</Badge>}
               {Boolean(manualReview.decision) && (
                 <Badge variant="outline">
-                  人工决策: {String(manualReview.decision) === "approved" ? "已批准" : "已拦截"}
+                  人工决策：{String(manualReview.decision) === "approved" ? "已批准" : "已拦截"}
                 </Badge>
               )}
             </div>
@@ -889,30 +889,30 @@ function EmailSequencePreviewSheet({
       <SheetBody className="space-y-6">
         <div className="grid gap-3 md:grid-cols-3">
           <div className="rounded-md border p-3">
-            <p className="text-xs uppercase tracking-wide text-muted-foreground">Tone</p>
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">语气</p>
             <p className="mt-1 text-sm font-medium">{String(templateProfile.tone || "n/a")}</p>
           </div>
           <div className="rounded-md border p-3">
-            <p className="text-xs uppercase tracking-wide text-muted-foreground">Opening</p>
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">开场策略</p>
             <p className="mt-1 text-sm font-medium">{String(templatePlan.opening_strategy || "n/a")}</p>
           </div>
           <div className="rounded-md border p-3">
-            <p className="text-xs uppercase tracking-wide text-muted-foreground">CTA</p>
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">行动号召</p>
             <p className="mt-1 text-sm font-medium">{String(templatePlan.cta_strategy || "n/a")}</p>
           </div>
         </div>
 
         <div className="grid gap-3 md:grid-cols-3">
           <div className="rounded-md border p-3">
-            <p className="text-xs uppercase tracking-wide text-muted-foreground">Validation</p>
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">校验</p>
             <p className="mt-1 text-sm font-medium">{String(validationSummary.status || "n/a")}</p>
           </div>
           <div className="rounded-md border p-3">
-            <p className="text-xs uppercase tracking-wide text-muted-foreground">Template Status</p>
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">模板表现</p>
             <p className="mt-1 text-sm font-medium">{formatTemplatePerfStatus(String(templatePerformance.status || "warming_up"))}</p>
           </div>
           <div className="rounded-md border p-3">
-            <p className="text-xs uppercase tracking-wide text-muted-foreground">Next Action</p>
+            <p className="text-xs uppercase tracking-wide text-muted-foreground">下一步</p>
             <p className="mt-1 text-sm font-medium">{formatTemplateAction(String(templatePerformance.recommended_action || "keep_collecting_data"))}</p>
           </div>
         </div>
@@ -920,9 +920,9 @@ function EmailSequencePreviewSheet({
         {sequence.template_id && (
           <div className="rounded-md border p-3 text-sm">
             <div className="flex flex-wrap gap-x-6 gap-y-1 text-muted-foreground">
-              <p>Template ID: <span className="text-foreground">{String(sequence.template_id)}</span></p>
-              <p>Usage: <span className="text-foreground">{String(sequence.template_usage_index || 0)} / {String(sequence.template_assigned_count || 0)}</span></p>
-              <p>Remaining: <span className="text-foreground">{String(sequence.template_remaining_capacity ?? "n/a")}</span></p>
+              <p>模板 ID：<span className="text-foreground">{String(sequence.template_id)}</span></p>
+              <p>使用次数：<span className="text-foreground">{String(sequence.template_usage_index || 0)} / {String(sequence.template_assigned_count || 0)}</span></p>
+              <p>剩余：<span className="text-foreground">{String(sequence.template_remaining_capacity ?? "n/a")}</span></p>
             </div>
             {Boolean(templatePerformance.reason) && (
               <p className="mt-2 text-muted-foreground">{String(templatePerformance.reason)}</p>
@@ -932,7 +932,7 @@ function EmailSequencePreviewSheet({
 
         {proofPoints.length > 0 && (
           <div>
-            <p className="mb-2 text-sm font-semibold">Proof Points</p>
+            <p className="mb-2 text-sm font-semibold">佐证要点</p>
             <div className="flex flex-wrap gap-2">
               {proofPoints.map((item) => (
                 <Badge key={item} variant="secondary">{item}</Badge>
@@ -943,7 +943,7 @@ function EmailSequencePreviewSheet({
 
         {issues.length > 0 && (
           <div className="rounded-md border border-amber-200 bg-amber-50 p-4 dark:border-amber-900 dark:bg-amber-950/20">
-            <p className="mb-2 text-sm font-semibold text-amber-800 dark:text-amber-300">Review Issues</p>
+            <p className="mb-2 text-sm font-semibold text-amber-800 dark:text-amber-300">审核问题</p>
             <ul className="space-y-1 text-sm text-amber-700 dark:text-amber-400">
               {issues.map((issue) => <li key={issue}>• {issue}</li>)}
             </ul>
@@ -952,7 +952,7 @@ function EmailSequencePreviewSheet({
 
         {(validationIssues.length > 0 || validationSuggestions.length > 0) && (
           <div className="rounded-md border p-4">
-            <p className="mb-2 text-sm font-semibold">Validation Summary</p>
+            <p className="mb-2 text-sm font-semibold">校验摘要</p>
             {validationIssues.length > 0 && (
               <ul className="space-y-1 text-sm text-amber-700 dark:text-amber-400">
                 {validationIssues.map((issue) => <li key={issue}>• {issue}</li>)}
@@ -1007,7 +1007,7 @@ function EmailSequencePreviewSheet({
                   <div className="flex flex-wrap items-center gap-2">
                     <Badge variant="secondary">#{email.sequence_number}</Badge>
                     <Badge variant="outline">{formatEmailType(email.email_type)}</Badge>
-                    <Badge variant="outline">Day {email.suggested_send_day}</Badge>
+                    <Badge variant="outline">第 {email.suggested_send_day} 天</Badge>
                     {email.send_status === "queued" && (
                       <Badge variant="outline">队列中</Badge>
                     )}
@@ -1047,7 +1047,7 @@ function EmailSequencePreviewSheet({
                 <div className="grid gap-3 md:grid-cols-2">
                   {(email.personalization_points || []).length > 0 && (
                     <div>
-                      <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">Personalization</p>
+                      <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">个性化要点</p>
                       <div className="flex flex-wrap gap-2">
                         {(email.personalization_points || []).map((point) => (
                           <Badge key={point} variant="secondary">{point}</Badge>
@@ -1057,7 +1057,7 @@ function EmailSequencePreviewSheet({
                   )}
                   {(email.cultural_adaptations || []).length > 0 && (
                     <div>
-                      <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">Locale Notes</p>
+                      <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">本地化说明</p>
                       <div className="flex flex-wrap gap-2">
                         {(email.cultural_adaptations || []).map((item) => (
                           <Badge key={item} variant="outline">{item}</Badge>
@@ -1643,7 +1643,7 @@ export function HuntDetailPage() {
         return;
       }
       if (d.status === "failed") {
-        setSSE((prev) => ({ ...prev, status: "failed", error: "Hunt failed" }));
+        setSSE((prev) => ({ ...prev, status: "failed", error: "任务执行失败" }));
         es.close();
         return;
       }
@@ -1651,7 +1651,7 @@ export function HuntDetailPage() {
     });
 
     es.onerror = () => {
-      setSSE((prev) => ({ ...prev, status: prev.status === "completed" ? "completed" : "failed", error: "Connection lost" }));
+      setSSE((prev) => ({ ...prev, status: prev.status === "completed" ? "completed" : "failed", error: "连接已断开" }));
       setShowResult(true);
       es.close();
     };
@@ -2625,11 +2625,11 @@ export function HuntDetailPage() {
 
                         <div className="grid gap-3 md:grid-cols-4">
                           <div className="rounded-md border bg-muted/30 p-3">
-                            <p className="text-xs uppercase tracking-wide text-muted-foreground">Reviewer Score</p>
+                            <p className="text-xs uppercase tracking-wide text-muted-foreground">审核分数</p>
                             <p className="mt-1 text-xl font-semibold">{String(reviewSummary.score || "0")}</p>
                           </div>
                           <div className="rounded-md border bg-muted/30 p-3">
-                            <p className="text-xs uppercase tracking-wide text-muted-foreground">Blocking Issues</p>
+                            <p className="text-xs uppercase tracking-wide text-muted-foreground">阻塞问题</p>
                             <p className="mt-1 text-xl font-semibold">{String(reviewSummary.blocking_issue_count || 0)}</p>
                           </div>
                           <div className="rounded-md border bg-muted/30 p-3">
@@ -2652,17 +2652,17 @@ export function HuntDetailPage() {
                               <p className="text-sm font-medium">模板策略</p>
                             </div>
                             <div className="space-y-1 text-sm">
-                              <p><span className="text-muted-foreground">Tone:</span> {String(templateProfile.tone || "n/a")}</p>
-                              <p><span className="text-muted-foreground">Opening:</span> {String(templatePlan.opening_strategy || "n/a")}</p>
-                              <p><span className="text-muted-foreground">Value Prop:</span> {String(templatePlan.value_angle || "n/a")}</p>
-                              <p><span className="text-muted-foreground">CTA:</span> {String(templatePlan.cta_strategy || "n/a")}</p>
-                              <p><span className="text-muted-foreground">Validation:</span> {String(validationSummary.status || "n/a")}</p>
-                              <p><span className="text-muted-foreground">Template Perf:</span> {formatTemplatePerfStatus(String(templatePerformance.status || "warming_up"))}</p>
-                              <p><span className="text-muted-foreground">Next Action:</span> {formatTemplateAction(String(templatePerformance.recommended_action || "keep_collecting_data"))}</p>
+                              <p><span className="text-muted-foreground">语气：</span> {String(templateProfile.tone || "n/a")}</p>
+                              <p><span className="text-muted-foreground">开场：</span> {String(templatePlan.opening_strategy || "n/a")}</p>
+                              <p><span className="text-muted-foreground">价值主张：</span> {String(templatePlan.value_angle || "n/a")}</p>
+                              <p><span className="text-muted-foreground">行动号召：</span> {String(templatePlan.cta_strategy || "n/a")}</p>
+                              <p><span className="text-muted-foreground">校验：</span> {String(validationSummary.status || "n/a")}</p>
+                              <p><span className="text-muted-foreground">模板表现：</span> {formatTemplatePerfStatus(String(templatePerformance.status || "warming_up"))}</p>
+                              <p><span className="text-muted-foreground">下一步：</span> {formatTemplateAction(String(templatePerformance.recommended_action || "keep_collecting_data"))}</p>
                             </div>
                             {proofPoints.length > 0 && (
                               <div>
-                                <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">Proof Points</p>
+                                <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">佐证要点</p>
                                 <div className="flex flex-wrap gap-2">
                                   {proofPoints.map((item) => (
                                     <Badge key={item} variant="secondary">{item}</Badge>
@@ -2672,7 +2672,7 @@ export function HuntDetailPage() {
                             )}
                             {forbiddenClaims.length > 0 && (
                               <div>
-                                <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">Avoid</p>
+                                <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">避免措辞</p>
                                 <div className="flex flex-wrap gap-2">
                                   {forbiddenClaims.map((item) => (
                                     <Badge key={item} variant="outline">{item}</Badge>
@@ -2685,7 +2685,7 @@ export function HuntDetailPage() {
                           <div className="rounded-md border p-3 space-y-2">
                             <div className="flex items-center gap-2">
                               <BarChart3 className="h-4 w-4 text-muted-foreground" />
-                              <p className="text-sm font-medium">Review Summary</p>
+                              <p className="text-sm font-medium">审核摘要</p>
                             </div>
                             <p className="text-sm text-muted-foreground">
                               最低通过分 {String(reviewSummary.min_score_required || "75")}，当前状态为 {formatReviewStatus(reviewStatus)}。
@@ -2693,14 +2693,14 @@ export function HuntDetailPage() {
                             {reviewIssues.length > 0 ? (
                               <div className="space-y-2">
                                 <div>
-                                  <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">Issues</p>
+                                  <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">问题列表</p>
                                   <ul className="space-y-1 text-sm text-amber-700 dark:text-amber-400">
                                     {reviewIssues.map((issue) => <li key={issue}>• {issue}</li>)}
                                   </ul>
                                 </div>
                                 {reviewSuggestions.length > 0 && (
                                   <div>
-                                    <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">Suggestions</p>
+                                    <p className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">修改建议</p>
                                     <ul className="space-y-1 text-sm text-muted-foreground">
                                       {reviewSuggestions.map((item) => <li key={item}>• {item}</li>)}
                                     </ul>

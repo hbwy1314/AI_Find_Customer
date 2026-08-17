@@ -245,7 +245,7 @@ def test_review_flags_sequence_missing_required_tokens() -> None:
     # Drifting triggers a heavy penalty → status flips
     assert summary["status"] == "needs_review"
     # At least one issue mentions template drift
-    assert any("drifting" in issue.lower() or "template voice" in issue.lower() for issue in summary["issues"])
+    assert any("偏离" in issue or "语气" in issue for issue in summary["issues"])
 
 
 def test_review_passes_when_tokens_retained() -> None:

@@ -260,7 +260,7 @@ class TestValidateEmailsTool:
         result = _rule_validate_emails_payload(emails)
 
         assert result["passed"] is False
-        assert any("layout lacks paragraph breaks" in issue for issue in result["issues"])
+        assert any("缺少段落分隔" in issue for issue in result["issues"])
 
     @pytest.mark.asyncio
     async def test_short_body_fails(self):
@@ -286,7 +286,7 @@ class TestValidateEmailsTool:
         ]})
         result = json.loads(await validate_fn(emails_json=short_emails))
         assert result["passed"] is False
-        assert any("too short" in issue for issue in result["issues"])
+        assert any("正文过短" in issue for issue in result["issues"])
 
     @pytest.mark.asyncio
     async def test_empty_input_fails(self):
@@ -332,8 +332,8 @@ class TestValidateEmailsTool:
 
         result = _rule_validate_emails_payload(payload)
         assert result["passed"] is False
-        assert any("subject repeats previous email" in issue for issue in result["issues"])
-        assert any("too aggressive" in issue for issue in result["issues"])
+        assert any("主题与上一封重复" in issue for issue in result["issues"])
+        assert any("过于激进" in issue for issue in result["issues"])
 
 
 class TestCraftForLead:
