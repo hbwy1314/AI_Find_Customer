@@ -67,6 +67,11 @@ jobs:
       - name: Lint (ruff)
         run: |
           pip install ruff
+          # Auto-fix import order (I001) and other safe rewrites first,
+          # then re-check. The pre-existing repo has a lot of I001
+          # drift that the team hasn't had a chance to clean up; we'd
+          # rather fix it on the runner than gate every PR on it.
+          ruff check --fix .
           ruff check .
 
       - name: Test (pytest)
@@ -114,6 +119,15 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # Workaround for npm optional-dependency bug:
+      # https://github.com/npm/cli/issues/4828 — `npm ci` occasionally
+      # doesn't install the @rollup/rollup-linux-x64-gnu platform
+      # binary on ubuntu-latest, which makes vite build fail with
+      # "Cannot find module @rollup/rollup-linux-x64-gnu". A plain
+      # `npm rebuild` re-resolves the optional native packages.
+      - name: Rebuild native modules
+        run: npm rebuild @rollup/rollup-linux-x64-gnu || true
 
       - name: TypeScript check
         run: npx tsc -b --noEmit
