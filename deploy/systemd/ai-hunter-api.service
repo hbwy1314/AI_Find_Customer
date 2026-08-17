@@ -1,14 +1,31 @@
 [Unit]
-Description=AI Hunter API
+Description=AI Hunter API (FastAPI + LangGraph)
 After=network.target
 
 [Service]
 Type=simple
+User=aihunter
+Group=aihunter
 WorkingDirectory=/opt/ai-hunter/backend
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/ai-hunter/backend/.venv/bin/python -m uvicorn api.app:app --host 0.0.0.0 --port 8000
+# All runtime config (LLM/email/Graph keys, SESSION_SECRET, etc.) is loaded
+# from this file by pydantic-settings. NEVER commit a populated version.
+EnvironmentFile=-/etc/ai-hunter.env
+ExecStartPre=-/usr/bin/install -d -o aihunter -g aihunter /opt/ai-hunter/backend/data
+ExecStart=/opt/ai-hunter/backend/.venv/bin/python -m uvicorn api.app:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
+# Bound graceful shutdown so long-lived SSE / WebSocket clients don't
+# hold the service up for minutes during a deploy. Uvicorn's default
+# behaviour is to wait for every connection to close on its own;
+# after TimeoutStopSec systemd SIGKILLs and the new release comes up.
+TimeoutStopSec=30s
+# Harden the service: read-only filesystem for /usr, write only where needed
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+ReadWritePaths=/opt/ai-hunter/backend/data /opt/ai-hunter/backend/uploads /opt/ai-hunter/backend
 
 [Install]
 WantedBy=multi-user.target
