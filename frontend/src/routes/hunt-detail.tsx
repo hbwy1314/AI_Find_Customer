@@ -6,12 +6,14 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetHeader, SheetBody } from "@/components/ui/sheet";
+import { EmptyState, ErrorState, LoadingState } from "@/components/data-states";
 import {
   Loader2, Users, Mail, Search, Brain, FileText,
   CheckCircle2, XCircle, ArrowLeft, Download, Globe,
   Building2, User, ExternalLink, Phone, MapPin,
   ChevronRight, ChevronDown, Copy, Check, Activity,
   Tag, BarChart3, PlayCircle, RefreshCw, DollarSign, Zap, TrendingUp,
+  StickyNote,
 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 
@@ -762,6 +764,60 @@ function LeadDetailSheet({ lead, open, onClose }: { lead: Lead | null; open: boo
   );
 }
 
+function TemplateInfoSheet({
+  view,
+  examples,
+  notes,
+  onClose,
+}: {
+  view: "examples" | "notes" | null;
+  examples: string[];
+  notes: string;
+  onClose: () => void;
+}) {
+  if (!view) return null;
+  const isExamples = view === "examples";
+  return (
+    <Sheet open onClose={onClose} className="max-w-3xl">
+      <SheetHeader>
+        <div className="flex items-start gap-3 pr-8">
+          <div className="p-2.5 rounded-lg bg-primary/10">
+            {isExamples
+              ? <FileText className="h-6 w-6 text-primary" />
+              : <StickyNote className="h-6 w-6 text-primary" />}
+          </div>
+          <div className="min-w-0 flex-1">
+            <h2 className="text-xl font-bold">{isExamples ? "原始邮件样例" : "邮件模板备注"}</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {isExamples
+                ? `创建任务时提供的 ${examples.length} 封历史邮件样例，邮件生成前会先从中提取写作风格。`
+                : "创建任务时填写的模板备注，用于约束生成邮件的风格与内容。"}
+            </p>
+          </div>
+          {isExamples && examples.length > 0 && (
+            <CopyButton text={examples.map((item, i) => `Example ${i + 1}:\n${item}`).join("\n\n")} />
+          )}
+          {!isExamples && notes && <CopyButton text={notes} />}
+        </div>
+      </SheetHeader>
+      <SheetBody className="space-y-4">
+        {isExamples ? (
+          examples.map((item, index) => (
+            <div key={index} className="rounded-md border p-4">
+              <p className="mb-2 text-xs uppercase tracking-wide text-muted-foreground">样例 {index + 1}</p>
+              <p className="whitespace-pre-wrap text-sm">{item}</p>
+            </div>
+          ))
+        ) : (
+          <div className="rounded-md border p-4">
+            <p className="whitespace-pre-wrap text-sm">{notes}</p>
+          </div>
+        )}
+      </SheetBody>
+    </Sheet>
+  );
+}
+
 function EmailSequencePreviewSheet({
   sequence,
   open,
@@ -1282,8 +1338,16 @@ export function HuntDetailPage() {
   const [activeTab, setActiveTab] = useState<"overview" | "leads" | "emails" | "email-log">("overview");
   const [realtimeLeads, setRealtimeLeads] = useState<Lead[]>([]);
   const [emailFilter, setEmailFilter] = useState<"all" | "approved" | "needs_review">("all");
+  // Render caps: large hunts produce hundreds of sequences/log rows; render
+  // them in batches instead of one giant DOM tree (page-freeze fix).
+  const EMAIL_RENDER_BATCH = 50;
+  const [emailSeqLimit, setEmailSeqLimit] = useState(EMAIL_RENDER_BATCH);
+  const [emailLogLimit, setEmailLogLimit] = useState(EMAIL_RENDER_BATCH * 2);
   const [previewSequence, setPreviewSequence] = useState<EmailSequence | null>(null);
   const [previewSequenceIndex, setPreviewSequenceIndex] = useState<number | null>(null);
+  // "邮件" tab: view the original template samples / notes the task was
+  // created with (null = closed).
+  const [templateInfoView, setTemplateInfoView] = useState<"examples" | "notes" | null>(null);
 
   const continueJobMutation = useMutation({
     mutationFn: ({ targetLeadCount, maxRounds, minNewLeadsThreshold, enableEmailCraft, emailTemplateExamples, emailTemplateNotes }: {
@@ -1334,7 +1398,7 @@ export function HuntDetailPage() {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [activityLog]);
 
-  const { data: result } = useQuery({
+  const { data: result, isLoading: resultIsLoading, isError: resultIsError, error: resultError, refetch: refetchResult } = useQuery({
     queryKey: ["hunt-result", huntId],
     queryFn: () => api.getHuntResult(huntId),
     enabled: initialLoaded,
@@ -1350,7 +1414,13 @@ export function HuntDetailPage() {
     queryKey: ["email-campaigns", huntId],
     queryFn: () => api.listEmailCampaigns(huntId),
     enabled: !!huntId,
-    refetchInterval: 5000,
+    // Poll faster while a campaign is actively sending (counts change),
+    // slower otherwise — the old flat 5s kept hammering the summary SQL.
+    refetchInterval: (query) => {
+      const items = query.state.data as Awaited<ReturnType<typeof api.listEmailCampaigns>> | undefined;
+      const hasActive = (items || []).some((item) => item.campaign.status === "active");
+      return hasActive ? 10000 : 30000;
+    },
     retry: false,
   });
 
@@ -1374,6 +1444,11 @@ export function HuntDetailPage() {
     [result?.email_sequences],
   );
   const emailCount = emailSequences.length;
+  const templateExamples = useMemo(
+    () => (result?.email_template_examples || []).map((item) => String(item)).filter(Boolean),
+    [result?.email_template_examples],
+  );
+  const templateNotes = String(result?.email_template_notes || "").trim();
   const approvedEmailCount = useMemo(
     () => emailSequences.filter((seq) => isSequenceReadyForSend(seq)).length,
     [emailSequences],
@@ -2159,6 +2234,13 @@ export function HuntDetailPage() {
         onClose={() => setSelectedLead(null)}
       />
 
+      <TemplateInfoSheet
+        view={templateInfoView}
+        examples={templateExamples}
+        notes={templateNotes}
+        onClose={() => setTemplateInfoView(null)}
+      />
+
       <EmailSequencePreviewSheet
         sequence={previewSequence}
         open={previewSequence !== null}
@@ -2254,10 +2336,18 @@ export function HuntDetailPage() {
               )}
             </CardHeader>
             <CardContent>
-              {displayLeads.length === 0 ? (
-                <p className="text-sm text-muted-foreground text-center py-8">
-                  {sse.status === "running" ? "正在提取线索..." : "暂未找到线索。"}
-                </p>
+              {!initialLoaded ? (
+                <LoadingState message="正在加载线索…" variant="skeleton" skeletonCount={4} />
+              ) : displayLeads.length === 0 ? (
+                <EmptyState
+                  title={sse.status === "running" ? "正在提取线索" : "暂未找到线索"}
+                  message={
+                    sse.status === "running"
+                      ? "搜索引擎正在按关键词抓取，提取到一批后会即时显示在这里。"
+                      : "试着调整关键词或换一个目标行业再开一轮。"
+                  }
+                  icon={<Users className="h-5 w-5" />}
+                />
               ) : (
                 <div className="rounded-md border overflow-auto">
                   <table className="w-full text-sm">
@@ -2396,15 +2486,53 @@ export function HuntDetailPage() {
       {activeTab === "emails" && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg">AI 邮件预览</CardTitle>
-            <CardDescription>
-              {emailCount > 0
-                ? `已生成 ${emailCount} 组个性化邮件序列，可在这里预览、审核并进入发送流程。`
-                : "当前任务还没有可预览的 AI 邮件。请先在创建任务或继续挖掘时开启 AI 邮件生成。"}
-            </CardDescription>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <CardTitle className="text-lg">AI 邮件预览</CardTitle>
+                <CardDescription>
+                  {emailCount > 0
+                    ? `已生成 ${emailCount} 组个性化邮件序列，可在这里预览、审核并进入发送流程。`
+                    : "当前任务还没有可预览的 AI 邮件。请先在创建任务或继续挖掘时开启 AI 邮件生成。"}
+                </CardDescription>
+              </div>
+              {(templateExamples.length > 0 || templateNotes) && (
+                <div className="flex flex-wrap gap-2">
+                  {templateExamples.length > 0 && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setTemplateInfoView("examples")}
+                    >
+                      <FileText className="h-4 w-4" />
+                      原始邮件样例 ({templateExamples.length})
+                    </Button>
+                  )}
+                  {templateNotes && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setTemplateInfoView("notes")}
+                    >
+                      <StickyNote className="h-4 w-4" />
+                      邮件模板备注
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
           </CardHeader>
           <CardContent className="space-y-4">
-            {emailCount > 0 && result ? (
+            {resultIsLoading ? (
+              <LoadingState message="正在加载邮件…" variant="skeleton" skeletonCount={3} />
+            ) : resultIsError ? (
+              <ErrorState
+                error={resultError}
+                onRetry={() => void refetchResult()}
+                title="加载邮件失败"
+              />
+            ) : emailCount > 0 && result ? (
               <>
                 <div className="flex flex-wrap gap-2">
                   {([
@@ -2442,7 +2570,7 @@ export function HuntDetailPage() {
                   </div>
                 </div>
 
-                {filteredEmailSequences.map(({ seq, index }) => {
+                {filteredEmailSequences.slice(0, emailSeqLimit).map(({ seq, index }) => {
                   const lead = asRecord(seq.lead);
                   const emails = seq.emails || [];
                   const reviewSummary = asRecord(seq.review_summary);
@@ -2598,11 +2726,24 @@ export function HuntDetailPage() {
                     </details>
                   );
                 })}
+                {filteredEmailSequences.length > emailSeqLimit && (
+                  <div className="flex justify-center pt-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => setEmailSeqLimit((limit) => limit + EMAIL_RENDER_BATCH)}
+                    >
+                      加载更多（剩余 {filteredEmailSequences.length - emailSeqLimit} 组）
+                    </Button>
+                  </div>
+                )}
               </>
             ) : (
-              <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
-                当前还没有 AI 邮件可预览。请在创建任务或继续挖掘时开启邮件生成。
-              </div>
+              <EmptyState
+                title="还没有 AI 邮件"
+                message="当前任务还没生成邮件。请在创建任务或继续挖掘时开启邮件生成。"
+                icon={<Mail className="h-5 w-5" />}
+              />
             )}
           </CardContent>
         </Card>
@@ -2635,10 +2776,19 @@ export function HuntDetailPage() {
                 </div>
               </div>
 
-              {emailLogRows.length === 0 ? (
-                <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
-                  当前还没有邮件日志数据。
-                </div>
+              {resultIsLoading ? (
+                <LoadingState message="正在加载邮件日志…" variant="skeleton" skeletonCount={5} />
+              ) : resultIsError ? (
+                <ErrorState
+                  error={resultError}
+                  onRetry={() => void refetchResult()}
+                  title="加载邮件日志失败"
+                />
+              ) : emailLogRows.length === 0 ? (
+                <EmptyState
+                  title="还没有邮件日志"
+                  message="这个任务下还没有任何发送或排队中的邮件记录。"
+                />
               ) : (
                 <div className="rounded-md border overflow-auto">
                   <table className="w-full text-sm">
@@ -2653,7 +2803,7 @@ export function HuntDetailPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {emailLogRows.map((row) => (
+                      {emailLogRows.slice(0, emailLogLimit).map((row) => (
                         <tr key={`${row.sequenceIndex}-${row.sequenceNumber}-${row.subject}`} className="border-b last:border-0">
                           <td className="p-3">
                             <div>
@@ -2703,6 +2853,17 @@ export function HuntDetailPage() {
                       ))}
                     </tbody>
                   </table>
+                </div>
+              )}
+              {emailLogRows.length > emailLogLimit && (
+                <div className="flex justify-center pt-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setEmailLogLimit((limit) => limit + EMAIL_RENDER_BATCH * 2)}
+                  >
+                    加载更多（剩余 {emailLogRows.length - emailLogLimit} 条）
+                  </Button>
                 </div>
               )}
             </CardContent>

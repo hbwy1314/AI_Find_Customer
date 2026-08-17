@@ -4,6 +4,7 @@ import { api, AutomationJob } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ErrorState, LoadingState } from "@/components/data-states";
 import { Plus, Crosshair, Users, Loader2, Globe, Clock, MapPin, Tag, Mail, Send, AlertTriangle, Workflow, Reply, Bell } from "lucide-react";
 import { useMemo, useState } from "react";
 
@@ -49,7 +50,7 @@ function queueStatusVariant(job: AutomationJob) {
 
 export function DashboardPage() {
   const [eventFilter, setEventFilter] = useState<"all" | "failed" | "sent" | "reply">("all");
-  const { data: jobs, isLoading, isFetching, error: jobsError } = useQuery({
+  const { data: jobs, isLoading, isFetching, isError: jobsIsError, error: jobsError, refetch: refetchJobs } = useQuery({
     queryKey: ["automation-jobs"],
     queryFn: api.listAutomationJobs,
     refetchInterval: 5000,
@@ -393,12 +394,14 @@ export function DashboardPage() {
       ) : null}
 
       {isLoading ? (
-        <Card className="border-dashed">
-          <CardContent className="flex items-center justify-center gap-3 py-16 text-muted-foreground">
-            <Loader2 className="h-6 w-6 animate-spin" />
-            <span>正在加载队列任务…</span>
-          </CardContent>
-        </Card>
+        <LoadingState message="正在加载队列任务…" className="py-16" />
+      ) : jobsIsError ? (
+        <ErrorState
+          error={jobsError}
+          onRetry={() => void refetchJobs()}
+          title="加载队列任务失败"
+          className="my-6"
+        />
       ) : !jobList.length ? (
         <Card className="border-dashed">
           <CardContent className="flex flex-col items-center justify-center py-16">
