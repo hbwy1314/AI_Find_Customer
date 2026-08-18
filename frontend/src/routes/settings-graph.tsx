@@ -295,35 +295,6 @@ export function GraphSettingsPage() {
         </div>
       ) : (
         <>
-          {/* Provider type toggle */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">默认发件 Provider</CardTitle>
-              <CardDescription>
-                切到 <span className="font-mono">graph</span> 后，发件与回信检测都会用共享邮箱走 Graph API，不再依赖 SMTP/IMAP。
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="flex flex-wrap gap-2">
-              {([
-                ["smtp", "SMTP/IMAP（兜底）"],
-                ["graph", "Microsoft Graph"],
-              ] as const).map(([v, l]) => (
-                <button
-                  key={v}
-                  type="button"
-                  onClick={() => form.handleChange("email_provider_type", v)}
-                  className={`rounded-md border px-4 py-2 text-sm ${
-                    (form.values.email_provider_type ?? "smtp") === v
-                      ? "border-primary bg-primary/10 text-primary"
-                      : "border-border text-muted-foreground"
-                  }`}
-                >
-                  {l}
-                </button>
-              ))}
-            </CardContent>
-          </Card>
-
           {/* Azure AD App credentials */}
           <Card>
             <CardHeader>
@@ -389,7 +360,7 @@ export function GraphSettingsPage() {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-1.5">
-              <Label htmlFor="graph_mailbox_upn">共享发件邮箱 (UPN / SMTP)</Label>
+              <Label htmlFor="graph_mailbox_upn">共享发件邮箱 (UPN)</Label>
               <Input
                 id="graph_mailbox_upn"
                 value={form.values.graph_mailbox_upn ?? ""}

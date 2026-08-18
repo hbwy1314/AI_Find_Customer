@@ -109,26 +109,42 @@ export function NewHuntPage() {
         .map((item) => item.trim())
         .filter(Boolean),
       email_template_notes: emailTemplateNotes.trim(),
+      // If the user explicitly pinned a connected mailbox, ship its
+      // id so the auto-created campaign rides on it. Empty / unset
+      // tells the backend to use the auto-managed default account,
+      // which follows `Settings.email_provider_type`.
+      email_account_id: pinnedAccountId || undefined,
     });
   };
 
   const settingsValues = settingsQuery.data?.settings ?? {};
-  const smtpConfigured = Boolean(
-    settingsValues.EMAIL_FROM_ADDRESS &&
-    settingsValues.EMAIL_SMTP_HOST &&
-    settingsValues.EMAIL_SMTP_PORT &&
-    settingsValues.EMAIL_SMTP_USERNAME &&
-    settingsValues.EMAIL_SMTP_PASSWORD
-  );
-  const imapConfigured = Boolean(
-    settingsValues.EMAIL_IMAP_HOST &&
-    settingsValues.EMAIL_IMAP_PORT &&
-    settingsValues.EMAIL_IMAP_USERNAME &&
-    settingsValues.EMAIL_IMAP_PASSWORD
-  );
-  const smtpTested = Boolean(settingsValues.EMAIL_SMTP_LAST_TEST_AT);
-  const imapTested = Boolean(settingsValues.EMAIL_IMAP_LAST_TEST_AT);
   const autoSendEnabled = (settingsValues.EMAIL_AUTO_SEND_ENABLED ?? "false") === "true";
+
+  // All outbound and inbound email now flows through Microsoft Graph.
+  // "Ready to send" means tenant/client/secret/shared-mailbox are all
+  // populated in Settings → Microsoft Graph.
+  const graphConfigured = Boolean(
+    settingsValues.GRAPH_TENANT_ID &&
+    settingsValues.GRAPH_CLIENT_ID &&
+    settingsValues.GRAPH_CLIENT_SECRET &&
+    settingsValues.GRAPH_MAILBOX_UPN
+  );
+  const outboundReady = graphConfigured;
+  const outboundProviderLabel = "Microsoft Graph";
+
+  // Pull the list of connected mailboxes so the user can pin a
+  // specific account instead of relying on the auto-managed default.
+  const accountsQuery = useQuery({
+    queryKey: ["email-accounts"],
+    queryFn: api.listEmailAccounts,
+  });
+  const connectedAccounts = accountsQuery.data?.accounts ?? [];
+  const activeAccounts = connectedAccounts.filter((a) => a.status === "active");
+  // Empty = rotate across ALL active accounts of the chosen provider
+  // (backend assigns each email sequence to the least-loaded mailbox,
+  // honoring the quotas-page rotation order). Only an explicit pick
+  // pins the campaign to a single account.
+  const [pinnedAccountId, setPinnedAccountId] = useState<string>("");
 
   return (
     <div className="max-w-2xl mx-auto">
@@ -361,7 +377,7 @@ export function NewHuntPage() {
             <div className="flex items-center gap-2">
               <CardTitle className="text-lg">AI 邮件生成</CardTitle>
             </div>
-            <CardDescription>基于 ICP 和官网洞察生成 3 步英文开发邮件，也支持从你的历史邮件中提取模板风格。</CardDescription>
+            <CardDescription>基于 ICP 和官网洞察生成单封开发邮件（默认），也支持从你的历史邮件中提取模板风格。</CardDescription>
           </CardHeader>
           <CardContent>
             <div className="rounded-lg border border-dashed p-4">
@@ -370,7 +386,7 @@ export function NewHuntPage() {
                   <Mail className="h-5 w-5 text-muted-foreground" />
                   <div>
                     <p className="text-sm font-medium">生成 AI 邮件序列</p>
-                    <p className="text-xs text-muted-foreground">启用后会为线索生成邮件模板计划、3 封开发邮件和发送审核信息。</p>
+                    <p className="text-xs text-muted-foreground">启用后会为线索生成邮件模板计划、1 封开发邮件和发送审核信息。</p>
                   </div>
                 </div>
                 <button
@@ -391,37 +407,54 @@ export function NewHuntPage() {
               </div>
               {enableEmailCraft && (
                 <div className="mt-4 space-y-4">
-                  <div className={`rounded-md border px-3 py-3 text-sm ${smtpConfigured ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-amber-200 bg-amber-50 text-amber-900"}`}>
+                  <div className={`rounded-md border px-3 py-3 text-sm ${outboundReady ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-amber-200 bg-amber-50 text-amber-900"}`}>
                     <div className="flex flex-wrap items-center gap-2">
-                      <Badge variant={smtpConfigured ? "success" : "warning"}>
-                        {smtpConfigured ? (smtpTested ? "SMTP 已验证" : "SMTP 已配置") : "SMTP 未配置"}
+                      <Badge variant={outboundReady ? "success" : "warning"}>
+                        {graphConfigured ? "Graph 已配置" : "Graph 未配置"}
                       </Badge>
-                      <span>邮件草稿可以正常生成和预览。</span>
+                      <span>当前出站通道：<strong>{outboundProviderLabel}</strong></span>
                     </div>
                     <p className="mt-2 text-xs leading-5 text-current/80">
-                      {smtpConfigured
-                        ? (
-                          smtpTested
-                            ? "当前邮箱授权信息已配置并测试成功，后续可以进入自动发送链路。"
-                            : "当前邮箱参数已填写，但还没有测试成功。可以先生成和预览；自动发送启动前仍会被后端拦截。"
-                        )
-                        : "当前仅建议用于生成和预览。未完成 SMTP 授权前，手动发送、创建自动发送 campaign 和调度器发送都会被后端拦截。"}
+                      {outboundReady
+                        ? `设置里的 ${outboundProviderLabel} 已配齐，新建任务的 AI 邮件会自动走这个通道，无需在这里选账号。`
+                        : `设置里的 ${outboundProviderLabel} 还没配齐，新任务会卡在发送前置校验。生成和预览不受影响。`}
                     </p>
-                    {autoSendEnabled && !smtpConfigured && (
+                    <p className="mt-2 text-xs leading-5 text-current/80">
+                      回信检测会读取同一个共享邮箱的 Inbox，无需额外配置。
+                    </p>
+                    {autoSendEnabled && !outboundReady && (
                       <p className="mt-2 text-xs leading-5 text-current/80">
-                        你在设置里开启了自动发送，但 SMTP 还没配好，这种状态下不会通过发送前置校验。
+                        你在设置里开启了自动发送，但当前通道还没配好，不会通过发送前置校验。
                       </p>
                     )}
-                    <p className="mt-2 text-xs leading-5 text-current/80">
-                      {imapConfigured
-                        ? (
-                          imapTested
-                            ? "IMAP 已配置并测试成功，可用于自动回信检测。"
-                            : "IMAP 参数已填写，但尚未测试成功；自动回信检测暂时不会启动。"
-                        )
-                        : "IMAP 未配置时仍可生成和发送，但无法自动检测回信。"}
+                    <p className="mt-1 text-xs leading-5 text-current/60">
+                      调整配置：<a href="/settings/graph" className="underline">Microsoft Graph</a> · <a href="/settings" className="underline">设置总览</a>
                     </p>
                   </div>
+                  {activeAccounts.length > 0 ? (
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium" htmlFor="pinned-account">
+                        发送账号 <span className="text-muted-foreground font-normal">（默认全部账号轮换）</span>
+                      </label>
+                      <select
+                        id="pinned-account"
+                        value={pinnedAccountId}
+                        onChange={(e) => setPinnedAccountId(e.target.value)}
+                        className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        <option value="">自动轮换（推荐）</option>
+                        {activeAccounts.map((a) => (
+                          <option key={a.id} value={a.id}>
+                            {a.from_email || a.id} · {a.provider_type}
+                          </option>
+                        ))}
+                      </select>
+                      <p className="text-xs text-muted-foreground">
+                        「自动轮换」会按发送限额页的轮转顺序，把邮件分散到当前通道的所有账号，
+                        每个账号各自扣自己的每日限额。只有需要指定某个发件箱时才选择具体账号。
+                      </p>
+                    </div>
+                  ) : null}
                   <div className="space-y-2">
                     <label className="text-sm font-medium">历史邮件样例 / 模板样例 <span className="text-muted-foreground font-normal">（可选）</span></label>
                     <textarea

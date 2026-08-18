@@ -1,8 +1,12 @@
-"""EmailCraftAgent — concurrent 3-email sequence generation per lead, multi-language.
+"""EmailCraftAgent — concurrent N-step email sequence generation per lead, multi-language.
 
 Uses a ReAct loop (Think → Draft → Validate → Revise) with max 3 iterations.
 The validate_emails tool checks language correctness, formality, salutation format,
 and cultural norms per locale before the agent finalises the output.
+
+Default sequence length is 1 (Settings.email_sequence_steps); the
+``_EMAIL_STEP_SPECS`` table keeps up to 3 entries so operators can
+opt back into a multi-step cadence by bumping the setting.
 """
 
 from __future__ import annotations
@@ -14,10 +18,15 @@ import json
 import logging
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from config.settings import get_settings
 from emailing.body_format import format_email_sequence_bodies, format_plaintext_email_body
-from emailing.policy import choose_email_target, expand_email_targets
+from emailing.policy import (
+    choose_email_target,
+    expand_email_targets,
+    is_role_based_email,
+)
 from emailing.template_pipeline import compose_template_plan, extract_template_profile
 from graph.state import HuntState
 from tools.llm_client import LLMTool
@@ -32,6 +41,167 @@ from tools.react_runner import ToolDef, react_loop
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TEMPLATE_MAX_SEND_COUNT = 100
+
+
+def _recipient_type_hint(target: dict[str, Any]) -> str:
+    """Render a one-line human note for the prompt so the LLM knows
+    whether it's writing to a named person or a shared inbox. The
+    CTA + tone guidance differ: role-based mailboxes usually bounce
+    around inside a company before landing, so the message should be
+    crisp and self-explanatory.
+    """
+    if not target:
+        return "No recipient resolved."
+    email = str(target.get("target_email") or "").strip()
+    if not email:
+        return "No recipient resolved."
+    name = str(target.get("target_name") or "").strip()
+    title = str(target.get("target_title") or "").strip()
+    role_based = bool(target.get("is_role_based"))
+    target_type = str(target.get("target_type") or "").strip()
+    lines: list[str] = []
+    lines.append(f"Recipient: {name or '—'} <{email}>")
+    if title:
+        lines.append(f"Title: {title}")
+    lines.append(f"Source: {target_type or 'unknown'}")
+    if role_based:
+        lines.append(
+            "Note: this is a role-based / shared inbox. The message will be "
+            "triaged by an assistant before it reaches a person, so keep the "
+            "subject line concrete (include our product name + their company) "
+            "and put the actionable ask + signature in the first two body "
+            "paragraphs. Do NOT expect a direct personal reply."
+        )
+    else:
+        lines.append(
+            "Note: this is a named decision maker. The subject can be more "
+            "tailored and the body can build rapport before the ask."
+        )
+    return "\n".join(lines)
+
+
+def _format_hunter_contacts(contacts: list[dict[str, Any]]) -> str:
+    """Render Hunter.io discovered contacts as a prompt block. Empty
+    list returns a clear "not available" marker so the LLM doesn't
+    silently fall back to guessing.
+    """
+    if not contacts:
+        return (
+            "None available for this lead (Hunter.io wasn't called, was "
+            "disabled, returned nothing, or the lead already had named "
+            "decision makers). The recipient is therefore the chosen "
+            "target above — write directly to them."
+        )
+    lines: list[str] = []
+    for c in contacts[:5]:
+        email = str(c.get("email") or "")
+        first = str(c.get("first_name") or "").strip()
+        last = str(c.get("last_name") or "").strip()
+        position = str(c.get("position") or "").strip()
+        seniority = str(c.get("seniority") or "").strip()
+        department = str(c.get("department") or "").strip()
+        confidence = c.get("confidence", 0)
+        role = " ".join(part for part in (first, last) if part).strip() or "—"
+        meta_bits = [bit for bit in (position, seniority, department) if bit]
+        meta = " / ".join(meta_bits) if meta_bits else "no role metadata"
+        lines.append(
+            f"- {role} <{email}> — {meta} (Hunter confidence {confidence}%)"
+        )
+    return "\n".join(lines)
+
+
+def _domain_from_url(url: str) -> str:
+    """Extract a bare hostname from a URL. Returns ``""`` for
+    anything that doesn't look like a valid domain.
+    """
+    if not url:
+        return ""
+    text = str(url).strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "http://" + text
+    try:
+        host = urlparse(text).hostname or ""
+    except ValueError:
+        return ""
+    host = host.lower().strip()
+    # Drop a leading "www." so the Hunter lookup matches whatever
+    # they actually expose via MX.
+    if host.startswith("www."):
+        host = host[4:]
+    if "." not in host:
+        return ""
+    return host
+
+
+async def _enrich_lead_with_hunter(
+    lead: dict[str, Any],
+    *,
+    max_results: int = 5,
+) -> list[dict[str, Any]]:
+    """If the lead has no named decision makers, ask Hunter.io to
+    discover contacts at the lead's domain. Returns a list of
+    ``{email, first_name, last_name, position, seniority, department,
+    confidence}`` dicts. Empty list on any failure (missing key,
+    domain, quota, network, …) — callers fall back to role-based
+    targets and the LLM prompt.
+    """
+    # Per product decision: only call Hunter when the lead has no
+    # decision_makers at all (otherwise we burn quota on leads that
+    # already have named contacts).
+    if lead.get("decision_makers"):
+        return []
+    website = str(lead.get("website") or "").strip()
+    if not website:
+        return []
+    domain = _domain_from_url(website)
+    if not domain:
+        return []
+    try:
+        from tools.hunter_client import HunterClient, HunterError
+    except ImportError:
+        return []
+    try:
+        client = HunterClient.from_settings()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[EmailCraft] Hunter client init skipped: %s", exc)
+        return []
+    try:
+        response = await client.domain_search(domain, limit=max_results)
+    except Exception as exc:  # noqa: BLE001 — HunterError + httpx + quota
+        logger.info(
+            "[EmailCraft] Hunter domain_search(%s) skipped: %s",
+            domain, exc.__class__.__name__,
+        )
+        return []
+    finally:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+    # Filter to deliverable + personal contacts (skip generic role
+    # addresses that Hunter may also surface).
+    out: list[dict[str, Any]] = []
+    for e in response.emails:
+        if not e.first_name and not e.last_name:
+            # Pure role-based / generic — Hunter is just echoing
+            # public catch-alls. Skip so we don't get duplicates
+            # of the role-based inbox we already have.
+            continue
+        out.append({
+            "email": e.email,
+            "first_name": e.first_name,
+            "last_name": e.last_name,
+            "position": e.position,
+            "seniority": e.seniority,
+            "department": e.department,
+            "confidence": e.confidence,
+            "source": "hunter.io",
+            "is_role_based": is_role_based_email(e.email),
+        })
+    return out
+
 
 # ── Locale rules: validation criteria per language ────────────────────────────
 _LOCALE_RULES: dict[str, dict[str, Any]] = {
@@ -222,6 +392,8 @@ _COUNTRY_LOCALE_MAP = {
 # ── Sequence step definitions (single source of truth for N-email support) ──
 # Each step: sequence_number, email_type, suggested_send_day, objective.
 # `Settings.email_sequence_steps` (1-3) decides how many of these are used.
+# Default is 1 (single outreach email). Bump the setting to re-enable a
+# multi-step cadence; the step table below is the source of truth.
 _EMAIL_STEP_SPECS: list[dict[str, Any]] = [
     {
         "sequence_number": 1,
@@ -416,15 +588,34 @@ Your task: write {task_noun} for a potential buyer/distributor, then validate an
    - 2-3 short body paragraphs
    - blank line
    - closing line
-7. Close every email with the sender signature given in the prompt. NEVER
+   - blank line
+   - sender signature (use the signature given in the prompt EXACTLY)
+7. Every email MUST be a complete, self-contained message. The body
+   must end with a localised closing line (e.g. "Best regards",
+   "Mit freundlichen Grüßen", "此致敬礼", "よろしくお願いいたします")
+   followed by the sender signature. NEVER truncate the body mid-sentence
+   or end with a dangling clause — a missing closing is a hard fail.
+8. Close every email with the sender signature given in the prompt. NEVER
    emit placeholder tokens such as [Your Name], [Name], [Your Company] —
    if a signature is provided, sign with it exactly.
-8. Output ONLY the JSON object — no extra text."""
+9. Output ONLY the JSON object — no extra text.
+10. **Product hook is mandatory.** Each email MUST anchor on at least
+    one concrete attribute of *our* product (a specific model, spec,
+    certification, or named customer reference drawn from "## Your
+    Company"). Generic claims ("high quality", "competitive pricing",
+    "industry-leading", "global presence", "best-in-class") without
+    backing detail count as a template failure and will be rejected.
+    Pull a specific value angle from the Strategy Brief, not boilerplate.
+11. The recipient's business must appear with at least one concrete
+    detail (a real product line, market, or website reference from
+    "## Target Lead") so the email is unmistakably addressed to *them*,
+    not a generic audience."""
 
 
-# Backwards-compatible constant (3-email variant). Runtime paths call
-# `_build_react_system()` so `Settings.email_sequence_steps` takes effect.
-EMAIL_REACT_SYSTEM = _build_react_system(3)
+# Backwards-compatible constant (default 1-email variant). Runtime
+# paths call `_build_react_system()` directly with the resolved
+# step count, so `Settings.email_sequence_steps` takes effect.
+EMAIL_REACT_SYSTEM = _build_react_system(1)
 
 
 EMAIL_FEWSHOT_EXAMPLES = """
@@ -501,7 +692,9 @@ Return JSON only:
 BRIEF_SYNTHESIS_SYSTEM = """You are a B2B outbound strategist.
 
 Do not write the emails yet.
-Prepare a concise strategy brief for a 3-step outbound sequence.
+Prepare a concise strategy brief for the configured N-step outbound sequence
+(default: a single outreach email; the operator may opt into a multi-step
+cadence via Settings.email_sequence_steps).
 
 The brief must be grounded in actual facts from:
 - the seller's products, positioning, and ICP
@@ -920,22 +1113,19 @@ def _rule_validate_emails_payload(
     emails_list: list[dict[str, Any]],
     steps: int | None = None,
 ) -> dict[str, Any]:
+    # The size check ("序列需要恰好包含 N 封") is intentionally omitted:
+    # the LLM is free to ship 1, 2, or N emails per sequence. The
+    # per-email + cross-step checks below still run on whatever the
+    # LLM produced.
     issues: list[str] = []
     suggestions: list[str] = []
 
     specs = _active_step_specs(steps)
-    n = len(specs)
-    if len(emails_list) != n:
-        issues.append(f"序列需要恰好包含 {n} 封邮件，当前为 {len(emails_list)} 封")
-        suggestions.append("请按以下类型生成：" + "、".join(spec["email_type"] for spec in specs))
-
     expected = [(spec["email_type"], spec["suggested_send_day"]) for spec in specs]
     previous_subject = ""
-    for i, (etype, eday) in enumerate(expected):
-        if i >= len(emails_list):
-            break
-        em = emails_list[i]
-        if em.get("email_type") != etype:
+    for i, em in enumerate(emails_list):
+        etype, eday = expected[i] if i < len(expected) else (None, None)
+        if etype is not None and em.get("email_type") != etype:
             issues.append(f"第 {i + 1} 封：email_type 应为 '{etype}'，当前为 '{em.get('email_type')}'")
         if em.get("suggested_send_day") != eday:
             issues.append(f"第 {i + 1} 封：suggested_send_day 应为 {eday}")
@@ -966,23 +1156,41 @@ def _rule_validate_emails_payload(
         if not any(token in lowered_body for token in ["you", "your", "您", "贵公司", "votre", "ihr", "su ", "sua ", "vos", "tu empresa"]):
             issues.append(f"第 {i + 1} 封：缺少面向买方的明确表达")
             suggestions.append(f"第 {i + 1} 封：说明此收件人/公司为何值得联系")
-        if any(phrase in lowered_body for phrase in ["leading provider", "world-class", "best-in-class", "industry-leading"]) and wc < 120:
+        # Generic marketing claims without backing detail. We flag
+        # these regardless of word count because they undercut the
+        # product-hook requirement (see prompt rule #10) — even a
+        # long, generic email reads as template noise.
+        generic_phrases = (
+            "leading provider", "world-class", "best-in-class",
+            "industry-leading", "globally recognized", "world leader",
+            "top-tier", "industry leader", "global leader",
+            "cutting-edge technology", "state-of-the-art",
+            "world-renowned", "high quality", "competitive pricing",
+            "best price", "best quality", "premier provider",
+            "一站式", "行业领先", "全球领先", "业界领先",
+            "世界一流", "顶尖", "高品质",
+        )
+        if any(phrase in lowered_body for phrase in generic_phrases):
             issues.append(f"第 {i + 1} 封：依赖泛化营销话术")
-            suggestions.append(f"第 {i + 1} 封：用具体佐证要点替换泛化吹捧")
+            suggestions.append(
+                f"第 {i + 1} 封：用具体卖点（型号 / 规格 / 认证 / 客户案例 / 数字）替换泛化吹捧"
+            )
         if previous_subject and previous_subject == lowered_subject:
             issues.append(f"第 {i + 1} 封：主题与上一封重复")
         previous_subject = lowered_subject
 
-    if len(emails_list) == 3:
+    if len(emails_list) >= 2:
+        # Cross-step checks only meaningful for multi-step sequences.
         email_1 = str(emails_list[0].get("body_text", "") or "").lower()
         email_2 = str(emails_list[1].get("body_text", "") or "").lower()
-        email_3 = str(emails_list[2].get("body_text", "") or "").lower()
         if email_1[:120] == email_2[:120]:
             issues.append("第 2 封与第 1 封内容重复，未加深相关性")
             suggestions.append("第 2 封应补充产品/应用匹配度或具体佐证")
-        if any(token in email_3 for token in ["urgent", "last chance", "final notice"]):
-            issues.append("第 3 封的 CTA 对冷启动过于激进")
-            suggestions.append("第 3 封建议改为更轻量的跟进或资格确认式 CTA")
+        if len(emails_list) >= 3:
+            email_3 = str(emails_list[2].get("body_text", "") or "").lower()
+            if any(token in email_3 for token in ["urgent", "last chance", "final notice"]):
+                issues.append("第 3 封的 CTA 对冷启动过于激进")
+                suggestions.append("第 3 封建议改为更轻量的跟进或资格确认式 CTA")
 
     return {
         "passed": len(issues) == 0,
@@ -1118,14 +1326,12 @@ def _review_issue_requires_manual_review(issue: str) -> bool:
         "missing a cta strategy",
         "missing tone guidance",
         "expected exactly 3 emails",
-        # Chinese (current reviewer output)
+        # Chinese (current reviewer output).
         "缺少主题",
         "缺少 cta 策略",
         "缺少 cta",
         "缺少语气",
         "缺少语气指引",
-        "序列需要恰好包含 3 封",
-        "序列需要恰好包含 3",
     )
     return any(marker in normalized for marker in manual_only_markers)
 
@@ -1542,14 +1748,15 @@ def _review_email_sequence(
     issues: list[str] = []
     suggestions: list[str] = []
 
-    if len(emails) != 3:
-        score -= 40
-        issues.append("序列需要恰好包含 3 封邮件。")
-        suggestions.append("请重新生成完整的 3 步序列再发送。")
-
-    required_days = [0, 3, 7]
+    # The size check ("序列需要恰好包含 N 封") is intentionally omitted:
+    # the LLM is free to ship 1, 2, or N emails per sequence. We still
+    # consult the configured step table to validate `suggested_send_day`
+    # on the first few emails — anything beyond the configured cadence
+    # is reviewed without a hard expectation.
+    step_specs = _active_step_specs()
+    required_days = [int(spec["suggested_send_day"]) for spec in step_specs]
     previous_subject = ""
-    for index, email in enumerate(emails[:3]):
+    for index, email in enumerate(emails):
         subject = str(email.get("subject", "") or "").strip()
         body = str(email.get("body_text", "") or "").strip()
         wc = len(body.split())
@@ -1569,10 +1776,19 @@ def _review_email_sequence(
             issues.append(f"第 {index + 1} 封纯文本排版过于密集。")
             suggestions.append(f"请在第 {index + 1} 封中加入明显的段落分隔与单独一行收尾。")
 
-        expected_day = required_days[index] if index < len(required_days) else None
-        if expected_day is not None and email.get("suggested_send_day") != expected_day:
-            score -= 5
-            issues.append(f"第 {index + 1} 封的发送日应为 {expected_day}。")
+        # Only flag a send-day mismatch when the LLM actually emitted
+        # a value. Missing/None is the common case (the model often
+        # omits the field on 1-step sequences) and is handled by the
+        # campaign-creation fallback, not by penalising the review.
+        raw_day = email.get("suggested_send_day")
+        if raw_day is not None and index < len(required_days):
+            try:
+                llm_day = int(raw_day)
+            except (TypeError, ValueError):
+                llm_day = None
+            if llm_day is not None and llm_day != required_days[index]:
+                score -= 5
+                issues.append(f"第 {index + 1} 封的发送日应为 {required_days[index]}。")
 
         lowered_subject = subject.lower()
         if previous_subject and lowered_subject == previous_subject:
@@ -1781,7 +1997,10 @@ async def _craft_for_lead(
     hunt_id: str = "",
     hunt_round: int = 0,
 ) -> dict | None:
-    """Generate a 3-email sequence for a single lead using a ReAct loop.
+    """Generate an N-step email sequence for a single lead using a ReAct loop.
+
+    The step count is resolved from ``Settings.email_sequence_steps`` via
+    ``_active_step_specs()``; the default is 1 (single outreach email).
 
     Flow: Think → Draft → validate_emails → Revise (up to 2x) → Output JSON.
 
@@ -1793,10 +2012,44 @@ async def _craft_for_lead(
         react_max_iterations: Max ReAct iterations (default 3: draft + 2 revisions).
     """
     async with semaphore:
-        target = choose_email_target(lead)
+        # Hunter.io enrichment: when the lead has no decision_makers
+        # (only role-based inboxes like info@/sales@), call Hunter to
+        # find named contacts at the lead's domain. We *don't* persist
+        # the discovered contacts to the lead dict — they live in the
+        # returned ``hunter_contacts`` field for the UI / prompt and
+        # for the per-lead waterfall pool.
+        hunter_contacts: list[dict[str, Any]] = []
+        if not lead.get("decision_makers"):
+            hunter_contacts = await _enrich_lead_with_hunter(lead)
+        effective_lead = lead
+        if hunter_contacts:
+            # Mutate a shallow copy so the in-memory state across
+            # concurrent leads is not shared.
+            effective_lead = dict(lead)
+            effective_lead["decision_makers"] = [
+                {
+                    "name": " ".join(
+                        part for part in (c.get("first_name"), c.get("last_name")) if part
+                    ).strip() or c.get("email"),
+                    "email": c.get("email"),
+                    "title": c.get("position", ""),
+                    "source": "hunter.io",
+                }
+                for c in hunter_contacts
+            ]
+            logger.info(
+                "[EmailCraft] Hunter.io found %d contact(s) for %s (%s)",
+                len(hunter_contacts), lead.get("company_name"), lead.get("website"),
+            )
+        target = choose_email_target(effective_lead)
         if not target.get("target_email"):
             logger.info("[EmailCraft] Skipping %s — no sendable email target", lead.get("company_name"))
             return None
+        # Promote the enriched lead so downstream code (brief synthesis,
+        # user_prompt, etc.) sees the Hunter-discovered decision makers
+        # without renaming the variable everywhere.
+        if hunter_contacts:
+            lead = effective_lead
         settings = get_settings()
         default_locale = _get_locale(lead.get("country_code", ""))
         language_choice = await _select_email_language(
@@ -1872,6 +2125,10 @@ async def _craft_for_lead(
             f"Expected closing: {rules['closing']}\n"
             f"Language selection reason: {language_choice.get('reason', '')}\n"
             f"Fallback used: {language_choice.get('fallback_used', False)}\n\n"
+            f"## Recipient Email Type\n"
+            f"{_recipient_type_hint(target)}\n\n"
+            f"## Hunter.io Discovered Contacts (for this lead)\n"
+            f"{_format_hunter_contacts(hunter_contacts)}\n\n"
             f"## Strategy Brief\n"
             f"Recipient profile: {strategy_brief.get('recipient_profile', '')}\n"
             f"Why this company may fit: {json.dumps(strategy_brief.get('why_this_company_may_fit', []), ensure_ascii=False)}\n"
@@ -1884,6 +2141,19 @@ async def _craft_for_lead(
             f"Personalization hooks: {json.dumps(strategy_brief.get('personalization_hooks', []), ensure_ascii=False)}\n\n"
             f"## Sequence Objectives\n"
             f"{objectives_block}\n\n"
+            f"## 营销要求（每封邮件必须满足）\n"
+            f"1. 每封邮件必须 hook 我司产品的至少 1 个具体卖点。优先从以下抽取：\n"
+            f"   - 具体型号 / 规格（例：SX-5000 inverter at 98.5% efficiency）\n"
+            f"   - 具体认证 / 标准（例：CE / RoHS / ISO 9001）\n"
+            f"   - 具体客户 / 行业案例（例：与 X 公司的合作经验）\n"
+            f"   - 具体差异化数字（例：交付周期 / 寿命 / 起订量）\n"
+            f"2. 禁止使用泛化营销话术：「行业领先 / 高质量 / 全球服务 / 极具竞争力」等没有\n"
+            f"   数据支撑的形容词。如需使用必须配上具体数字或案例。\n"
+            f"3. 客户业务必须落到具体细节：引用「## Target Lead」中的某个具体产品线、\n"
+            f"   市场或网站细节。避免「Your esteemed company」这种空话。\n"
+            f"4. 每封邮件至少 1 个差异化角度（vs 行业通用方案）。\n"
+            f"5. marketing angle 必须从「## Strategy Brief」的 best_value_angles /\n"
+            f"   proof_points_to_use 抽取，不要重新发明卖点。\n\n"
             f"## Style Examples\n"
             f"{EMAIL_FEWSHOT_EXAMPLES}\n\n"
             f"## Template Guidance\n"
@@ -1939,7 +2209,9 @@ async def _craft_for_lead(
             logger.warning("[EmailCraft] No emails in output for %s", lead.get("company_name"))
             return None
 
-        emails = format_email_sequence_bodies(validated["emails"])
+        emails = format_email_sequence_bodies(
+            validated["emails"], locale=locale, signature=signature
+        )
         # Resolve template-adherence expectations up-front so we pass
         # the same set to the initial review and to any auto-improve
         # round. This is the user's voice — if the LLM drifts, we
@@ -1976,7 +2248,11 @@ async def _craft_for_lead(
             required_tokens=required_tokens,
             min_token_match_ratio=min_token_match_ratio,
         )
-        emails = format_email_sequence_bodies(list(optimized_sequence.get("emails", []) or emails))
+        emails = format_email_sequence_bodies(
+            list(optimized_sequence.get("emails", []) or emails),
+            locale=locale,
+            signature=signature,
+        )
 
         # Final template-adherence gate: if the LLM output still
         # doesn't carry enough of the user's required phrases after
@@ -2010,7 +2286,9 @@ async def _craft_for_lead(
                         worst_ratio * 100,
                         min_token_match_ratio * 100,
                     )
-                    emails = format_email_sequence_bodies(fallback_emails)
+                    emails = format_email_sequence_bodies(
+                        fallback_emails, locale=locale, signature=signature
+                    )
                     template_fallback_used = True
                     # Re-score the fallback so the rest of the pipeline
                     # (auto_send_eligible, review_status) sees a clean
@@ -2044,6 +2322,7 @@ async def _craft_for_lead(
             "review_summary": review_summary,
             "review_optimization": review_optimization,
             "auto_send_eligible": _review_allows_send(review_summary, settings),
+            "hunter_contacts": hunter_contacts,
         }
 
 
@@ -2236,7 +2515,11 @@ async def email_craft_node(state: HuntState) -> dict:
                                 validation_max_revisions=max(0, int(getattr(settings, "email_validation_max_revisions", 2) or 2)),
                                 max_rounds=max(0, int(getattr(settings, "email_review_auto_fix_rounds", 2) or 2)),
                             )
-                            applied["emails"] = format_email_sequence_bodies(list(optimized_sequence.get("emails", []) or validated["emails"]))
+                            applied["emails"] = format_email_sequence_bodies(
+                                list(optimized_sequence.get("emails", []) or validated["emails"]),
+                                locale=str(applied.get("locale", "en_US") or "en_US"),
+                                signature=str(applied.get("signature", "") or "") or None,
+                            )
                             applied["review_summary"] = review_summary
                             applied["validation_summary"] = {
                                 "passed": review_summary["status"] == "approved",

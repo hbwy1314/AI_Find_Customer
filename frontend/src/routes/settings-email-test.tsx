@@ -95,7 +95,7 @@ export function EmailTestPage() {
       <div>
         <h1 className="text-2xl font-bold tracking-tight">邮件收发测试</h1>
         <p className="text-muted-foreground mt-1">
-          选一个账号，发一封测试邮件，再去拉它的收件箱看回执。用来诊断 SMTP/IMAP 或 Microsoft Graph 是否真的通了。
+          选一个账号，发一封测试邮件，再去拉它的收件箱看回执。用来诊断 Microsoft Graph 是否真的通了。
         </p>
       </div>
 

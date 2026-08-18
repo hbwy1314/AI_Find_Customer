@@ -99,6 +99,55 @@ def test_add_recipients_creates_pending_rows(store: EmailStore) -> None:
         assert rows[1]["email"] == "b@test.com"
         assert rows[1]["position"] == 1
         assert all(r["status"] == "pending" for r in rows)
+        # Without explicit flags, all rows default to non-role-based.
+        assert all(int(r.get("is_role_based", 0)) == 0 for r in rows)
+    finally:
+        _cleanup(store, seq_id)
+
+
+def test_add_recipients_records_role_based_flag(store: EmailStore) -> None:
+    seq_id = "seq-ar-rb-1"
+    _seed_full_setup(store, seq_id=seq_id)
+    try:
+        added = store.add_recipients(
+            seq_id,
+            ["info@test.com", "buyer@test.com", "sales@test.com"],
+            is_role_based_per_email={
+                "info@test.com": True,
+                "buyer@test.com": False,
+                "sales@test.com": True,
+                "missing@test.com": True,  # unknown key, not in the email list
+            },
+        )
+        assert len(added) == 3
+        by_email = {r["email"]: r for r in store.list_recipients(seq_id)}
+        assert int(by_email["info@test.com"]["is_role_based"]) == 1
+        assert int(by_email["buyer@test.com"]["is_role_based"]) == 0
+        assert int(by_email["sales@test.com"]["is_role_based"]) == 1
+    finally:
+        _cleanup(store, seq_id)
+
+
+def test_mark_recipient_skipped_records_reason(store: EmailStore) -> None:
+    seq_id = "seq-skip-1"
+    _seed_full_setup(store, seq_id=seq_id)
+    try:
+        added = store.add_recipients(
+            seq_id,
+            ["info@test.com"],
+            is_role_based_per_email={"info@test.com": True},
+        )
+        assert added[0]["status"] == "pending"
+        store.mark_recipient_skipped(
+            added[0]["id"],
+            reason="recipient_role_based",
+            updated_at="2026-08-18T00:00:00Z",
+        )
+        rows = store.list_recipients(seq_id)
+        assert rows[0]["status"] == "skipped"
+        assert rows[0]["failure_reason"] == "recipient_role_based"
+        # The next-pending query must NOT pick a skipped row.
+        assert store.next_pending_recipient(seq_id) is None
     finally:
         _cleanup(store, seq_id)
 

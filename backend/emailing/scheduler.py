@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 from api.hunt_store import load_hunt, save_hunt
 from config.settings import get_settings
 from emailing.email_sender import send_email
+from emailing.policy import is_role_based_email
 from emailing.store import EmailStore
 from emailing.unsubscribe import build_mailto_unsubscribe, build_unsubscribe_url, issue_token
 
@@ -284,6 +285,92 @@ async def run_scheduler_once(
                 str(job["id"]),
                 failure_reason="no_recipient",
                 updated_at=current,
+            )
+            failed += 1
+            continue
+        # Role-based guard — info@/sales@/support@ etc. route to a
+        # shared inbox and never receive the lead's personal attention.
+        # We refuse to send to them and advance the waterfall to the
+        # next candidate immediately (no 3-day wait), so a lead that
+        # only has a role-based address ends up with the message
+        # marked failed rather than silently going to /dev/null.
+        #   1) Pool entry: skip the recipient row, clone the latest
+        #      message for the next pending candidate (if any).
+        #   2) Legacy single-recipient fallback: nothing to advance
+        #      to, so the message is marked failed with the same
+        #      reason and the sequence is parked as exhausted.
+        if recipient and recipient_row is not None and int(
+            recipient_row.get("is_role_based", 0) or 0
+        ) == 1:
+            store.mark_recipient_skipped(
+                str(recipient_row["id"]),
+                reason="recipient_role_based",
+                updated_at=current,
+            )
+            # Mark the current message as failed so it doesn't
+            # re-queue. The clone below (if a next candidate exists)
+            # is the message that will actually be sent.
+            store.mark_message_failed(
+                str(job["id"]),
+                failure_reason="recipient_role_based",
+                updated_at=current,
+            )
+            next_rec = store.next_pending_recipient(str(sequence["id"]))
+            if next_rec is not None:
+                store.update_sequence_lead_email(
+                    str(sequence["id"]),
+                    lead_email=str(next_rec["email"]),
+                    updated_at=current,
+                )
+                latest = store.latest_message_for_sequence(str(sequence["id"]))
+                if latest:
+                    new_msg_id = store.clone_pending_message_after(
+                        str(latest["id"]), scheduled_at=current
+                    )
+                    if new_msg_id:
+                        new_job = store.get_message(new_msg_id)
+                        if new_job:
+                            jobs.append(new_job)
+                skipped += 1
+                continue
+            # Pool empty: every candidate was role-based. Mark the
+            # current message failed and park the sequence as
+            # exhausted so the UI shows the reason.
+            store.mark_message_failed(
+                str(job["id"]),
+                failure_reason="recipient_role_based",
+                updated_at=current,
+            )
+            store.update_sequence_status(
+                str(sequence["id"]),
+                status="exhausted",
+                updated_at=current,
+                stop_reason="all_recipients_role_based",
+                next_scheduled_at="",
+            )
+            failed += 1
+            continue
+        if (
+            recipient
+            and recipient_row is None
+            and is_role_based_email(recipient)
+        ):
+            # Legacy single-recipient sequence whose lead_email is
+            # itself role-based. The pool path can't help (pool is
+            # empty). Park the sequence as exhausted and fail the
+            # message so the operator notices and adds a real
+            # decision-maker email.
+            store.mark_message_failed(
+                str(job["id"]),
+                failure_reason="recipient_role_based",
+                updated_at=current,
+            )
+            store.update_sequence_status(
+                str(sequence["id"]),
+                status="exhausted",
+                updated_at=current,
+                stop_reason="lead_email_role_based",
+                next_scheduled_at="",
             )
             failed += 1
             continue

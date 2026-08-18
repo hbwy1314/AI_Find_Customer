@@ -51,15 +51,6 @@ export interface EmailAccountRow {
   from_name: string;
   from_email: string;
   reply_to: string;
-  // SMTP/IMAP fields kept on the type as optional, never written by
-  // the frontend, but the backend still ships them on legacy rows.
-  smtp_host?: string;
-  smtp_port?: number;
-  smtp_username?: string;
-  imap_host?: string;
-  imap_port?: number;
-  imap_username?: string;
-  use_tls?: number;
   status: string;
   daily_send_limit: number;
   hourly_send_limit: number;
@@ -71,10 +62,6 @@ export interface EmailAccountRow {
   graph_client_id?: string;
   /** Per-account Graph secret is encrypted server-side; flag only. */
   has_graph_secret?: boolean;
-  has_smtp_password?: boolean;
-  has_imap_password?: boolean;
-  smtp_password_masked?: string;
-  imap_password_masked?: string;
   sent_today?: number;
   /** Manual rotation order set from the quotas page. Lower = earlier. */
   sort_order?: number;
@@ -218,6 +205,26 @@ export interface EmailDraft {
   sent_to?: string;
 }
 
+export interface EmailTarget {
+  target_email: string;
+  target_name?: string;
+  target_title?: string;
+  target_type?: string;
+  is_role_based?: boolean;
+}
+
+export interface HunterContact {
+  email: string;
+  first_name?: string;
+  last_name?: string;
+  position?: string;
+  seniority?: string;
+  department?: string;
+  confidence?: number;
+  source?: string;
+  is_role_based?: boolean;
+}
+
 export interface EmailReviewSummary {
   status: string;
   score: number;
@@ -238,6 +245,8 @@ export interface EmailManualReview {
 export interface EmailSequence {
   lead: Record<string, unknown>;
   locale: string;
+  target?: EmailTarget;
+  targets?: EmailTarget[];
   emails: EmailDraft[];
   template_profile: Record<string, unknown>;
   template_plan: Record<string, unknown>;
@@ -267,6 +276,7 @@ export interface EmailSequence {
     reason?: string;
   };
   manual_review?: EmailManualReview;
+  hunter_contacts?: HunterContact[];
   reply_detection?: {
     checked_at?: string;
     reply_count?: number;
@@ -772,7 +782,7 @@ export const api = {
       body: JSON.stringify({ current_password, new_password }),
     }),
 
-  // --- Connected mailboxes (multi-account, Graph + SMTP) ---
+  // --- Connected mailboxes (multi-account, Microsoft Graph) ---
   listEmailAccounts: () => request<EmailAccountList>("/email-accounts"),
   createEmailAccount: (payload: EmailAccountPayload) =>
     request<EmailAccountRow>("/email-accounts", {

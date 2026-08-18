@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
-import { api, EmailDraft, EmailSequence } from "@/api/client";
+import { api, EmailDraft, EmailSequence, HunterContact } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,7 @@ import {
   ChevronRight, ChevronDown, Copy, Check, Activity,
   Tag, BarChart3, PlayCircle, RefreshCw, DollarSign, Zap, TrendingUp,
   StickyNote,
+  UserCheck,
 } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 
@@ -818,6 +819,82 @@ function TemplateInfoSheet({
   );
 }
 
+function recipientLabel(t: { target_email?: string; target_name?: string; is_role_based?: boolean } | null | undefined): string {
+  if (!t) return "—";
+  const name = (t.target_name || "").trim();
+  if (name) return `${name} <${t.target_email || ""}>`;
+  return t.target_email || "—";
+}
+
+function RecipientCard({ sequence }: { sequence: EmailSequence }) {
+  const target = (sequence.targets && sequence.targets[0]) || sequence.target || null;
+  const hunterContacts = Array.isArray(sequence.hunter_contacts)
+    ? (sequence.hunter_contacts as HunterContact[])
+    : [];
+  if (!target && hunterContacts.length === 0) return null;
+  return (
+    <div className="rounded-lg border bg-card p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <UserCheck className="h-4 w-4 text-muted-foreground" />
+        <p className="text-sm font-medium">收件人</p>
+        {target?.is_role_based ? (
+          <Badge className="bg-amber-100 text-amber-800 hover:bg-amber-100 border-amber-200">
+            角色邮箱（共享收件箱）
+          </Badge>
+        ) : target ? (
+          <Badge className="bg-emerald-100 text-emerald-800 hover:bg-emerald-100 border-emerald-200">
+            已识别决策人
+          </Badge>
+        ) : null}
+      </div>
+      {target ? (
+        <div className="text-sm text-muted-foreground">
+          <p>
+            <span className="font-mono">{recipientLabel(target)}</span>
+          </p>
+          {target.target_type ? (
+            <p className="mt-1 text-xs">类型：{target.target_type}</p>
+          ) : null}
+          {target.is_role_based ? (
+            <p className="mt-2 text-xs text-amber-700">
+              提示：此邮箱为 info@/sales@ 等共享收件箱，会经助理转交。已在邮件主题和正文前两段强调具体产品和收件方公司名，提升被直接打开的概率。
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+      {hunterContacts.length > 0 ? (
+        <div className="space-y-1.5 border-t pt-3">
+          <p className="text-xs uppercase tracking-wide text-muted-foreground">
+            Hunter.io 发掘的备选收件人
+          </p>
+          <ul className="space-y-1 text-xs">
+            {hunterContacts.slice(0, 5).map((c, idx) => {
+              const name = [c.first_name, c.last_name].filter(Boolean).join(" ").trim() || "—";
+              const meta = [c.position, c.seniority, c.department].filter(Boolean).join(" / ");
+              return (
+                <li key={`${c.email}-${idx}`} className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono">{name} &lt;{c.email}&gt;</span>
+                  {meta ? <span className="text-muted-foreground">— {meta}</span> : null}
+                  {typeof c.confidence === "number" ? (
+                    <Badge variant="outline" className="text-[10px]">
+                      置信度 {c.confidence}%
+                    </Badge>
+                  ) : null}
+                  {c.is_role_based ? (
+                    <Badge className="bg-amber-100 text-amber-800 hover:bg-amber-100 border-amber-200 text-[10px]">
+                      角色邮箱
+                    </Badge>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function EmailSequencePreviewSheet({
   sequence,
   open,
@@ -901,6 +978,11 @@ function EmailSequencePreviewSheet({
             <p className="mt-1 text-sm font-medium">{String(templatePlan.cta_strategy || "n/a")}</p>
           </div>
         </div>
+
+        {/* Recipient block: show the chosen target and flag role-based
+            / Hunter-discovered inboxes so the operator knows what kind
+            of mailbox is being targeted. */}
+        <RecipientCard sequence={sequence} />
 
         <div className="grid gap-3 md:grid-cols-3">
           <div className="rounded-md border p-3">
@@ -2556,7 +2638,7 @@ export function HuntDetailPage() {
                   <div className="rounded-md border bg-muted/30 p-3">
                     <p className="text-xs uppercase tracking-wide text-muted-foreground">邮件总数</p>
                     <p className="mt-1 text-2xl font-semibold">{emailCount}</p>
-                    <p className="text-xs text-muted-foreground">每组包含 3 封邮件</p>
+                    <p className="text-xs text-muted-foreground">每组 1 封邮件；多邮箱线索走 waterfall</p>
                   </div>
                   <div className="rounded-md border bg-emerald-50 p-3 dark:bg-emerald-950/20">
                     <p className="text-xs uppercase tracking-wide text-muted-foreground">发送流程候选</p>

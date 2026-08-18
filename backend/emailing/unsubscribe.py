@@ -117,10 +117,23 @@ def append_footer(body_text: str, unsubscribe_url: str) -> str:
 
     The footer is short and unobtrusive — never a wall of legal text. It must
     appear at the very end so the URL is the last thing a recipient sees.
+
+    If the body already ends with a footer (recognised by the
+    ``--`` separator + ``"不再接收此类邮件："`` marker), the existing
+    footer is replaced in-place with the new URL instead of being
+    duplicated. This keeps preview-stored bodies consistent with the
+    version that actually gets sent.
     """
     sep = "\n\n--\n"
     footer = f"不再接收此类邮件：{unsubscribe_url}\n"
-    if not body_text:
+    cleaned = (body_text or "").rstrip()
+    if not cleaned:
         return footer
-    return body_text.rstrip() + sep + footer
+    # Detect an existing placeholder footer introduced by
+    # `body_format._append_unsubscribe_placeholder` (or by an earlier
+    # send) and replace its URL with the new one.
+    if "\n\n--\n" in cleaned and "不再接收此类邮件：" in cleaned:
+        head, _, tail = cleaned.rpartition("\n\n--\n")
+        return head + sep + footer
+    return cleaned + sep + footer
 

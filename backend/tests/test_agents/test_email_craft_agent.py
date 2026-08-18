@@ -203,10 +203,11 @@ class TestValidateEmailsTool:
             "formality_correct": True, "salutation_correct": True,
             "issues": [], "suggestions": [],
         }))
-        tools = _build_email_tools(llm, "de_DE")
-        validate_fn = tools[0].fn
-
-        result = json.loads(await validate_fn(emails_json=FAKE_EMAIL_RESPONSE))
+        with patch("agents.email_craft_agent.get_settings") as mock_settings:
+            mock_settings.return_value.email_sequence_steps = 3
+            tools = _build_email_tools(llm, "de_DE")
+            validate_fn = tools[0].fn
+            result = json.loads(await validate_fn(emails_json=FAKE_EMAIL_RESPONSE))
         assert result["passed"] is True
         assert result["language"] == "German"
 
@@ -306,6 +307,9 @@ class TestValidateEmailsTool:
         assert "Japanese" in tools[0].description
 
     def test_rule_validator_flags_repetition_and_aggressive_cta(self):
+        # Cross-step checks need >= 2 emails. Force the validator into
+        # a 3-step mode so the repetition + aggressive-CTA branches fire
+        # regardless of the production default (1).
         payload = [
             {
                 "sequence_number": 1,
@@ -330,10 +334,195 @@ class TestValidateEmailsTool:
             },
         ]
 
-        result = _rule_validate_emails_payload(payload)
+        result = _rule_validate_emails_payload(payload, steps=3)
         assert result["passed"] is False
         assert any("主题与上一封重复" in issue for issue in result["issues"])
         assert any("过于激进" in issue for issue in result["issues"])
+
+    def test_rule_validator_flags_generic_marketing_phrases(self):
+        # Generic phrases trigger regardless of word count now (the
+        # earlier ``wc < 120`` guard is gone) so even a long email
+        # that relies on boilerplate fails the product-hook check.
+        payload = [
+            {
+                "sequence_number": 1,
+                "email_type": "company_intro",
+                "subject": "Potential fit for your switch category",
+                "body_text": " ".join(
+                    [
+                        "Dear team,",
+                        "We are an industry-leading global leader in switches.",
+                        "Our world-class quality and competitive pricing make us a top-tier supplier.",
+                        "Buyers in your segment value our cutting-edge technology and our state-of-the-art manufacturing footprint across the region.",
+                        "Best regards,",
+                    ]
+                ),
+                "suggested_send_day": 0,
+            },
+        ]
+        result = _rule_validate_emails_payload(payload)
+        assert result["passed"] is False
+        assert any("泛化营销话术" in issue for issue in result["issues"])
+        assert any("具体卖点" in s for s in result["suggestions"])
+
+    def test_rule_validator_does_not_flag_concrete_hooks(self):
+        # An email that anchors on a real product attribute (model,
+        # spec, certification, customer) should not trip the
+        # generic-phrase guard.
+        body = (
+            "Dear team, our SX-5000 inverter reaches 98.5% efficiency and is CE / RoHS certified. "
+            "Three of your peers in the Nordics — Voltline, KraftPower and EcoNord — already "
+            "run a 6-month qualification with us on the same model line. Happy to share a short spec sheet. "
+            "Best regards,"
+        )
+        payload = [
+            {
+                "sequence_number": 1,
+                "email_type": "company_intro",
+                "subject": "SX-5000 inverter for your evaluation",
+                "body_text": body,
+                "suggested_send_day": 0,
+            },
+        ]
+        result = _rule_validate_emails_payload(payload)
+        # We don't require pass, but no generic-phrase issue should
+        # appear.
+        assert not any("泛化营销话术" in issue for issue in result["issues"])
+
+    @pytest.mark.asyncio
+    async def test_hunter_enriches_lead_when_no_decision_makers(self):
+        from agents.email_craft_agent import _enrich_lead_with_hunter
+
+        # Mock the HunterClient before calling the enrichment helper.
+        # The helper builds its own client per call, so we patch the
+        # `from_settings` factory and `domain_search` method.
+        from tools.hunter_client import DomainSearchResponse, DomainSearchResult
+
+        fake_response = DomainSearchResponse(
+            domain="acme.com",
+            organization="Acme",
+            emails=[
+                DomainSearchResult(
+                    email="john.doe@acme.com",
+                    first_name="John",
+                    last_name="Doe",
+                    position="Sales Director",
+                    seniority="senior",
+                    department="sales",
+                    confidence=92,
+                    sources=[],
+                ),
+                DomainSearchResult(
+                    email="info@acme.com",
+                    first_name="",
+                    last_name="",
+                    position="",
+                    seniority="",
+                    department="",
+                    confidence=10,
+                    sources=[],
+                ),
+            ],
+            pattern="{first}.{last}",
+            raw={},
+        )
+
+        class _FakeHunter:
+            def __init__(self):
+                self.closed = False
+
+            async def domain_search(self, domain, *, limit=10, offset=0, seniority="", department=""):
+                return fake_response
+
+            async def aclose(self):
+                self.closed = True
+
+        with patch(
+            "tools.hunter_client.HunterClient.from_settings",
+            return_value=_FakeHunter(),
+        ):
+            contacts = await _enrich_lead_with_hunter(
+                {"website": "https://acme.com", "decision_makers": []},
+                max_results=5,
+            )
+
+        # Only the named contact survives the role-based filter
+        assert len(contacts) == 1
+        assert contacts[0]["email"] == "john.doe@acme.com"
+        assert contacts[0]["source"] == "hunter.io"
+        assert contacts[0]["is_role_based"] is False
+
+    @pytest.mark.asyncio
+    async def test_hunter_skipped_when_lead_already_has_decision_makers(self):
+        from agents.email_craft_agent import _enrich_lead_with_hunter
+
+        called = {"n": 0}
+
+        class _FakeHunter:
+            async def domain_search(self, *a, **kw):
+                called["n"] += 1
+                raise AssertionError("should not be called")
+
+            async def aclose(self):
+                pass
+
+        with patch(
+            "tools.hunter_client.HunterClient.from_settings",
+            return_value=_FakeHunter(),
+        ):
+            contacts = await _enrich_lead_with_hunter(
+                {
+                    "website": "https://acme.com",
+                    "decision_makers": [{"name": "Buyer", "email": "buyer@acme.com"}],
+                },
+            )
+        assert contacts == []
+        assert called["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_hunter_skipped_when_no_website(self):
+        from agents.email_craft_agent import _enrich_lead_with_hunter
+
+        called = {"n": 0}
+
+        class _FakeHunter:
+            async def domain_search(self, *a, **kw):
+                called["n"] += 1
+                raise AssertionError("should not be called")
+
+            async def aclose(self):
+                pass
+
+        with patch(
+            "tools.hunter_client.HunterClient.from_settings",
+            return_value=_FakeHunter(),
+        ):
+            contacts = await _enrich_lead_with_hunter(
+                {"website": "", "decision_makers": []},
+            )
+        assert contacts == []
+        assert called["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_hunter_graceful_degradation_on_quota_exhausted(self):
+        from agents.email_craft_agent import _enrich_lead_with_hunter
+        from tools.hunter_client import HunterQuotaExhausted
+
+        class _FakeHunter:
+            async def domain_search(self, *a, **kw):
+                raise HunterQuotaExhausted("exhausted")
+
+            async def aclose(self):
+                pass
+
+        with patch(
+            "tools.hunter_client.HunterClient.from_settings",
+            return_value=_FakeHunter(),
+        ):
+            contacts = await _enrich_lead_with_hunter(
+                {"website": "https://acme.com", "decision_makers": []},
+            )
+        assert contacts == []
 
 
 class TestCraftForLead:
@@ -393,6 +582,8 @@ class TestCraftForLead:
         assert result is not None
         assert result["locale"] == "de_DE"
         assert len(result["emails"]) == 3
+        assert result["emails"][0]["sequence_number"] == 1
+        assert result["emails"][0]["email_type"] == "company_intro"
         assert result["lead"]["company_name"] == "EnergieDist"
         assert result["target"]["target_email"] == "info@energiedist.de"
         assert result["review_summary"]["status"] in {"approved", "needs_review"}
@@ -1054,19 +1245,20 @@ class TestCraftForLead:
             "value_angle": "Relevant product fit",
         }
 
-        optimized, review_summary, optimization = await _auto_improve_reviewed_sequence(
-            llm,
-            locale="en_US",
-            rules=_get_locale_rules("en_US"),
-            user_prompt="Write a concise outbound sequence for Acme.",
-            current_sequence=current_sequence,
-            lead=lead,
-            template_profile=template_profile,
-            template_plan=template_plan,
-            min_score=75,
-            max_blocking_issues=0,
-            max_rounds=2,
-        )
+        with patch("agents.email_craft_agent.get_settings") as mock_settings:
+            optimized, review_summary, optimization = await _auto_improve_reviewed_sequence(
+                llm,
+                locale="en_US",
+                rules=_get_locale_rules("en_US"),
+                user_prompt="Write a concise outbound sequence for Acme.",
+                current_sequence=current_sequence,
+                lead=lead,
+                template_profile=template_profile,
+                template_plan=template_plan,
+                min_score=75,
+                max_blocking_issues=0,
+                max_rounds=2,
+            )
 
         assert review_summary["status"] == "approved"
         assert optimization["attempted"] is True
@@ -1171,7 +1363,7 @@ class TestCraftForLead:
         with patch(
             "agents.email_craft_agent._validate_and_revise_sequence",
             AsyncMock(return_value=(validated_sequence, {"passed": True, "status": "approved", "issues": [], "suggestions": []})),
-        ) as mock_validate:
+        ) as mock_validate, patch("agents.email_craft_agent.get_settings") as mock_settings:
             optimized, review_summary, optimization = await _auto_improve_reviewed_sequence(
                 llm,
                 locale="en_US",

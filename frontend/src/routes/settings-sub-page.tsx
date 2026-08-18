@@ -1,7 +1,7 @@
 /**
  * Shared layout for the /settings sub-pages.
  *
- * Each sub-page (llm / smtp / graph / search / notifications / performance)
+ * Each sub-page (llm / graph / search / notifications / performance)
  * uses `useSettingsForm()` from `lib/settingsForm` for state, then renders
  * a `SettingsSubPage` with its own save button.
  */
@@ -20,7 +20,6 @@ const SECRET_KEYS: readonly string[] = [
   "email_groq_api_key", "email_zai_api_key", "email_moonshot_api_key", "email_minimax_api_key",
   "serper_api_key", "tavily_api_key", "jina_api_key",
   "amap_api_key", "baidu_api_key", "hunter_api_key",
-  "email_smtp_password", "email_imap_password",
   "graph_client_secret", "automation_feishu_webhook_url",
 ];
 

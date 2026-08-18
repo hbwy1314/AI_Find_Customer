@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS lead_email_recipients (
   last_attempt_at TEXT DEFAULT '',
   replied_at TEXT DEFAULT '',
   failure_reason TEXT DEFAULT '',
+  is_role_based INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -256,6 +257,10 @@ class EmailStore:
             # single campaign's volume rotates across all connected
             # mailboxes; empty falls back to the campaign-level account.
             self._ensure_column(conn, "lead_email_sequences", "email_account_id", "TEXT NOT NULL DEFAULT ''")
+            # Per-recipient role-based flag: marks shared inboxes
+            # (info@/sales@/support@) so the scheduler can refuse to
+            # send and advance the waterfall immediately.
+            self._ensure_column(conn, "lead_email_recipients", "is_role_based", "INTEGER NOT NULL DEFAULT 0")
             # New columns for encrypted secrets + Graph account metadata
             self._ensure_column(conn, "email_accounts", "secrets_ciphertext", "BLOB DEFAULT X''")
             self._ensure_column(conn, "email_accounts", "graph_tenant_id", "TEXT DEFAULT ''")
@@ -496,10 +501,17 @@ class EmailStore:
         self,
         sequence_id: str,
         emails: list[str],
+        *,
+        is_role_based_per_email: dict[str, bool] | None = None,
     ) -> list[dict[str, Any]]:
         """Insert one row per email into lead_email_recipients for the
         given sequence. Position is the list order (0 = first try).
         Returns the inserted rows.
+
+        ``is_role_based_per_email`` (optional) maps an email address
+        (lowercased) to its role-based flag. The scheduler uses that
+        flag to skip shared inboxes (info@/sales@/...) and advance
+        to the next named recipient. Missing keys default to False.
 
         Empty / dedup-safe: skipped duplicates within the same input
         and existing rows for the sequence.
@@ -507,6 +519,7 @@ class EmailStore:
         seq_id = str(sequence_id or "").strip()
         if not seq_id:
             raise ValueError("sequence_id is required")
+        flags = {str(k or "").strip().lower(): bool(v) for k, v in (is_role_based_per_email or {}).items()}
         norm: list[str] = []
         seen: set[str] = set()
         for raw in emails or []:
@@ -533,9 +546,18 @@ class EmailStore:
                 row_id = uuid.uuid4().hex
                 conn.execute(
                     "INSERT INTO lead_email_recipients "
-                    "(id, sequence_id, email, position, status, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
-                    (row_id, seq_id, email, pos, now, now),
+                    "(id, sequence_id, email, position, status, is_role_based, "
+                    " created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+                    (
+                        row_id,
+                        seq_id,
+                        email,
+                        pos,
+                        1 if flags.get(email) else 0,
+                        now,
+                        now,
+                    ),
                 )
                 inserted.append(
                     {
@@ -595,6 +617,24 @@ class EmailStore:
             conn.execute(
                 "UPDATE lead_email_recipients "
                 "SET status = 'failed', failure_reason = ?, last_attempt_at = ?, updated_at = ? "
+                "WHERE id = ?",
+                (reason, updated_at, updated_at, recipient_id),
+            )
+
+    def mark_recipient_skipped(
+        self, recipient_id: str, *, reason: str, updated_at: str
+    ) -> None:
+        """A recipient was rejected before any send attempt (e.g. a
+        role-based shared inbox). Park the recipient in ``skipped`` so
+        the waterfall can advance to the next candidate without
+        waiting for the 3-day timeout. ``reason`` is recorded for
+        audit (``recipient_role_based`` / ``recipient_unsubscribed``
+        / etc.) so the UI can surface *why* the address was skipped.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE lead_email_recipients "
+                "SET status = 'skipped', failure_reason = ?, last_attempt_at = ?, updated_at = ? "
                 "WHERE id = ?",
                 (reason, updated_at, updated_at, recipient_id),
             )

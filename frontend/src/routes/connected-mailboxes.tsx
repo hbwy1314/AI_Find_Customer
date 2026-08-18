@@ -16,8 +16,8 @@ function GraphConfigCard() {
       <div className="p-6 space-y-1 border-b">
         <h2 className="text-lg font-semibold">Microsoft Graph 配置</h2>
         <p className="text-sm text-muted-foreground">
-          通过 Application 权限（Mail.ReadWrite / Mail.Send）共用一个发件邮箱，
-          取代 SMTP/IMAP。Admin 需在 Azure AD 给该 App 一次 admin consent。
+          通过 Application 权限（Mail.ReadWrite / Mail.Send）共用一个发件邮箱。
+          Admin 需在 Azure AD 给该 App 一次 admin consent。
         </p>
       </div>
       <div className="p-6 space-y-3 text-sm">
@@ -71,9 +71,7 @@ function AccountForm({
 }) {
   const qc = useQueryClient();
   const isEdit = Boolean(initial);
-  // All accounts use Microsoft Graph for send + receive. The provider
-  // select is shown only on create for backward compat with rows that
-  // still say provider_type='smtp' (the backend coerces them).
+  // All accounts use Microsoft Graph for send + receive.
   const [fromEmail, setFromEmail] = useState(initial?.from_email ?? "");
   const [fromName, setFromName] = useState(initial?.from_name ?? "");
   const [graphTenantId, setGraphTenantId] = useState(initial?.graph_tenant_id ?? "");
@@ -305,9 +303,7 @@ function AccountRow({
         </div>
         <div className="text-xs text-muted-foreground">
           {account.from_name ? `${account.from_name} · ` : ""}
-          {account.provider_type === "smtp"
-            ? `${account.smtp_host || "—"}:${account.smtp_port} · IMAP ${account.imap_host || "—"}`
-            : `共享邮箱 ${account.graph_user_principal_name || "—"}`}
+          共享邮箱 {account.graph_user_principal_name || "—"}
         </div>
         <div className="flex flex-wrap items-center gap-3 text-xs">
           <DailyQuotaBadge
@@ -322,28 +318,14 @@ function AccountRow({
         ) : null}
       </div>
       <div className="flex flex-wrap items-center gap-2">
-        {account.provider_type === "smtp" ? (
-          // Legacy rows: backend coerces "smtp" provider_type to graph,
-          // so the test endpoint only needs to be called once. Show a
-          // single Graph test button regardless.
-          <button
-            type="button"
-            disabled={testing === "graph"}
-            onClick={() => runTest("graph")}
-            className="rounded-md border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-60"
-          >
-            {testing === "graph" ? "测试中…" : "测试连接"}
-          </button>
-        ) : (
-          <button
-            type="button"
-            disabled={testing === "graph"}
-            onClick={() => runTest("graph")}
-            className="rounded-md border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-60"
-          >
-            {testing === "graph" ? "测试中…" : "测试 Graph"}
-          </button>
-        )}
+        <button
+          type="button"
+          disabled={testing === "graph"}
+          onClick={() => runTest("graph")}
+          className="rounded-md border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-60"
+        >
+          {testing === "graph" ? "测试中…" : "测试连接"}
+        </button>
         <button
           type="button"
           onClick={onEdit}
@@ -386,7 +368,7 @@ export function ConnectedMailboxesPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold">已连接邮箱</h1>
-          <p className="text-sm text-muted-foreground">管理多套发件邮箱。Graph 走 Application 权限共享邮箱；SMTP/IMAP 走授权码。</p>
+          <p className="text-sm text-muted-foreground">管理多套发件邮箱。所有账号都走 Microsoft Graph Application 权限 + 共享邮箱。</p>
         </div>
         <button
           type="button"

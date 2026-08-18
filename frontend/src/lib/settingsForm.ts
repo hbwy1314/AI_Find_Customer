@@ -1,7 +1,7 @@
 /**
  * Shared hook + helpers for the /settings sub-pages.
  *
- * Every sub-page (smtp, llm, search, graph, notifications, performance) loads
+ * Every sub-page (llm, search, graph, notifications, performance) loads
  * the same /api/settings payload and saves back a subset. The shape and the
  * `masked` flag handling are identical — they live here.
  */
@@ -43,10 +43,6 @@ export const SETTINGS_KEY_MAP: Record<string, string> = {
   EMAIL_FROM_NAME: "email_from_name",
   EMAIL_FROM_ADDRESS: "email_from_address",
   EMAIL_REPLY_TO: "email_reply_to",
-  // SMTP/IMAP removed — outbound and inbound email all flow through
-  // Microsoft Graph now. The legacy keys are still accepted on the
-  // wire (the backend ignores them) so old saved settings don't
-  // 422 the user; we just don't render inputs for them.
   EMAIL_AUTO_SEND_ENABLED: "email_auto_send_enabled",
   EMAIL_REPLY_DETECTION_ENABLED: "email_reply_detection_enabled",
   EMAIL_REPLY_CHECK_INTERVAL_SECONDS: "email_reply_check_interval_seconds",

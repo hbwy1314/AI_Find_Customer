@@ -14,6 +14,7 @@ from api.security import require_api_access
 from config.settings import get_settings
 from emailing.policy import expand_email_targets
 from emailing.readiness import ensure_inbound_tested, ensure_outbound_ready, ensure_outbound_tested
+from agents.email_craft_agent import _active_step_specs
 from emailing.reply_detector import run_graph_reply_detection_once
 from emailing.scheduler import run_scheduler_once
 from emailing.store import EmailStore
@@ -248,9 +249,29 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
                 "updated_at": created,
             })
             next_scheduled = ""
-            for email in emails:
+            # Fallback for the LLM's `suggested_send_day`: when the model
+            # omits the field (or sets 0) we anchor the message to the
+            # configured step cadence. Prevents review flags like
+            # "第 1 封的发送日应为 0" caused by missing JSON fields.
+            step_specs = _active_step_specs()
+            for index, email in enumerate(emails):
                 step_number = int(email.get("sequence_number", 1) or 1)
-                delay_days = int(email.get("suggested_send_day", 0) or 0)
+                llm_day = email.get("suggested_send_day")
+                fallback_day = (
+                    step_specs[index]["suggested_send_day"]
+                    if index < len(step_specs)
+                    else (step_specs[-1]["suggested_send_day"] if step_specs else 0)
+                )
+                try:
+                    day_value = int(llm_day) if llm_day is not None else fallback_day
+                except (TypeError, ValueError):
+                    day_value = fallback_day
+                # If the LLM said 0 but the step expects a later day
+                # (only possible when steps > 1), trust the LLM and let
+                # it land on day 0 — operators can pause before then.
+                if day_value < 0:
+                    day_value = 0
+                delay_days = day_value
                 scheduled_at = (base_time + timedelta(days=delay_days)).isoformat()
                 if step_number == 1:
                     next_scheduled = scheduled_at
@@ -272,6 +293,33 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
                     "updated_at": created,
                 })
             store.update_sequence_status(sequence_id, status="scheduled", updated_at=created, next_scheduled_at=next_scheduled)
+            # Waterfall recipient pool: every sendable email becomes a
+            # ``pending`` row in priority order. The scheduler sends the
+            # first one, marks it ``waiting_reply``, and after
+            # ``email_recipient_waterfall_days`` with no reply, advances
+            # to the next pending row. Single-email sequences behave
+            # exactly like the legacy code (pool size 1). We also
+            # forward each email's role-based flag so the scheduler
+            # can skip shared inboxes (info@/sales@/...) and advance
+            # to the next named recipient immediately.
+            target_emails = [
+                str(t.get("target_email") or "").strip().lower()
+                for t in targets
+                if str(t.get("target_email") or "").strip()
+            ]
+            if target_emails:
+                is_role_based_per_email = {
+                    str(t.get("target_email") or "").strip().lower(): bool(
+                        t.get("is_role_based")
+                    )
+                    for t in targets
+                    if str(t.get("target_email") or "").strip()
+                }
+                store.add_recipients(
+                    sequence_id,
+                    target_emails,
+                    is_role_based_per_email=is_role_based_per_email,
+                )
 
     _write_summary_to_hunt(store, hunt_id, campaign_id)
     summary = _campaign_summary(store, campaign_id)
