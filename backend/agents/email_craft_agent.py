@@ -535,7 +535,7 @@ def _sender_signature(settings: Any = None) -> str:
     name = str(getattr(settings, "email_from_name", "") or "").strip()
     if name and not name.lower().startswith("<magicmock"):
         return name
-    return "Ai Hunter"
+    return ""
 
 
 # ── ReAct system prompt ───────────────────────────────────────────────────────

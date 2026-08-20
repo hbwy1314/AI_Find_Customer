@@ -140,7 +140,7 @@ class Settings(BaseSettings):
     # at read time) but the settings + send + reply code paths only
     # implement Graph.
     email_provider_type: str = "graph"
-    email_from_name: str = "Ai Hunter"
+    email_from_name: str = ""
     email_from_address: str = ""
     email_reply_to: str = ""
     email_smtp_last_test_at: str = ""

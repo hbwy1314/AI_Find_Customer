@@ -444,9 +444,9 @@ async def test_send_email(
                 },
             )
 
-    subject = (payload.subject or "").strip() or f"[AI Hunter test] from {account.get('from_email')}"
+    subject = (payload.subject or "").strip() or f"[测试邮件] from {account.get('from_email')}"
     body = (payload.body or "").strip() or (
-        "这是一封来自 AI Hunter 的测试邮件。\n\n"
+        "这是一封测试邮件。\n\n"
         f"账号: {account.get('from_email')}\n"
         f"时间: {datetime.now(timezone.utc).isoformat()}\n\n"
         "如果收到说明 Microsoft Graph 发送链路工作正常。"

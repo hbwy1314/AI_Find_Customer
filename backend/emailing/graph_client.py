@@ -266,9 +266,13 @@ async def _send_two_step(
             if list_unsubscribe_mailto:
                 parts.append(list_unsubscribe_mailto)
             parts.append(list_unsubscribe_url)
+            # Microsoft Graph rejects standard RFC 8058 "List-Unsubscribe"
+            # header (requires x- or X- prefix per their doc). Use
+            # "X-List-Unsubscribe" instead — well-known to most MTA pipelines
+            # and Graph accepts it.
             draft_payload["internetMessageHeaders"] = [
-                {"name": "List-Unsubscribe", "value": ", ".join(f"<{p}>" for p in parts)},
-                {"name": "List-Unsubscribe-Post", "value": "List-Unsubscribe=One-Click"},
+                {"name": "X-List-Unsubscribe", "value": ", ".join(f"<{p}>" for p in parts)},
+                {"name": "X-List-Unsubscribe-Post", "value": "List-Unsubscribe=One-Click"},
             ]
         create_status, create_body = await _graph_request(
             "POST",
@@ -380,7 +384,7 @@ async def _send_single_step(
     """
     try:
         from_email = str(account.get("from_email") or upn)
-        from_name = str(account.get("from_name") or "Ai Hunter")
+        from_name = str(account.get("from_name") or "")
         if list_unsubscribe_url:
             body_text = append_footer(body_text, list_unsubscribe_url)
         message: dict[str, Any] = {

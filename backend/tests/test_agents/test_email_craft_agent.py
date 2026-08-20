@@ -1825,3 +1825,47 @@ class TestEmailCraftNode:
 
         assert react_call_count["n"] == 2
         assert len(result["email_sequences"]) == 2
+
+
+class TestSenderSignature:
+    """Default sender signature / from_name should never silently include
+    the product brand name. Outbound emails must sign with the configured
+    `email_from_name` / `email_signature_block` (both defaulting to empty),
+    so the recipient never sees the product name unless the operator
+    explicitly sets it."""
+
+    def test_signature_default_is_empty_when_no_env_overrides(self, monkeypatch):
+        monkeypatch.delenv("EMAIL_SIGNATURE_BLOCK", raising=False)
+        monkeypatch.delenv("EMAIL_FROM_NAME", raising=False)
+        import importlib
+        from config import settings as settings_mod
+        importlib.reload(settings_mod)
+        from agents import email_craft_agent as craft_mod
+        importlib.reload(craft_mod)
+
+        sig = craft_mod._sender_signature()
+        assert sig == ""
+
+    def test_signature_uses_signature_block_when_set(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_SIGNATURE_BLOCK", "Alex from Acme")
+        monkeypatch.delenv("EMAIL_FROM_NAME", raising=False)
+        import importlib
+        from config import settings as settings_mod
+        importlib.reload(settings_mod)
+        from agents import email_craft_agent as craft_mod
+        importlib.reload(craft_mod)
+
+        sig = craft_mod._sender_signature()
+        assert sig == "Alex from Acme"
+
+    def test_signature_uses_from_name_when_block_unset(self, monkeypatch):
+        monkeypatch.delenv("EMAIL_SIGNATURE_BLOCK", raising=False)
+        monkeypatch.setenv("EMAIL_FROM_NAME", "Sales Team")
+        import importlib
+        from config import settings as settings_mod
+        importlib.reload(settings_mod)
+        from agents import email_craft_agent as craft_mod
+        importlib.reload(craft_mod)
+
+        sig = craft_mod._sender_signature()
+        assert sig == "Sales Team"
