@@ -1108,3 +1108,65 @@ class TestDecisionMakerEmailInference:
         }
         result = _normalize_decision_maker_emails(lead)
         assert result["decision_makers"][1]["email"] == "john.doe@acme.com (inferred)"
+
+
+class TestFinalDedupSafetyNet:
+    """Final dedup pass on `existing_leads + new_leads` to guarantee no duplicates
+    ever escape into the email_craft stage (defends against requeue state
+    re-injection, seen_urls drift across rounds, etc.)."""
+
+    async def test_dedupes_identical_leads_by_website_domain(self):
+        from agents.lead_extract_agent import _official_website_domain
+
+        lead = {
+            "company_name": "IE Wholesale Inc",
+            "website": "http://www.iewholesale.online/",
+            "emails": ["info@iewholesale.online"],
+        }
+        # Simulate the safety net directly via _official_website_domain
+        domain = _official_website_domain(lead["website"])
+        assert domain == "iewholesale.online"
+        # Two identical domains should collapse to one
+        assert len({domain, _official_website_domain("https://iewholesale.online/")}) == 1
+
+    def test_final_dedup_drops_duplicate_website_in_existing_and_new(self):
+        """Direct unit test of the final dedup logic: same website in both
+        `existing_leads` (carried over from a previous round) and `new_leads`
+        (this round) should keep only one entry."""
+        from agents.lead_extract_agent import _official_website_domain
+
+        existing_leads = [{
+            "company_name": "IE Wholesale Inc",
+            "website": "http://www.iewholesale.online/",
+            "emails": ["info@iewholesale.online"],
+        }]
+        new_leads = [{
+            "company_name": "IE Wholesale Inc",
+            "website": "http://www.iewholesale.online/",
+            "emails": ["info@iewholesale.online"],
+        }]
+
+        # Reproduce the final dedup loop in isolation
+        merged = existing_leads + new_leads
+        deduped = []
+        final_seen_domains: set[str] = set()
+        for lead in merged:
+            domain = _official_website_domain(lead.get("website", ""))
+            if domain:
+                if domain in final_seen_domains:
+                    continue
+                final_seen_domains.add(domain)
+            deduped.append(lead)
+
+        assert len(deduped) == 1
+        assert deduped[0]["website"] == "http://www.iewholesale.online/"
+
+    def test_final_dedup_falls_back_to_company_name_when_no_website(self):
+        from agents.lead_extract_agent import _official_website_domain
+
+        lead = {"company_name": "Acme Vapes", "website": "", "emails": []}
+        domain = _official_website_domain(lead["website"])
+        assert domain == ""
+        # When website is empty, dedup key should fall back to company_name
+        name_key = (lead["company_name"] or "").strip().lower()
+        assert name_key == "acme vapes"

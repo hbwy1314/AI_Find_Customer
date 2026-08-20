@@ -1395,8 +1395,53 @@ async def lead_extract_node(state: HuntState) -> dict:
         if kw and kw in keyword_stats:
             keyword_stats[kw]["leads_found"] = keyword_stats[kw].get("leads_found", 0) + 1
 
+    # ── Final dedup safety net ──────────────────────────────────────────
+    # Even with the per-round `seen_domains` check above, in rare cases
+    # (e.g. same lead produced by different rounds with the same website
+    # but different `seen_urls` state, or LangGraph reducer re-injecting
+    # state on a requeue) we can end up with duplicates in the merged
+    # `existing_leads + new_leads`. Dedupe by normalized website domain
+    # (and fall back to normalized company_name for leads with no website)
+    # so the downstream email_craft stage never sees the same lead twice.
+    merged = existing_leads + new_leads
+    deduped: list[dict] = []
+    final_seen_domains: set[str] = set()
+    final_seen_names: set[str] = set()
+    for lead in merged:
+        if not isinstance(lead, dict):
+            continue
+        domain = _official_website_domain(lead.get("website", ""))
+        if domain:
+            if domain in final_seen_domains:
+                logger.info(
+                    "[LeadExtractAgent] Final dedup dropped duplicate lead company=%s website=%s",
+                    lead.get("company_name"), lead.get("website"),
+                )
+                continue
+            final_seen_domains.add(domain)
+        else:
+            # No website → use normalized company_name as a secondary key
+            name_key = (lead.get("company_name") or "").strip().lower()
+            if not name_key:
+                # No website AND no name → still dedup by source+country to be safe
+                name_key = f"unknown::{lead.get('source', '')}::{lead.get('country_code', '')}"
+            if name_key in final_seen_names:
+                logger.info(
+                    "[LeadExtractAgent] Final dedup dropped nameless duplicate website=%s",
+                    lead.get("website"),
+                )
+                continue
+            final_seen_names.add(name_key)
+        deduped.append(lead)
+
+    if len(deduped) != len(merged):
+        logger.warning(
+            "[LeadExtractAgent] Final dedup removed %d duplicate(s) (had %d, kept %d)",
+            len(merged) - len(deduped), len(merged), len(deduped),
+        )
+
     return {
-        "leads": existing_leads + new_leads,
+        "leads": deduped,
         "keyword_search_stats": keyword_stats,
         "current_stage": "lead_extract",
     }
