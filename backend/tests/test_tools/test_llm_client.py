@@ -385,3 +385,64 @@ class TestLLMToolLifecycle:
     async def test_close_is_noop(self):
         tool = LLMTool(settings=_make_settings())
         await tool.close()  # Should not raise
+
+
+class TestLLMApiBaseInjection:
+    """When `llm_api_base` (or `email_llm_api_base`) is set, litellm must
+    route through that custom OpenAI-compatible proxy instead of the
+    default api.openai.com — otherwise the OpenAI key is rejected as
+    invalid because the proxy issued it, not OpenAI."""
+
+    def test_llm_api_base_injects_openai_api_base(self, monkeypatch):
+        # Clear stale state
+        for k in ("OPENAI_API_BASE", "ANTHROPIC_API_BASE", "OPENROUTER_API_BASE"):
+            monkeypatch.delenv(k, raising=False)
+
+        settings = _make_settings(
+            openai_api_key="sk-proxy",
+            llm_api_base="https://api.vectorengine.cn/v1",
+        )
+        _inject_api_keys(settings)
+        assert os.environ["OPENAI_API_BASE"] == "https://api.vectorengine.cn/v1"
+
+    def test_email_scope_uses_email_llm_api_base(self, monkeypatch):
+        for k in ("OPENAI_API_BASE", "ANTHROPIC_API_BASE", "OPENROUTER_API_BASE"):
+            monkeypatch.delenv(k, raising=False)
+
+        settings = _make_settings(
+            openai_api_key="sk-proxy",
+            llm_api_base="https://api.shared-proxy.cn/v1",
+            email_llm_api_base="https://api.email-proxy.cn/v1",
+        )
+        _inject_api_keys(settings, "email")
+        assert os.environ["OPENAI_API_BASE"] == "https://api.email-proxy.cn/v1"
+
+    def test_empty_llm_api_base_clears_stale_openai_api_base(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_BASE", "https://stale-proxy.example.com/v1")
+        settings = _make_settings(
+            openai_api_key="sk-test",
+            llm_api_base="",
+        )
+        _inject_api_keys(settings)
+        # Stale env var must be cleared, not just left around
+        assert "OPENAI_API_BASE" not in os.environ
+
+    def test_custom_base_redirects_all_provider_bases(self, monkeypatch):
+        for k in (
+            "OPENAI_API_BASE", "ANTHROPIC_API_BASE", "OPENROUTER_API_BASE",
+            "GROQ_API_BASE", "ZAI_API_BASE", "MOONSHOT_API_BASE",
+        ):
+            monkeypatch.delenv(k, raising=False)
+
+        settings = _make_settings(
+            openai_api_key="sk-test",
+            llm_api_base="https://api.vectorengine.cn/v1",
+        )
+        _inject_api_keys(settings)
+        # Every provider that respects _API_BASE env should now route
+        # through the same OpenAI-compatible proxy.
+        for k in (
+            "OPENAI_API_BASE", "ANTHROPIC_API_BASE", "OPENROUTER_API_BASE",
+            "GROQ_API_BASE", "ZAI_API_BASE", "MOONSHOT_API_BASE",
+        ):
+            assert os.environ.get(k) == "https://api.vectorengine.cn/v1", f"{k} not set"

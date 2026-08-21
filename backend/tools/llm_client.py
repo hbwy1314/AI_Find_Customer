@@ -67,37 +67,76 @@ def _is_retryable_rate_limit_error(exc: Exception) -> bool:
 
 
 def _provider_key_map(settings: Settings, scope: str) -> dict[str, str]:
+    # Per-scope custom base URL (falls back to the shared LLM one).
+    # Empty string means "let litellm pick the provider's default endpoint".
     if scope in {"email", "email_reasoning"}:
-        return {
-            "OPENAI_API_KEY": settings.email_openai_api_key or settings.openai_api_key,
-            "ANTHROPIC_API_KEY": settings.email_anthropic_api_key or settings.anthropic_api_key,
-            "OPENROUTER_API_KEY": settings.email_openrouter_api_key or settings.openrouter_api_key,
-            "GROQ_API_KEY": settings.email_groq_api_key or settings.groq_api_key,
-            "ZAI_API_KEY": settings.email_zai_api_key or settings.zai_api_key,
-            "MOONSHOT_API_KEY": settings.email_moonshot_api_key or settings.moonshot_api_key,
-            "MINIMAX_API_KEY": settings.email_minimax_api_key or settings.minimax_api_key,
-            "MINIMAX_API_BASE": normalize_minimax_api_base(settings.minimax_api_base),
-            "ZHIPUAI_API_KEY": settings.email_zai_api_key or settings.zai_api_key,
-        }
-    return {
-        "OPENAI_API_KEY": settings.openai_api_key,
-        "ANTHROPIC_API_KEY": settings.anthropic_api_key,
-        "OPENROUTER_API_KEY": settings.openrouter_api_key,
-        "GROQ_API_KEY": settings.groq_api_key,
-        "ZAI_API_KEY": settings.zai_api_key,
-        "MOONSHOT_API_KEY": settings.moonshot_api_key,
-        "MINIMAX_API_KEY": settings.minimax_api_key,
+        custom_base = (settings.email_llm_api_base or settings.llm_api_base).strip().rstrip("/")
+    else:
+        custom_base = settings.llm_api_base.strip().rstrip("/")
+
+    base = {
+        "OPENAI_API_KEY": "",
+        "ANTHROPIC_API_KEY": "",
+        "OPENROUTER_API_KEY": "",
+        "GROQ_API_KEY": "",
+        "ZAI_API_KEY": "",
+        "MOONSHOT_API_KEY": "",
+        "MINIMAX_API_KEY": "",
         "MINIMAX_API_BASE": normalize_minimax_api_base(settings.minimax_api_base),
-        "ZHIPUAI_API_KEY": settings.zai_api_key,
+        "ZHIPUAI_API_KEY": "",
     }
+    # Always include the per-provider base-URL slots so the inject step
+    # can clear any stale value from a previous Settings snapshot.
+    # When a custom base URL is set, also redirect the Anthropic-shaped
+    # proxy (so users running Claude behind an OpenAI-compatible
+    # gateway can keep using anthropic/claude-* model names).
+    base["OPENAI_API_BASE"] = custom_base
+    base["ANTHROPIC_API_BASE"] = custom_base
+    base["OPENROUTER_API_BASE"] = custom_base
+    base["GROQ_API_BASE"] = custom_base
+    base["ZAI_API_BASE"] = custom_base
+    base["MOONSHOT_API_BASE"] = custom_base
+    base["HUGGINGFACE_API_BASE"] = custom_base
+    base["TOGETHERAI_API_BASE"] = custom_base
+
+    # Now layer the actual API keys (per-scope email_* fallbacks first).
+    if scope in {"email", "email_reasoning"}:
+        base["OPENAI_API_KEY"] = settings.email_openai_api_key or settings.openai_api_key
+        base["ANTHROPIC_API_KEY"] = settings.email_anthropic_api_key or settings.anthropic_api_key
+        base["OPENROUTER_API_KEY"] = settings.email_openrouter_api_key or settings.openrouter_api_key
+        base["GROQ_API_KEY"] = settings.email_groq_api_key or settings.groq_api_key
+        base["ZAI_API_KEY"] = settings.email_zai_api_key or settings.zai_api_key
+        base["MOONSHOT_API_KEY"] = settings.email_moonshot_api_key or settings.moonshot_api_key
+        base["MINIMAX_API_KEY"] = settings.email_minimax_api_key or settings.minimax_api_key
+        base["ZHIPUAI_API_KEY"] = settings.email_zai_api_key or settings.zai_api_key
+    else:
+        base["OPENAI_API_KEY"] = settings.openai_api_key
+        base["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+        base["OPENROUTER_API_KEY"] = settings.openrouter_api_key
+        base["GROQ_API_KEY"] = settings.groq_api_key
+        base["ZAI_API_KEY"] = settings.zai_api_key
+        base["MOONSHOT_API_KEY"] = settings.moonshot_api_key
+        base["MINIMAX_API_KEY"] = settings.minimax_api_key
+        base["ZHIPUAI_API_KEY"] = settings.zai_api_key
+    return base
 
 
 def _inject_api_keys(settings: Settings, scope: str = "default") -> None:
-    """Push provider API keys from Settings into env vars for litellm."""
+    """Push provider API keys from Settings into env vars for litellm.
+
+    For every provider in the key map we *either* set the env var to
+    a non-empty value *or* delete it from the process environment.
+    We delete (not just leave stale) because litellm reads the env
+    once at first call and caches it; an old OPENAI_API_BASE from
+    a previous Settings snapshot would otherwise stick around even
+    after the user cleared the custom base URL.
+    """
     _key_map = _provider_key_map(settings, scope)
     for env_var, value in _key_map.items():
         if value:
             os.environ[env_var] = value
+        else:
+            os.environ.pop(env_var, None)
 
     # Native workaround: If using anthropic/ prefix for MiniMax, inject ANTHROPIC_API_BASE
     llm_models = [
