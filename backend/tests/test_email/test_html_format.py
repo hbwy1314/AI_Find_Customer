@@ -130,6 +130,7 @@ class TestUnsubscribeCard:
         html = plaintext_to_html(
             "Body",
             unsubscribe_url="https://api.nineluan.com/api/unsubscribe/abc",
+            locale="zh_CN",
         )
         # The card's <a> tag must carry the real token, not the
         # placeholder.
@@ -223,3 +224,119 @@ class TestStripLegacyFooter:
         # Without the marker we leave it alone (the separator is too
         # common a pattern to be a reliable footer signal on its own).
         assert out == body
+
+
+class TestLocaleAwareCard:
+    """The unsubscribe card must follow the email's locale so a
+    Chinese button on an English email never lands in a recipient's
+    inbox (it's the surest way to get them to ignore the opt-out
+    and hit \"report spam\" instead)."""
+
+    def test_english_email_uses_english_card(self):
+        html = plaintext_to_html(
+            "Body",
+            unsubscribe_url="https://x.com/u",
+            locale="en_US",
+        )
+        assert "No longer want to receive these emails?" in html
+        assert ">Unsubscribe</a>" in html
+        assert "一键退订" not in html
+
+    def test_german_email_uses_german_card(self):
+        html = plaintext_to_html(
+            "Body",
+            unsubscribe_url="https://x.com/u",
+            locale="de_DE",
+        )
+        assert "Diese E-Mails nicht mehr erhalten?" in html
+        assert ">Abmelden</a>" in html
+        assert "不再希望收到" not in html
+
+    def test_french_email_uses_french_card(self):
+        html = plaintext_to_html(
+            "Body",
+            unsubscribe_url="https://x.com/u",
+            locale="fr_FR",
+        )
+        assert "Vous ne souhaitez plus recevoir ces e-mails" in html
+        assert "Se désabonner" in html
+
+    def test_japanese_email_uses_japanese_card(self):
+        html = plaintext_to_html(
+            "Body",
+            unsubscribe_url="https://x.com/u",
+            locale="ja_JP",
+        )
+        assert "受信しない" in html
+        assert "配信停止" in html
+
+    def test_chinese_email_uses_chinese_card(self):
+        html = plaintext_to_html(
+            "正文",
+            unsubscribe_url="https://x.com/u",
+            locale="zh_CN",
+        )
+        assert "不再希望收到" in html
+        assert "一键退订" in html
+
+    def test_traditional_chinese_uses_tw_strings(self):
+        html = plaintext_to_html(
+            "Body",
+            unsubscribe_url="https://x.com/u",
+            locale="zh_TW",
+        )
+        assert "此類郵件" in html  # 繁體
+        assert "一鍵退訂" in html
+        assert "此邮件" not in html  # 簡體 not present
+
+    def test_unknown_locale_falls_back_to_english(self):
+        html = plaintext_to_html(
+            "Body",
+            unsubscribe_url="https://x.com/u",
+            locale="xx_YY",  # unknown
+        )
+        # Falls back to English.
+        assert "No longer want to receive these emails?" in html
+        assert ">Unsubscribe</a>" in html
+
+    def test_no_locale_falls_back_to_english(self):
+        html = plaintext_to_html(
+            "Body",
+            unsubscribe_url="https://x.com/u",
+            locale=None,
+        )
+        assert "No longer want to receive these emails?" in html
+
+    def test_arabic_locale_renders_rtl_card(self):
+        # Arabic gets dir="rtl" so the card mirrors in RTL clients.
+        html = plaintext_to_html(
+            "Body",
+            unsubscribe_url="https://x.com/u",
+            locale="ar_SA",
+        )
+        assert 'dir="rtl"' in html
+        assert "إلغاء الاشتراك" in html
+
+    def test_non_rtl_locale_does_not_get_dir_attribute(self):
+        # Spanish/English etc. must NOT get dir="rtl".
+        for loc in ("en_US", "es_ES", "zh_CN", "ja_JP"):
+            html = plaintext_to_html(
+                "Body",
+                unsubscribe_url="https://x.com/u",
+                locale=loc,
+            )
+            assert 'dir="rtl"' not in html, f"{loc} should not be RTL"
+
+    def test_locale_with_underscore_normalised(self):
+        # Full BCP-47 tags like "en_US" / "de_DE" must work — the
+        # renderer strips the region before looking up the card.
+        html_en = plaintext_to_html("Body", unsubscribe_url="https://x.com/u", locale="en_US")
+        html_de = plaintext_to_html("Body", unsubscribe_url="https://x.com/u", locale="de_DE")
+        assert "Unsubscribe" in html_en
+        assert "Abmelden" in html_de
+
+    def test_render_preview_html_uses_locale(self):
+        # The in-product preview helper should also accept locale.
+        html = render_preview_html("Body", locale="ja_JP")
+        assert "配信停止" in html
+        assert "__preview__" in html

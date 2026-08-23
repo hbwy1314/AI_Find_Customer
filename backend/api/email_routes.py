@@ -28,15 +28,21 @@ def _store() -> EmailStore:
     return store
 
 
-def _render_email_html(body_text: str) -> str:
+def _render_email_html(body_text: str, locale: str | None = None) -> str:
     """Render the preview HTML for ``body_text`` (placeholder unsubscribe).
+
+    ``locale`` is the campaign's primary language and is forwarded
+    to the unsubscribe-card renderer so the button text + prompt
+    + "reply 'unsubscribe'" hint stay in the same language as the
+    body. Without this the card stays Chinese on an English email
+    and the recipient is more likely to ignore it.
 
     Import is local so module-load order stays simple (body_format /
     html_format are otherwise imported by the email craft agent and
     can pull in heavy ML deps we don't need at request time).
     """
     from emailing.html_format import render_preview_html
-    return render_preview_html(body_text)
+    return render_preview_html(body_text, locale=locale)
 
 
 def _default_account(store: EmailStore) -> dict[str, Any]:
@@ -302,6 +308,7 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
                     # Graph call.
                     "body_html": _render_email_html(
                         str(email.get("body_text", "") or ""),
+                        locale=str(seq.get("locale") or "") or None,
                     ),
                     "status": "pending",
                     "scheduled_at": scheduled_at,

@@ -87,18 +87,150 @@ def _paragraph_html(paragraph: str) -> str:
     return linked.replace("\n", "<br>\n")
 
 
-# Signature for the unsubscribe card. The link is rendered as a
-# black button — most mail clients respect display:inline-block +
-# border-radius and surface it as a tap target.
-_UNSUBSCRIBE_CARD_HTML = """
-<div style="margin:24px 0 8px 0;padding:16px 20px;background:#f5f5f7;border-radius:8px;text-align:center;">
-  <p style="margin:0 0 4px 0;font-size:13px;color:#555;">不再希望收到此类邮件？</p>
-  <p style="margin:8px 0;">
-    <a href="{url}" style="display:inline-block;padding:10px 20px;background:#1d1d1f;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:500;font-size:14px;">一键退订</a>
-  </p>
-  <p style="margin:8px 0 0 0;font-size:12px;color:#888;">或直接回复「退订」即可</p>
-</div>
-"""
+# Localised strings for the unsubscribe card. Keys mirror the
+# closing-phrase table in ``body_format._DEFAULT_CLOSING_BY_LOCALE``
+# so a single ``locale`` value drives both the body's salutation
+# *and* the unsubscribe prompt. Every entry is 3 strings:
+#
+#   ``prompt``   — small text above the button ("No longer want …?")
+#   ``button``   — the button label (kept short — fits the button)
+#   ``fallback`` — small text below the button (the "or reply
+#                  'unsubscribe'" hint)
+#
+# Arabic uses RTL; we keep the layout direction in the card's
+# ``dir`` attribute so clients mirror the prompt + fallback.
+_UNSUBSCRIBE_CARD_STRINGS: dict[str, dict[str, str]] = {
+    "en": {
+        "prompt": "No longer want to receive these emails?",
+        "button": "Unsubscribe",
+        "fallback": "Or simply reply with “unsubscribe”.",
+    },
+    "de": {
+        "prompt": "Diese E-Mails nicht mehr erhalten?",
+        "button": "Abmelden",
+        "fallback": "Oder antworten Sie einfach mit „Abmelden“.",
+    },
+    "fr": {
+        "prompt": "Vous ne souhaitez plus recevoir ces e-mails ?",
+        "button": "Se désabonner",
+        "fallback": "Ou répondez simplement « désabonner ».",
+    },
+    "es": {
+        "prompt": "¿Ya no deseas recibir estos correos?",
+        "button": "Cancelar suscripción",
+        "fallback": "O simplemente responde con “cancelar”.",
+    },
+    "pt": {
+        "prompt": "Não quer mais receber estes e-mails?",
+        "button": "Cancelar inscrição",
+        "fallback": "Ou simplesmente responda com “cancelar”.",
+    },
+    "it": {
+        "prompt": "Non vuoi più ricevere queste email?",
+        "button": "Annulla iscrizione",
+        "fallback": "O rispondi semplicemente con “annulla”.",
+    },
+    "nl": {
+        "prompt": "Wil je deze e-mails niet meer ontvangen?",
+        "button": "Afmelden",
+        "fallback": "Of reageer eenvoudig met “afmelden”.",
+    },
+    "pl": {
+        "prompt": "Nie chcesz już otrzymywać tych e-maili?",
+        "button": "Anuluj subskrypcję",
+        "fallback": "Lub po prostu odpowiedz „anuluj”.",
+    },
+    "ru": {
+        "prompt": "Больше не хотите получать эти письма?",
+        "button": "Отписаться",
+        "fallback": "Или просто ответьте «отписаться».",
+    },
+    "ja": {
+        "prompt": "これらのメールを受信しない場合は？",
+        "button": "配信停止",
+        "fallback": "または「配信停止」と返信してください。",
+    },
+    "ko": {
+        "prompt": "이러한 이메일을 더 이상 받고 싶지 않으신가요?",
+        "button": "수신 거부",
+        "fallback": "또는 간단히 '수신 거부'로 회신하세요.",
+    },
+    "zh": {
+        "prompt": "不再希望收到此类邮件？",
+        "button": "一键退订",
+        "fallback": "或直接回复「退订」即可。",
+    },
+    "tw": {
+        "prompt": "不再希望收到此類郵件？",
+        "button": "一鍵退訂",
+        "fallback": "或直接回覆「退訂」即可。",
+    },
+    "ar": {
+        "prompt": "هل لا تريد تلقي هذه الرسائل بعد الآن؟",
+        "button": "إلغاء الاشتراك",
+        "fallback": "أو ببساطة رد بكلمة «إلغاء الاشتراك».",
+    },
+    "tr": {
+        "prompt": "Bu e-postaları artık almak istemiyor musunuz?",
+        "button": "Abonelikten çık",
+        "fallback": "Veya sadece \"aboneliği iptal et\" ile yanıtlayın.",
+    },
+}
+
+
+def _unsubscribe_strings_for_locale(locale: str | None) -> dict[str, str]:
+    """Return the localised ``{prompt, button, fallback}`` for the
+    unsubscribe card, falling back to English when the locale is
+    unknown.
+
+    Tries (in order):
+    1. Exact match (``"zh_TW"`` → ``"zh_TW"`` key if present).
+    2. Base language (``"zh_TW"`` → ``"tw"`` for traditional Chinese,
+       or ``"zh"`` for simplified — whichever we have).
+    3. English fallback.
+    """
+    if not locale:
+        return _UNSUBSCRIBE_CARD_STRINGS["en"]
+    norm = locale.lower().replace("-", "_")
+    if norm in _UNSUBSCRIBE_CARD_STRINGS:
+        return _UNSUBSCRIBE_CARD_STRINGS[norm]
+    lang = norm.split("_", 1)[0]
+    # Special-case the zh split: zh_TW should map to "tw" (we have
+    # a traditional-Chinese entry), zh_CN / zh_SG etc. map to "zh".
+    if lang == "zh" and norm.startswith("zh_tw"):
+        return _UNSUBSCRIBE_CARD_STRINGS["tw"]
+    return _UNSUBSCRIBE_CARD_STRINGS.get(lang, _UNSUBSCRIBE_CARD_STRINGS["en"])
+
+
+_RTL_LOCALES = {"ar"}
+
+
+def _unsubscribe_card_html(url: str, locale: str | None = None) -> str:
+    """Render the unsubscribe card in the recipient's language.
+
+    Uses ``_unsubscribe_strings_for_locale`` to pick the prompt /
+    button / fallback text. Arabic locales get a ``dir="rtl"``
+    attribute on the wrapping ``<div>`` so the card mirrors in RTL
+    mail clients.
+    """
+    s = _unsubscribe_strings_for_locale(locale)
+    escaped_url = _html.escape(url, quote=True)
+    escaped_prompt = _escape_text(s["prompt"])
+    escaped_button = _escape_text(s["button"])
+    escaped_fallback = _escape_text(s["fallback"])
+    dir_attr = ' dir="rtl"' if (locale or "").lower().replace("-", "_").split("_", 1)[0] in _RTL_LOCALES else ""
+    return (
+        f'<div{dir_attr} style="margin:24px 0 8px 0;padding:16px 20px;'
+        f'background:#f5f5f7;border-radius:8px;text-align:center;">'
+        f'<p style="margin:0 0 4px 0;font-size:13px;color:#555;">{escaped_prompt}</p>'
+        f'<p style="margin:8px 0;">'
+        f'<a href="{escaped_url}" style="display:inline-block;padding:10px 20px;'
+        f'background:#1d1d1f;color:#ffffff;text-decoration:none;border-radius:6px;'
+        f'font-weight:500;font-size:14px;">{escaped_button}</a>'
+        f'</p>'
+        f'<p style="margin:8px 0 0 0;font-size:12px;color:#888;">{escaped_fallback}</p>'
+        f"</div>"
+    )
 
 
 def plaintext_to_html(
@@ -106,6 +238,7 @@ def plaintext_to_html(
     unsubscribe_url: Optional[str] = None,
     *,
     extra_footer_text: Optional[str] = None,
+    locale: Optional[str] = None,
 ) -> str:
     """Render ``body_text`` as a self-contained HTML document.
 
@@ -121,6 +254,11 @@ def plaintext_to_html(
             preview renderer which shows a placeholder URL).
         extra_footer_text: Optional small-print line below the body
             (e.g. "Sent by Acme Vape"). HTML-escaped before insertion.
+        locale: Recipient's locale (e.g. ``"en"``, ``"de_DE"``).
+            Drives the unsubscribe card's prompt / button / fallback
+            text — so the card stays in the same language as the
+            body and never lands a Chinese button on an English
+            email. Falls back to English when unknown.
 
     Returns:
         A ``<div>...</div>`` HTML fragment (no ``<html>`` / ``<head>``
@@ -149,7 +287,7 @@ def plaintext_to_html(
         )
     if unsubscribe_url:
         parts.append(
-            _UNSUBSCRIBE_CARD_HTML.format(url=_html.escape(unsubscribe_url, quote=True))
+            _unsubscribe_card_html(unsubscribe_url, locale=locale)
         )
 
     inner = "\n".join(parts).strip()
@@ -191,12 +329,23 @@ def _strip_legacy_footer(body_text: str) -> str:
     return body_text
 
 
-def render_preview_html(body_text: str) -> str:
+def render_preview_html(body_text: str, locale: Optional[str] = None) -> str:
     """Render a preview-friendly HTML body (with a placeholder URL).
 
     Used by the in-product preview so the UI can show the recipient
     what the actual email will look like. The placeholder URL is
     swapped for a real per-recipient token at send time, so this
     preview does NOT need to be regenerated per message.
+
+    Args:
+        body_text: Same as ``plaintext_to_html``.
+        locale: Drives the unsubscribe card's language. Defaults to
+            ``None`` (English fallback) when the caller doesn't have
+            the locale handy — UI previews can pass it through from
+            the lead's metadata.
     """
-    return plaintext_to_html(body_text, unsubscribe_url=_UNSUBSCRIBE_PLACEHOLDER_URL)
+    return plaintext_to_html(
+        body_text,
+        unsubscribe_url=_UNSUBSCRIBE_PLACEHOLDER_URL,
+        locale=locale,
+    )
