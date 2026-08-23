@@ -223,48 +223,62 @@ function EmailBodyPreview({
   const [renderedHtml, setRenderedHtml] = useState<string | null>(
     body_html || null,
   );
-  const [rendering, setRendering] = useState(false);
 
   // If body_html arrives later (props change after a rewrite),
   // adopt it. If it's missing, ask the backend to render one.
+  // The effect intentionally does NOT keep ``renderedHtml`` in its
+  // dependency array: the latched value itself should never re-trigger
+  // a re-fetch. We also don't gate on a ``rendering`` flag — instead
+  // we tie the in-flight request to a per-invocation AbortController
+  // so React 18 StrictMode's dev-only mount/unmount/mount cycle
+  // doesn't strand the first request's response.
   useEffect(() => {
     if (body_html) {
       setRenderedHtml(body_html);
       return;
     }
-    if (!body_text || renderedHtml || rendering) {
+    if (!body_text) {
       return;
     }
-    let cancelled = false;
-    setRendering(true);
+    const controller = new AbortController();
     api
-      .renderEmailHtml(body_text, locale)
+      .renderEmailHtml(body_text, locale, { signal: controller.signal })
       .then((res) => {
-        if (!cancelled) setRenderedHtml(res.body_html);
+        setRenderedHtml(res.body_html);
       })
-      .catch(() => {
-        // Swallow — fallback view below will keep showing the
-        // plain text body.
-      })
-      .finally(() => {
-        if (!cancelled) setRendering(false);
+      .catch((err) => {
+        // Swallow — the fallback view below will keep showing the
+        // plain text body. Aborted requests are expected when the
+        // component re-renders with a different body_text.
+        if (err?.name !== "AbortError") {
+          // eslint-disable-next-line no-console
+          console.warn("[EmailBodyPreview] render-email-html failed", err);
+        }
       });
     return () => {
-      cancelled = true;
+      controller.abort();
     };
-  }, [body_text, body_html, locale, renderedHtml, rendering]);
+  }, [body_text, body_html, locale]);
 
   const hasHtml = !!renderedHtml;
   const [view, setView] = useState<"html" | "text">(hasHtml ? "html" : "text");
+  // Track the body_text the user last had on screen so we only
+  // auto-promote ``text`` → ``html`` the *first* time HTML arrives
+  // for a given body. Without this guard, every manual click on
+  // "纯文本" would silently snap right back to "HTML 预览".
+  const lastSeenBodyRef = useRef<string | null>(null);
 
   // When the rendered HTML finally arrives (legacy sequence
   // round-trip), promote the view from "text" to "html" so the
-  // operator sees the new layout without an extra click.
+  // operator sees the new layout without an extra click — but only
+  // for the body that just transitioned, not for bodies the user
+  // has already inspected.
   useEffect(() => {
-    if (hasHtml && view === "text") {
+    if (hasHtml && view === "text" && lastSeenBodyRef.current !== body_text) {
+      lastSeenBodyRef.current = body_text;
       setView("html");
     }
-  }, [hasHtml, view]);
+  }, [hasHtml, view, body_text]);
 
   if (!hasHtml) {
     return (

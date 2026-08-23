@@ -705,6 +705,19 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
   const method = (options?.method ?? "GET").toUpperCase();
+  // Combine caller-supplied abort signal with our timeout signal so
+  // the caller's ``abort()`` still cancels the request without
+  // disabling the 15s safety timeout.
+  const externalSignal = options?.signal;
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener("abort", () => controller.abort(), {
+        once: true,
+      });
+    }
+  }
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, {
@@ -715,7 +728,15 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error(`Request timed out after ${API_TIMEOUT_MS / 1000}s`);
+      // Surface a more useful error for either the caller's abort or
+      // the timeout; the EmailBodyPreview component only uses the
+      // name to skip logging for caller-driven aborts.
+      const reason = externalSignal?.aborted
+        ? "aborted by caller"
+        : `Request timed out after ${API_TIMEOUT_MS / 1000}s`;
+      const err = new Error(reason);
+      err.name = "AbortError";
+      throw err;
     }
     throw error;
   } finally {
@@ -922,10 +943,15 @@ export const api = {
    * Used by the in-product email preview to fill in ``body_html``
    * for sequences that pre-date the HTML pipeline (only have
    * ``body_text`` in storage). */
-  renderEmailHtml: (body_text: string, locale?: string) =>
+  renderEmailHtml: (
+    body_text: string,
+    locale?: string,
+    options?: { signal?: AbortSignal },
+  ) =>
     request<{ body_html: string }>("/utilities/render-email-html", {
       method: "POST",
       body: JSON.stringify({ body_text, locale: locale || "" }),
+      signal: options?.signal,
     }),
 
   sendEmailDraft: (huntId: string, sequenceIndex: number, data: SendEmailDraftRequest) =>
