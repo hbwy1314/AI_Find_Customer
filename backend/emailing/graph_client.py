@@ -151,6 +151,7 @@ async def send_via_graph(
     thread_key: str | None = None,
     list_unsubscribe_url: str | None = None,
     list_unsubscribe_mailto: str | None = None,
+    body_html: str | None = None,
 ) -> dict[str, Any]:
     """Send `body_text` to `to_email` using the shared Graph mailbox.
 
@@ -196,6 +197,7 @@ async def send_via_graph(
         body_text=body_text, reply_to=reply_to, thread_key=thread_key,
         list_unsubscribe_url=list_unsubscribe_url,
         list_unsubscribe_mailto=list_unsubscribe_mailto,
+        body_html=body_html,
     )
     if two_step_result.get("ok"):
         return two_step_result
@@ -221,6 +223,7 @@ async def send_via_graph(
         body_text=body_text, reply_to=reply_to, thread_key=thread_key,
         list_unsubscribe_url=list_unsubscribe_url,
         list_unsubscribe_mailto=list_unsubscribe_mailto,
+        body_html=body_html,
     )
     if fallback.get("ok"):
         return fallback
@@ -244,6 +247,7 @@ async def _send_two_step(
     thread_key: str | None,
     list_unsubscribe_url: str | None = None,
     list_unsubscribe_mailto: str | None = None,
+    body_html: str | None = None,
 ) -> dict[str, Any]:
     try:
         # ── Step 1: create the draft message ──────────────────────
@@ -254,9 +258,23 @@ async def _send_two_step(
         # expose a one-click unsubscribe button.
         if list_unsubscribe_url:
             body_text = append_footer(body_text, list_unsubscribe_url)
+        # Use the caller's HTML if it was passed in (e.g. the
+        # scheduler pre-renders it with the real per-recipient token).
+        # Otherwise render it from the plain text body here.
+        if not body_html:
+            from emailing.html_format import plaintext_to_html
+            body_html = plaintext_to_html(
+                body_text,
+                unsubscribe_url=list_unsubscribe_url,
+            )
         draft_payload = {
             "subject": subject,
-            "body": {"contentType": "Text", "content": body_text or ""},
+            # Graph's Message.body takes a single contentType. We send
+            # HTML so the unsubscribe button renders as a real link;
+            # the plain text body is preserved in the same draft via
+            # Graph's `bodyPreview` field for clients that strip HTML.
+            "body": {"contentType": "HTML", "content": body_html},
+            "bodyPreview": body_text or "",
             "toRecipients": [{"emailAddress": {"name": "", "address": to_email}}],
         }
         if reply_to:
@@ -374,6 +392,7 @@ async def _send_single_step(
     thread_key: str | None,
     list_unsubscribe_url: str | None = None,
     list_unsubscribe_mailto: str | None = None,
+    body_html: str | None = None,
 ) -> dict[str, Any]:
     """Single-shot sendMail — fallback when the two-step create+send fails.
 
@@ -387,9 +406,19 @@ async def _send_single_step(
         from_name = str(account.get("from_name") or "")
         if list_unsubscribe_url:
             body_text = append_footer(body_text, list_unsubscribe_url)
+        # Use the caller's HTML if it was passed in; otherwise render
+        # it here (see _send_two_step for the rationale on why we
+        # prefer HTML over plain text when sending through Graph).
+        if not body_html:
+            from emailing.html_format import plaintext_to_html
+            body_html = plaintext_to_html(
+                body_text,
+                unsubscribe_url=list_unsubscribe_url,
+            )
         message: dict[str, Any] = {
             "subject": subject,
-            "body": {"contentType": "Text", "content": body_text or ""},
+            "body": {"contentType": "HTML", "content": body_html},
+            "bodyPreview": body_text or "",
             "toRecipients": [{"emailAddress": {"name": "", "address": to_email}}],
             "from": {"emailAddress": {"name": from_name, "address": from_email}},
         }

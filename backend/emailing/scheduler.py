@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 from api.hunt_store import load_hunt, save_hunt
 from config.settings import get_settings
 from emailing.email_sender import send_email
+from emailing.html_format import _UNSUBSCRIBE_PLACEHOLDER_URL as _HTML_UNSUBSCRIBE_PLACEHOLDER
 from emailing.policy import is_role_based_email
 from emailing.store import EmailStore
 from emailing.unsubscribe import build_mailto_unsubscribe, build_unsubscribe_url, issue_token
@@ -410,6 +411,24 @@ async def run_scheduler_once(
         un_url = build_unsubscribe_url(un_base, untoken) if untoken else ""
         un_mailto = build_mailto_unsubscribe(recipient) if recipient else ""
 
+        # The stored body_html was rendered at sequence-create time
+        # with a placeholder unsubscribe URL (`__preview__`). Swap
+        # that for the real per-recipient token now so the recipient
+        # sees a working unsubscribe link (and the click records
+        # against the right campaign scope).
+        body_html = str(job.get("body_html", "") or "")
+        if body_html and un_url:
+            body_html = body_html.replace(_HTML_UNSUBSCRIBE_PLACEHOLDER, un_url)
+        elif not body_html and un_url:
+            # Older messages written before body_html existed — fall
+            # back to rendering on the fly so we still get an HTML
+            # email with a clickable unsubscribe button.
+            from emailing.html_format import plaintext_to_html
+            body_html = plaintext_to_html(
+                str(job.get("body_text", "") or ""),
+                unsubscribe_url=un_url,
+            )
+
         result = await sender(
             account,
             to_email=recipient,
@@ -419,6 +438,7 @@ async def run_scheduler_once(
             thread_key=str(job.get("thread_key", "") or ""),
             list_unsubscribe_url=un_url or None,
             list_unsubscribe_mailto=un_mailto or None,
+            body_html=body_html or None,
         )
         if result.get("ok"):
             store.mark_message_sent(

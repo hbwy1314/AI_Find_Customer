@@ -36,8 +36,16 @@ async def send_email(
     thread_key: str | None = None,
     list_unsubscribe_url: str | None = None,
     list_unsubscribe_mailto: str | None = None,
+    body_html: str | None = None,
 ) -> dict[str, Any]:
-    """Send one email via Microsoft Graph."""
+    """Send one email via Microsoft Graph.
+
+    ``body_html`` is the optional pre-rendered HTML body. When
+    provided, it is sent as the email's HTML content (with the
+    recipient's real unsubscribe token already substituted in).
+    When omitted, Graph API receives a fresh render from the plain
+    text body via ``emailing.html_format.plaintext_to_html``.
+    """
     if not to_email.strip():
         return {
             "ok": False,
@@ -73,6 +81,7 @@ async def send_email(
             thread_key=thread_key,
             list_unsubscribe_url=list_unsubscribe_url,
             list_unsubscribe_mailto=list_unsubscribe_mailto,
+            body_html=body_html,
         )
     except asyncio.CancelledError:
         raise

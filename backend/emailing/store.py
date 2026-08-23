@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS email_messages (
   locale TEXT NOT NULL,
   subject TEXT NOT NULL,
   body_text TEXT NOT NULL,
+  body_html TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'pending',
   scheduled_at TEXT NOT NULL,
   sent_at TEXT DEFAULT '',
@@ -268,6 +269,9 @@ class EmailStore:
             # Manual rotation order set from the quotas page. Existing rows
             # default to 0; new rows are appended at MAX(sort_order)+1.
             self._ensure_column(conn, "email_accounts", "sort_order", "INTEGER NOT NULL DEFAULT 0")
+            # HTML body for the recipient's mail client. Older rows
+            # stay empty — we re-render on demand from body_text.
+            self._ensure_column(conn, "email_messages", "body_html", "TEXT NOT NULL DEFAULT ''")
             # Ensure the singleton app_bootstrap row exists
             conn.execute(
                 "INSERT OR IGNORE INTO app_bootstrap (id, initialized, last_admin_at) VALUES (1, 0, '')"
@@ -811,9 +815,9 @@ class EmailStore:
             new_id = uuid.uuid4().hex
             conn.execute(
                 "INSERT INTO email_messages "
-                "(id, sequence_id, step_number, goal, locale, subject, body_text, "
+                "(id, sequence_id, step_number, goal, locale, subject, body_text, body_html, "
                 " status, scheduled_at, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
                 (
                     new_id,
                     src["sequence_id"],
@@ -822,6 +826,7 @@ class EmailStore:
                     src["locale"],
                     src["subject"],
                     src["body_text"],
+                    src["body_html"] if "body_html" in src.keys() else "",
                     scheduled_at,
                     scheduled_at,
                     scheduled_at,

@@ -28,6 +28,17 @@ def _store() -> EmailStore:
     return store
 
 
+def _render_email_html(body_text: str) -> str:
+    """Render the preview HTML for ``body_text`` (placeholder unsubscribe).
+
+    Import is local so module-load order stays simple (body_format /
+    html_format are otherwise imported by the email craft agent and
+    can pull in heavy ML deps we don't need at request time).
+    """
+    from emailing.html_format import render_preview_html
+    return render_preview_html(body_text)
+
+
 def _default_account(store: EmailStore) -> dict[str, Any]:
     settings = get_settings()
     account_id = "default"
@@ -283,6 +294,15 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
                     "locale": str(seq.get("locale") or "en_US"),
                     "subject": str(email.get("subject", "") or ""),
                     "body_text": str(email.get("body_text", "") or ""),
+                    # Render the HTML body now (with a placeholder
+                    # unsubscribe URL) so the in-product preview can
+                    # render it and we don't have to re-render at
+                    # send time. The real per-recipient token is
+                    # swapped in by the scheduler right before the
+                    # Graph call.
+                    "body_html": _render_email_html(
+                        str(email.get("body_text", "") or ""),
+                    ),
                     "status": "pending",
                     "scheduled_at": scheduled_at,
                     "sent_at": "",
