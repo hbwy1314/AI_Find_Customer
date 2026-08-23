@@ -23,7 +23,6 @@ import httpx
 from msal import ConfidentialClientApplication
 
 from config.settings import get_settings
-from emailing.unsubscribe import append_footer
 
 logger = logging.getLogger(__name__)
 
@@ -254,10 +253,12 @@ async def _send_two_step(
         # Note: deliberately OMIT `from` so Graph assigns the shared
         # mailbox as the sender. See the docstring above for why.
         # Inject the unsubscribe footer + RFC 8058 List-Unsubscribe
-        # headers (HTTPS link + mailto: fallback) so mail clients
-        # expose a one-click unsubscribe button.
-        if list_unsubscribe_url:
-            body_text = append_footer(body_text, list_unsubscribe_url)
+        # The plain-text body intentionally stays free of a visible
+        # unsubscribe line — the localised unsubscribe card lives in
+        # the HTML body, and the RFC 8058 ``X-List-Unsubscribe`` /
+        # ``X-List-Unsubscribe-Post`` headers (set further below)
+        # remain the canonical surface for one-click opt-out in
+        # modern mail clients.
         # Use the caller's HTML if it was passed in (e.g. the
         # scheduler pre-renders it with the real per-recipient token).
         # Otherwise render it from the plain text body here.
@@ -404,8 +405,6 @@ async def _send_single_step(
     try:
         from_email = str(account.get("from_email") or upn)
         from_name = str(account.get("from_name") or "")
-        if list_unsubscribe_url:
-            body_text = append_footer(body_text, list_unsubscribe_url)
         # Use the caller's HTML if it was passed in; otherwise render
         # it here (see _send_two_step for the rationale on why we
         # prefer HTML over plain text when sending through Graph).

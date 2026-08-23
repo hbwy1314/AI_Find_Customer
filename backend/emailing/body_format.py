@@ -50,15 +50,6 @@ _DEFAULT_CLOSING_BY_LOCALE: dict[str, str] = {
 }
 
 
-# Placeholder URL that the email preview renders. At send time
-# `emailing.unsubscribe.append_footer` detects the footer block
-# (recognised by the `不再接收此类邮件：` marker) and replaces the
-# placeholder URL with the real per-recipient token, so the recipient
-# always sees a working link without us having to mutate the stored
-# body ahead of time.
-_UNSUBSCRIBE_PLACEHOLDER_URL = "https://api.nineluan.com/api/unsubscribe/__preview__"
-
-
 def _normalize_lines(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = [line.rstrip() for line in text.split("\n")]
@@ -129,26 +120,6 @@ def _append_closing_if_missing(text: str, locale: str | None, signature: str | N
     return "\n\n".join(pieces)
 
 
-def _append_unsubscribe_placeholder(text: str) -> str:
-    """Append a placeholder unsubscribe footer so the preview shows
-    the recipient where the opt-out link will land. The placeholder
-    URL is replaced with a real per-recipient token at send time by
-    :func:`emailing.unsubscribe.append_footer` (which recognises the
-    marker and re-uses the existing ``--`` separator instead of
-    stacking a second footer).
-    """
-    if not text:
-        return text
-    sep = "\n\n--\n"
-    placeholder = f"不再接收此类邮件：{_UNSUBSCRIBE_PLACEHOLDER_URL}\n"
-    cleaned = text.rstrip()
-    # Avoid double-appending if the body already has a placeholder
-    # (e.g. from a prior review-and-rewrite loop).
-    if "\n\n--\n" in cleaned and "不再接收此类邮件：" in cleaned:
-        return text
-    return cleaned + sep + placeholder
-
-
 def format_plaintext_email_body(
     body_text: str,
     locale: str | None = None,
@@ -164,6 +135,14 @@ def format_plaintext_email_body(
     the body is missing a recognised closing, append a localised
     default closing before the signature. This is the safety net
     that catches the "邮件未完整 / 结尾部分缺失" review issue.
+
+    Note: there is intentionally no plain-text unsubscribe footer
+    anymore. The HTML body still carries the localised unsubscribe
+    card, and the message-level ``X-List-Unsubscribe`` header (set
+    by the Graph send path) is the standard opt-out signal that
+    mail clients actually surface in their UI. Recipients who only
+    see the plain-text body can still opt out by replying or via
+    the sender contact.
     """
     normalized = _normalize_lines(str(body_text or ""))
     if not normalized:
@@ -198,17 +177,11 @@ def format_email_sequence_bodies(
     emails: list[dict],
     locale: str | None = None,
     signature: str | None = None,
-    append_unsubscribe_footer: bool = True,
 ) -> list[dict]:
     """Return a copy of emails with normalized plain-text paragraph spacing.
 
     When ``locale``/``signature`` is provided, missing closings are
     back-filled (see :func:`format_plaintext_email_body`).
-
-    When ``append_unsubscribe_footer`` is true (default) every email
-    body is given a placeholder unsubscribe footer so the preview
-    shows the recipient where the opt-out link will land. The real
-    per-recipient token is swapped in at send time.
     """
     formatted: list[dict] = []
     for email in emails:
@@ -221,8 +194,6 @@ def format_email_sequence_bodies(
             locale=locale,
             signature=signature,
         )
-        if append_unsubscribe_footer:
-            body = _append_unsubscribe_placeholder(body)
         item["body_text"] = body
         formatted.append(item)
     return formatted

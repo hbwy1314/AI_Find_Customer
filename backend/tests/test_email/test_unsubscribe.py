@@ -12,7 +12,6 @@ from config.settings import get_settings
 from emailing.scheduler import run_scheduler_once
 from emailing.store import EmailStore
 from emailing.unsubscribe import (
-    append_footer,
     build_mailto_unsubscribe,
     build_unsubscribe_url,
     issue_token,
@@ -56,38 +55,6 @@ def test_token_hash_is_deterministic_and_not_reversible() -> None:
     assert len(h1) == 64  # sha256 hex
     # the raw token is not in the hash
     assert t not in h1
-
-
-def test_append_footer_only_when_url_given() -> None:
-    body = "Hello world"
-    out = append_footer(body, "https://x.example/u/abc")
-    assert "Hello world" in out
-    assert "不再接收此类邮件" in out
-    assert "https://x.example/u/abc" in out
-    # short body with no trailing newline still gets the footer
-    assert out.endswith("https://x.example/u/abc\n")
-
-
-def test_append_footer_replaces_existing_placeholder() -> None:
-    """When a body already carries a placeholder unsubscribe footer
-    (as introduced by ``body_format._append_unsubscribe_placeholder``
-    during preview), a second call to ``append_footer`` should swap
-    the URL in place rather than stack a second footer block.
-    """
-    body = (
-        "Hello, here is the offer.\n\n"
-        "Best regards,\nAcme\n\n--\n"
-        "不再接收此类邮件：https://api.nineluan.com/api/unsubscribe/__preview__\n"
-    )
-    out = append_footer(body, "https://api.real.example/api/unsubscribe/real-token")
-    # Exactly one footer block (one occurrence of the marker)
-    assert out.count("不再接收此类邮件：") == 1
-    # The placeholder URL is replaced with the real one
-    assert "__preview__" not in out
-    assert "real-token" in out
-    # Body content is preserved
-    assert "Hello, here is the offer." in out
-    assert "Best regards," in out
 
 
 def test_build_unsubscribe_url_and_mailto() -> None:

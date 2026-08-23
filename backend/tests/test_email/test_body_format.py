@@ -103,7 +103,11 @@ def test_format_email_sequence_bodies_no_back_fill_without_locale():
     assert "Best regards" not in body
 
 
-def test_format_email_sequence_bodies_appends_unsubscribe_placeholder():
+def test_format_email_sequence_bodies_omits_plain_text_unsubscribe_footer():
+    """The plain-text body must no longer carry a visible unsubscribe
+    line or placeholder URL — the unsubscribe CTA lives in the HTML
+    body and in the X-List-Unsubscribe header.
+    """
     emails = [
         {
             "subject": "Potential fit",
@@ -113,15 +117,17 @@ def test_format_email_sequence_bodies_appends_unsubscribe_placeholder():
 
     formatted = format_email_sequence_bodies(emails)
     body = formatted[0]["body_text"]
-    # The preview should expose a placeholder unsubscribe URL so
-    # the recipient knows where the opt-out link will land.
-    assert "不再接收此类邮件" in body
-    assert "__preview__" in body
-    assert body.rstrip().endswith("__preview__")
+    assert "不再接收此类邮件" not in body
+    assert "__preview__" not in body
+    # The plain body content must still be intact.
+    assert "Dear Sir/Madam" in body
+    assert "Kind regards" in body
 
 
-def test_format_email_sequence_bodies_no_double_footer():
-    """Calling the helper twice must not stack two footer blocks."""
+def test_format_email_sequence_bodies_idempotent_without_footer():
+    """Calling the helper twice must not introduce any unsubscribe
+    artefacts even on repeated runs.
+    """
     emails = [
         {
             "subject": "Potential fit",
@@ -133,19 +139,6 @@ def test_format_email_sequence_bodies_no_double_footer():
     twice = format_email_sequence_bodies(
         [{"subject": "Potential fit", "body_text": once}]
     )[0]["body_text"]
-    assert once.count("不再接收此类邮件：") == 1
-    assert twice.count("不再接收此类邮件：") == 1
-
-
-def test_format_email_sequence_bodies_can_skip_unsubscribe_footer():
-    emails = [
-        {
-            "subject": "Potential fit",
-            "body_text": "Dear Sir/Madam, we manufacture micro switches.\n\nKind regards,",
-        },
-    ]
-
-    formatted = format_email_sequence_bodies(
-        emails, append_unsubscribe_footer=False
-    )
-    assert "不再接收此类邮件" not in formatted[0]["body_text"]
+    assert once == twice
+    assert "不再接收此类邮件" not in once
+    assert "不再接收此类邮件" not in twice

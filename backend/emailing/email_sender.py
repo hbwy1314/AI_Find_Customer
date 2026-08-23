@@ -13,7 +13,6 @@ import logging
 from typing import Any
 
 from emailing.body_format import format_plaintext_email_body
-from emailing.unsubscribe import append_footer
 
 logger = logging.getLogger(__name__)
 
