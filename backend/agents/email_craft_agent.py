@@ -912,7 +912,7 @@ def _fallback_email_from_template(
         if value and needle.lower() in subject_line.lower():
             subject_line = re.sub(re.escape(needle), value, subject_line, flags=re.IGNORECASE)
 
-    return {
+    return _email_dict_with_html({
         "subject": subject_line,
         "body_text": body_text,
         "suggested_send_day": 0,
@@ -920,7 +920,38 @@ def _fallback_email_from_template(
         "personalization_points": [p for p in (lead_company, lead_industry, target_title) if p],
         "_template_fallback": True,
         "locale": fallback_locale,
-    }
+    }, locale=fallback_locale)
+
+
+def _email_dict_with_html(email: dict[str, Any], locale: str | None = None) -> dict[str, Any]:
+    """Return ``email`` with a ``body_html`` key derived from
+    ``body_text`` via :func:`emailing.html_format.plaintext_to_html`.
+
+    Used by every code path that constructs an email-dict (template
+    fallback, validator output, and the per-lead craft pipeline) so
+    the in-product preview can render the same HTML the recipient
+    will actually see. The ``locale`` argument drives the
+    unsubscribe-card language (defaults to the email's own locale
+    field if absent). Imports are local so this helper is safe to
+    call from the validator/template hot paths without pulling in
+    heavy deps at import time.
+    """
+    if not isinstance(email, dict):
+        return email
+    if "body_html" in email and email["body_html"]:
+        # Already rendered (e.g. by the per-lead craft pipeline which
+        # runs the full ReAct loop). Leave it alone.
+        return email
+    if not email.get("body_text"):
+        return email
+    from emailing.html_format import render_preview_html
+    out = dict(email)
+    effective_locale = locale or out.get("locale") or None
+    out["body_html"] = render_preview_html(
+        str(out.get("body_text") or ""),
+        locale=str(effective_locale) if effective_locale else None,
+    )
+    return out
 
 
 def _build_raw_template_fallback(
@@ -2307,6 +2338,13 @@ async def _craft_for_lead(
 
         logger.info("[EmailCraft] %s → %d emails in %s", lead.get("company_name"), len(emails), locale)
 
+        # Render the HTML body for every email so the in-product
+        # preview can show the same HTML the recipient will see.
+        # The body_html field is what the scheduler also uses as a
+        # starting point at send time (it just swaps the placeholder
+        # URL for the real per-recipient token).
+        enriched_emails = [_email_dict_with_html(e, locale=locale) for e in (emails or [])]
+
         return {
             "lead": lead,
             "locale": locale,
@@ -2315,7 +2353,7 @@ async def _craft_for_lead(
             "strategy_brief": strategy_brief,
             "validation_summary": validation_summary,
             "review_status": review_summary.get("status", validation_summary.get("status", "approved")),
-            "emails": emails,
+            "emails": enriched_emails,
             "template_profile": template_profile,
             "template_plan": template_plan,
             "template_seed_source": str((prepared_template_seed or {}).get("source", "") or ""),

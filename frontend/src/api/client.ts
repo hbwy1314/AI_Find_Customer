@@ -197,6 +197,7 @@ export interface EmailDraft {
   email_type: string;
   subject: string;
   body_text: string;
+  body_html?: string;
   suggested_send_day: number;
   personalization_points?: string[];
   cultural_adaptations?: string[];

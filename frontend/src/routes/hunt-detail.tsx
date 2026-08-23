@@ -196,6 +196,93 @@ function ContinueJobDialog({
 type Lead = Record<string, unknown>;
 
 function getLeadEmails(lead: Lead): string[] { return (lead.emails as string[]) || []; }
+
+
+/**
+ * Render an outbound email body. The backend ships both the plain
+ * text (for clients that strip HTML) and a pre-rendered HTML version
+ * (with the clickable unsubscribe card, localised to the email's
+ * locale). We show the HTML view by default because that's what
+ * most modern clients will actually render — and the unsubscribe
+ * button is much easier to spot than the old single-line URL.
+ *
+ * The toggle falls back to plain text when ``body_html`` is missing
+ * (older sequences written before the HTML pipeline was added).
+ */
+function EmailBodyPreview({
+  body_text,
+  body_html,
+}: {
+  body_text: string;
+  body_html?: string;
+}) {
+  const hasHtml = !!(body_html && body_html.trim());
+  const [view, setView] = useState<"html" | "text">(hasHtml ? "html" : "text");
+
+  // If body_html appears later (e.g. after a ReAct rewrite),
+  // promote ourselves out of the plain-text fallback.
+  useEffect(() => {
+    if (hasHtml && view === "text" && !body_text) {
+      setView("html");
+    }
+  }, [hasHtml, view, body_text]);
+
+  if (!hasHtml) {
+    return (
+      <p className="whitespace-pre-wrap text-sm text-muted-foreground">
+        {body_text}
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="inline-flex rounded-md border bg-muted/40 p-0.5 text-xs">
+        <button
+          type="button"
+          onClick={() => setView("html")}
+          className={
+            "rounded px-2 py-1 transition-colors " +
+            (view === "html"
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground")
+          }
+        >
+          HTML 预览
+        </button>
+        <button
+          type="button"
+          onClick={() => setView("text")}
+          className={
+            "rounded px-2 py-1 transition-colors " +
+            (view === "text"
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground")
+          }
+        >
+          纯文本
+        </button>
+      </div>
+      {view === "html" ? (
+        // ``srcDoc`` sandboxes the body so the preview can never
+        // execute scripts or break out into the host app. The
+        // inline styles on the body are already self-contained, so
+        // we don't need to inject any extra CSS.
+        <iframe
+          title="email-html-preview"
+          srcDoc={body_html}
+          sandbox=""
+          className="w-full rounded-md border bg-white"
+          style={{ minHeight: 280, colorScheme: "light" }}
+        />
+      ) : (
+        <p className="whitespace-pre-wrap rounded-md border bg-muted/20 p-3 text-sm text-muted-foreground">
+          {body_text}
+        </p>
+      )}
+    </div>
+  );
+}
 function getLeadPhones(lead: Lead): string[] { return (lead.phone_numbers as string[]) || []; }
 function getLeadSocial(lead: Lead): Record<string, string> { return (lead.social_media as Record<string, string>) || {}; }
 function getLeadStr(lead: Lead, key: string): string { return typeof lead[key] === "string" ? (lead[key] as string) : ""; }
@@ -1124,7 +1211,7 @@ function EmailSequencePreviewSheet({
                   <p className="text-xs text-muted-foreground">已进入发送队列。</p>
                 )}
               </div>
-              <p className="whitespace-pre-wrap text-sm text-muted-foreground">{email.body_text}</p>
+              <EmailBodyPreview body_text={email.body_text} body_html={email.body_html} />
               {((email.personalization_points || []).length > 0 || (email.cultural_adaptations || []).length > 0) && (
                 <div className="grid gap-3 md:grid-cols-2">
                   {(email.personalization_points || []).length > 0 && (
