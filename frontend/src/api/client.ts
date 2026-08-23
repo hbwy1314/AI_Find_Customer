@@ -918,6 +918,16 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  /** Render a plain-text body as the HTML the recipient will see.
+   * Used by the in-product email preview to fill in ``body_html``
+   * for sequences that pre-date the HTML pipeline (only have
+   * ``body_text`` in storage). */
+  renderEmailHtml: (body_text: string, locale?: string) =>
+    request<{ body_html: string }>("/utilities/render-email-html", {
+      method: "POST",
+      body: JSON.stringify({ body_text, locale: locale || "" }),
+    }),
+
   sendEmailDraft: (huntId: string, sequenceIndex: number, data: SendEmailDraftRequest) =>
     request<SendEmailDraftResponse>(`/hunts/${huntId}/email-sequences/${sequenceIndex}/send`, {
       method: "POST",

@@ -206,26 +206,65 @@ function getLeadEmails(lead: Lead): string[] { return (lead.emails as string[]) 
  * most modern clients will actually render — and the unsubscribe
  * button is much easier to spot than the old single-line URL.
  *
- * The toggle falls back to plain text when ``body_html`` is missing
- * (older sequences written before the HTML pipeline was added).
+ * Sequences that pre-date the HTML pipeline ship with an empty
+ * ``body_html``; we ask the backend to render one on the fly
+ * (``api.renderEmailHtml``) so the operator still sees the new card
+ * without us having to migrate historical data.
  */
 function EmailBodyPreview({
   body_text,
   body_html,
+  locale,
 }: {
   body_text: string;
   body_html?: string;
+  locale?: string;
 }) {
-  const hasHtml = !!(body_html && body_html.trim());
+  const [renderedHtml, setRenderedHtml] = useState<string | null>(
+    body_html || null,
+  );
+  const [rendering, setRendering] = useState(false);
+
+  // If body_html arrives later (props change after a rewrite),
+  // adopt it. If it's missing, ask the backend to render one.
+  useEffect(() => {
+    if (body_html) {
+      setRenderedHtml(body_html);
+      return;
+    }
+    if (!body_text || renderedHtml || rendering) {
+      return;
+    }
+    let cancelled = false;
+    setRendering(true);
+    api
+      .renderEmailHtml(body_text, locale)
+      .then((res) => {
+        if (!cancelled) setRenderedHtml(res.body_html);
+      })
+      .catch(() => {
+        // Swallow — fallback view below will keep showing the
+        // plain text body.
+      })
+      .finally(() => {
+        if (!cancelled) setRendering(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [body_text, body_html, locale, renderedHtml, rendering]);
+
+  const hasHtml = !!renderedHtml;
   const [view, setView] = useState<"html" | "text">(hasHtml ? "html" : "text");
 
-  // If body_html appears later (e.g. after a ReAct rewrite),
-  // promote ourselves out of the plain-text fallback.
+  // When the rendered HTML finally arrives (legacy sequence
+  // round-trip), promote the view from "text" to "html" so the
+  // operator sees the new layout without an extra click.
   useEffect(() => {
-    if (hasHtml && view === "text" && !body_text) {
+    if (hasHtml && view === "text") {
       setView("html");
     }
-  }, [hasHtml, view, body_text]);
+  }, [hasHtml, view]);
 
   if (!hasHtml) {
     return (
@@ -263,14 +302,14 @@ function EmailBodyPreview({
           纯文本
         </button>
       </div>
-      {view === "html" ? (
+      {view === "html" && renderedHtml ? (
         // ``srcDoc`` sandboxes the body so the preview can never
         // execute scripts or break out into the host app. The
         // inline styles on the body are already self-contained, so
         // we don't need to inject any extra CSS.
         <iframe
           title="email-html-preview"
-          srcDoc={body_html}
+          srcDoc={renderedHtml}
           sandbox=""
           className="w-full rounded-md border bg-white"
           style={{ minHeight: 280, colorScheme: "light" }}
@@ -1211,7 +1250,11 @@ function EmailSequencePreviewSheet({
                   <p className="text-xs text-muted-foreground">已进入发送队列。</p>
                 )}
               </div>
-              <EmailBodyPreview body_text={email.body_text} body_html={email.body_html} />
+              <EmailBodyPreview
+                body_text={email.body_text}
+                body_html={email.body_html}
+                locale={String(sequence.locale || "") || undefined}
+              />
               {((email.personalization_points || []).length > 0 || (email.cultural_adaptations || []).length > 0) && (
                 <div className="grid gap-3 md:grid-cols-2">
                   {(email.personalization_points || []).length > 0 && (

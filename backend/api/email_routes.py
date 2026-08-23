@@ -402,6 +402,26 @@ async def get_email_sequence(sequence_id: str):
     return {"sequence": sequence, "messages": messages, "reply_events": reply_events}
 
 
+@router.post("/utilities/render-email-html", dependencies=[Depends(require_api_access)])
+async def render_email_html(payload: dict[str, str]):
+    """Render a plain-text email body as the HTML the recipient
+    will see.
+
+    Used by the in-product email preview to fill in ``body_html``
+    for sequences that were generated before the HTML pipeline
+    existed (so they have only ``body_text`` in storage). Without
+    this, the operator would see the old plain-text footer in the
+    preview even though the actual outbound mail has the new HTML
+    card with the clickable unsubscribe button.
+    """
+    body_text = str(payload.get("body_text", "") or "")
+    locale = payload.get("locale") or None
+    if not body_text.strip():
+        raise HTTPException(status_code=400, detail="body_text is required")
+    from emailing.html_format import render_preview_html
+    return {"body_html": render_preview_html(body_text, locale=locale)}
+
+
 @router.post("/email-scheduler/run", dependencies=[Depends(require_api_access)])
 async def run_email_scheduler():
     store = _store()
