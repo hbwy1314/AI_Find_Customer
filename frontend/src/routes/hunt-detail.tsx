@@ -2931,7 +2931,11 @@ export function HuntDetailPage() {
                               <Badge variant="secondary">#{Number(email.sequence_number)}</Badge>
                               <span className="text-sm font-medium">{String(email.subject)}</span>
                             </div>
-                            <p className="text-sm text-muted-foreground whitespace-pre-wrap">{String(email.body_text)}</p>
+                            <EmailBodyPreview
+                              body_text={String(email.body_text || "")}
+                              body_html={email.body_html}
+                              locale={String(seq.locale || "") || undefined}
+                            />
                           </div>
                         ))}
                       </div>
