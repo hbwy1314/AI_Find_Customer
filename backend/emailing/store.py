@@ -21,15 +21,6 @@ CREATE TABLE IF NOT EXISTS email_accounts (
   from_name TEXT NOT NULL,
   from_email TEXT NOT NULL,
   reply_to TEXT DEFAULT '',
-  smtp_host TEXT DEFAULT '',
-  smtp_port INTEGER DEFAULT 587,
-  smtp_username TEXT DEFAULT '',
-  smtp_secret_encrypted TEXT DEFAULT '',
-  imap_host TEXT DEFAULT '',
-  imap_port INTEGER DEFAULT 993,
-  imap_username TEXT DEFAULT '',
-  imap_secret_encrypted TEXT DEFAULT '',
-  use_tls INTEGER NOT NULL DEFAULT 1,
   status TEXT NOT NULL DEFAULT 'active',
   daily_send_limit INTEGER NOT NULL DEFAULT 50,
   hourly_send_limit INTEGER NOT NULL DEFAULT 10,
@@ -53,7 +44,8 @@ CREATE TABLE IF NOT EXISTS email_campaigns (
   min_fit_score REAL NOT NULL DEFAULT 0.6,
   min_contactability_score REAL NOT NULL DEFAULT 0.45,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (email_account_id) REFERENCES email_accounts(id)
 );
 CREATE TABLE IF NOT EXISTS lead_email_sequences (
   id TEXT PRIMARY KEY,
@@ -77,7 +69,8 @@ CREATE TABLE IF NOT EXISTS lead_email_sequences (
   last_sent_at TEXT DEFAULT '',
   next_scheduled_at TEXT DEFAULT '',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (campaign_id) REFERENCES email_campaigns(id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sequence_campaign_lead ON lead_email_sequences(campaign_id, lead_key);
 -- Per-sequence recipient pool for the "waterfall" send strategy.
@@ -101,7 +94,8 @@ CREATE TABLE IF NOT EXISTS lead_email_recipients (
   failure_reason TEXT DEFAULT '',
   is_role_based INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (sequence_id) REFERENCES lead_email_sequences(id)
 );
 CREATE INDEX IF NOT EXISTS idx_recipient_sequence ON lead_email_recipients(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_recipient_status_pos ON lead_email_recipients(sequence_id, status, position);
@@ -121,7 +115,8 @@ CREATE TABLE IF NOT EXISTS email_messages (
   thread_key TEXT DEFAULT '',
   failure_reason TEXT DEFAULT '',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (sequence_id) REFERENCES lead_email_sequences(id)
 );
 -- Not unique per (sequence_id, step_number): waterfall creates a fresh
 -- message row for each recipient attempt of the same step. The unique
@@ -147,7 +142,8 @@ CREATE TABLE IF NOT EXISTS email_test_send_log (
   ok INTEGER NOT NULL DEFAULT 1,
   failure_reason TEXT DEFAULT '',
   sent_at TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (account_id) REFERENCES email_accounts(id)
 );
 CREATE INDEX IF NOT EXISTS idx_test_send_account_sent ON email_test_send_log(account_id, sent_at);
 CREATE TABLE IF NOT EXISTS email_reply_events (
@@ -159,7 +155,8 @@ CREATE TABLE IF NOT EXISTS email_reply_events (
   snippet TEXT DEFAULT '',
   received_at TEXT NOT NULL,
   raw_ref TEXT DEFAULT '',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (sequence_id) REFERENCES lead_email_sequences(id)
 );
 CREATE INDEX IF NOT EXISTS idx_reply_sequence_id ON email_reply_events(sequence_id);
 -- Unsubscribe records. `email` is the recipient address (lowercased).
@@ -207,7 +204,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   user_agent TEXT DEFAULT '',
   expires_at TEXT NOT NULL,
   last_seen_at TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
@@ -227,11 +225,31 @@ class EmailStore:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # Enforce FOREIGN KEY constraints declared in the DDL. SQLite's
+        # default is OFF (a historical quirk — pre-3.6.19 had no FK
+        # support and the default was never flipped). Without this
+        # pragma the FK clauses in our CREATE TABLE statements are
+        # documentation, not enforcement. Turning it on means orphan
+        # inserts / cascades now actually fail / cascade, matching the
+        # intent of every "→ table.column" comment in the schema.
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(_DDL)
+            # Enforce FK constraints at startup. If an older DB has
+            # orphan rows (e.g. a sequence_id was deleted without
+            # cascading to email_messages), the check raises and we
+            # log it — much better than silently inserting more
+            # orphans on top. The check is cheap (one full-table scan
+            # per table, ~ms on our sizes).
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                logger.warning(
+                    "FK violations on startup: %s — fix with cleanup_migration",
+                    [tuple(v) for v in violations],
+                )
             # Migration: the legacy DDL had `CREATE UNIQUE INDEX` on
             # `email_messages(sequence_id, step_number)`. The waterfall
             # feature intentionally creates multiple rows per (sequence,
@@ -272,51 +290,50 @@ class EmailStore:
             # HTML body for the recipient's mail client. Older rows
             # stay empty — we re-render on demand from body_text.
             self._ensure_column(conn, "email_messages", "body_html", "TEXT NOT NULL DEFAULT ''")
+            # SMTP/IMAP were removed in f3dcaca (route all email
+            # through Microsoft Graph). The columns were left in place
+            # for back-compat with the old `cols` whitelist in
+            # `upsert_account`, but with Graph-only that whitelist
+            # reads them out of thin air. Drop the 8 columns so the
+            # schema reflects what the app actually uses.
+            self._drop_smtp_imap_columns(conn)
             # Ensure the singleton app_bootstrap row exists
             conn.execute(
                 "INSERT OR IGNORE INTO app_bootstrap (id, initialized, last_admin_at) VALUES (1, 0, '')"
             )
-        # Idempotent migration: move any pre-existing plaintext secrets into the
-        # encrypted blob so SMTP/IMAP keep working after the encryption column is added.
-        self._migrate_plaintext_secrets_to_ciphertext()
 
-    def _migrate_plaintext_secrets_to_ciphertext(self) -> None:
-        """One-shot migration: any row that still has plaintext
-        `smtp_secret_encrypted` / `imap_secret_encrypted` and an empty
-        `secrets_ciphertext` is migrated in-place.
+    def _drop_smtp_imap_columns(self, conn: sqlite3.Connection) -> None:
+        """Drop the legacy SMTP/IMAP columns from `email_accounts`.
+
+        The columns were orphaned when f3dcaca switched the entire
+        codebase to Graph-only. We can't keep them around because
+        `upsert_account` reads columns by name from a whitelist —
+        if the schema has them, we'd be writing empty values for
+        accounts that never had real SMTP/IMAP creds in the first
+        place (the post-f3dcaca accounts).
+
+        Idempotent: skips columns that don't exist. SQLite DROP
+        COLUMN requires 3.35+; this is a no-op on older DBs which
+        will just hit the schema-mismatch error path on next
+        `upsert_account`. We log + ignore so init_db stays
+        forward-compatible.
         """
-        try:
-            with self._connect() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT id, smtp_secret_encrypted, imap_secret_encrypted, secrets_ciphertext
-                    FROM email_accounts
-                    WHERE (smtp_secret_encrypted != '' OR imap_secret_encrypted != '')
-                      AND (secrets_ciphertext IS NULL OR length(secrets_ciphertext) = 0)
-                    """
-                ).fetchall()
-                for row in rows:
-                    blob = secret_cipher.encrypt_dict(
-                        {
-                            "smtp_secret": str(row["smtp_secret_encrypted"] or ""),
-                            "imap_secret": str(row["imap_secret_encrypted"] or ""),
-                        }
-                    )
-                    conn.execute(
-                        """
-                        UPDATE email_accounts
-                        SET secrets_ciphertext = ?,
-                            smtp_secret_encrypted = '',
-                            imap_secret_encrypted = '',
-                            updated_at = updated_at
-                        WHERE id = ?
-                        """,
-                        (blob, row["id"]),
-                    )
-                if rows:
-                    logger.info("Migrated %d email_accounts rows to encrypted secrets_ciphertext", len(rows))
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to migrate plaintext secrets to encrypted ciphertext")
+        legacy = [
+            "smtp_host", "smtp_port", "smtp_username", "smtp_secret_encrypted",
+            "imap_host", "imap_port", "imap_username", "imap_secret_encrypted",
+            "use_tls",
+        ]
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(email_accounts)").fetchall()
+        }
+        for col in legacy:
+            if col in existing:
+                try:
+                    conn.execute(f"ALTER TABLE email_accounts DROP COLUMN {col}")
+                except sqlite3.OperationalError as exc:
+                    # SQLite < 3.35 can't drop columns. Log and move on.
+                    logger.warning("Cannot drop legacy column %s: %s", col, exc)
 
     def _ensure_column(self, conn: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
         columns = {
@@ -329,9 +346,7 @@ class EmailStore:
     def upsert_account(self, payload: dict[str, Any]) -> None:
         cols = [
             "id", "provider_type", "from_name", "from_email", "reply_to",
-            "smtp_host", "smtp_port", "smtp_username", "smtp_secret_encrypted",
-            "imap_host", "imap_port", "imap_username", "imap_secret_encrypted",
-            "use_tls", "status", "daily_send_limit", "hourly_send_limit",
+            "status", "daily_send_limit", "hourly_send_limit",
             "last_test_at", "created_at", "updated_at",
             "secrets_ciphertext", "graph_tenant_id", "graph_user_principal_name",
             "sort_order",

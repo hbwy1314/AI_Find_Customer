@@ -26,7 +26,6 @@ import html as _html
 import re
 from typing import Optional
 
-
 # Placeholder URL that the in-product preview renders. At send time
 # the scheduler (``emailing.scheduler.run_scheduler_once``) detects
 # this exact string in the stored body_html and replaces it with the

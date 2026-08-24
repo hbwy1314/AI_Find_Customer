@@ -7,9 +7,10 @@ import os as _os
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
+from auth.security import require_api_access
 from automation.notifier import send_feishu_text
 from config.settings import get_settings
 from config.settings_store import is_configured, read_settings, update_settings
@@ -52,8 +53,6 @@ class SettingsPayload(BaseModel):
     email_from_name: str = ""
     email_from_address: str = ""
     email_reply_to: str = ""
-    email_smtp_last_test_at: str = ""
-    email_imap_last_test_at: str = ""
     email_sequence_enabled: str = ""
     email_auto_send_enabled: str = ""
     email_step1_delay_days: str = ""
@@ -154,7 +153,7 @@ def _now_iso() -> str:
 
 
 # ── Settings routes ───────────────────────────────────────────────────────────
-@router.get("", response_model=SettingsResponse)
+@router.get("", response_model=SettingsResponse, dependencies=[Depends(require_api_access)])
 async def get_settings_api():
     """Return current settings with sensitive values partially masked."""
     _ensure_settings_api_enabled()
@@ -171,7 +170,7 @@ async def get_settings_api():
     )
 
 
-@router.post("", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_api_access)])
 async def save_settings(payload: SettingsPayload):
     """Save settings to the user's .env file. Empty strings are skipped."""
     _ensure_settings_api_enabled()
@@ -207,8 +206,6 @@ async def save_settings(payload: SettingsPayload):
         "email_from_name": "EMAIL_FROM_NAME",
         "email_from_address": "EMAIL_FROM_ADDRESS",
         "email_reply_to": "EMAIL_REPLY_TO",
-        "email_smtp_last_test_at": "EMAIL_SMTP_LAST_TEST_AT",
-        "email_imap_last_test_at": "EMAIL_IMAP_LAST_TEST_AT",
         "email_sequence_enabled": "EMAIL_SEQUENCE_ENABLED",
         "email_auto_send_enabled": "EMAIL_AUTO_SEND_ENABLED",
         "email_step1_delay_days": "EMAIL_STEP1_DELAY_DAYS",
@@ -293,7 +290,7 @@ async def save_settings(payload: SettingsPayload):
     get_settings.cache_clear()
 
 
-@router.post("/email/graph-test", response_model=GraphTestResponse)
+@router.post("/email/graph-test", response_model=GraphTestResponse, dependencies=[Depends(require_api_access)])
 async def test_graph_settings():
     """Test Microsoft Graph connectivity using the current saved settings.
 
@@ -338,7 +335,7 @@ async def test_graph_settings():
     )
 
 
-@router.post("/automation/feishu-test", response_model=FeishuTestResponse)
+@router.post("/automation/feishu-test", response_model=FeishuTestResponse, dependencies=[Depends(require_api_access)])
 async def test_automation_feishu_webhook():
     """Send a test message to the configured Feishu webhook."""
     get_settings.cache_clear()
@@ -379,25 +376,25 @@ def _license_removed_response() -> LicenseStatusResponse:
     )
 
 
-@router.get("/license/status", response_model=LicenseStatusResponse)
+@router.get("/license/status", response_model=LicenseStatusResponse, dependencies=[Depends(require_api_access)])
 async def license_status():
     """Return a compatibility response after license verification removal."""
     return _license_removed_response()
 
 
-@router.post("/license/activate", response_model=LicenseStatusResponse)
+@router.post("/license/activate", response_model=LicenseStatusResponse, dependencies=[Depends(require_api_access)])
 async def activate_license(req: ActivateRequest):
     """Keep the old activation endpoint stable after license removal."""
     return _license_removed_response()
 
 
-@router.post("/license/deactivate", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/license/deactivate", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_api_access)])
 async def deactivate_license():
     """Keep the old deactivation endpoint stable after license removal."""
     return None
 
 
-@router.post("/license/save-token", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/license/save-token", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_api_access)])
 async def save_license_token(req: SaveTokenRequest):
     """Accept legacy save-token calls as a no-op after license removal."""
     return None

@@ -12,9 +12,9 @@ from __future__ import annotations
 import asyncio
 import email
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from email.header import decode_header, make_header
-from email.utils import getaddresses, parsedate_to_datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
 
 from api.hunt_store import load_hunt, save_hunt

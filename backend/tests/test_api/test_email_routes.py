@@ -491,6 +491,24 @@ def test_start_campaign_requires_smtp_configuration(monkeypatch, tmp_path):
 
     store = EmailStore(str(tmp_path / "email.db"))
     store.init_db()
+    # FK requires the account row to exist before the campaign.
+    store.upsert_account({
+        "id": "default",
+        "provider_type": "graph",
+        "from_name": "Sales",
+        "from_email": "sales@test.com",
+        "reply_to": "",
+        "status": "active",
+        "daily_send_limit": 100,
+        "hourly_send_limit": 10,
+        "last_test_at": "",
+        "created_at": "2026-04-04T00:00:00Z",
+        "updated_at": "2026-04-04T00:00:00Z",
+        "secrets_ciphertext": b"",
+        "graph_tenant_id": "",
+        "graph_user_principal_name": "",
+        "sort_order": 0,
+    })
     store.create_campaign({
         "id": "cmp_1",
         "hunt_id": "hunt_1",
@@ -545,6 +563,24 @@ def test_start_campaign_requires_smtp_test_success(monkeypatch, tmp_path):
 
     store = EmailStore(str(tmp_path / "email.db"))
     store.init_db()
+    # FK requires the account row to exist before the campaign.
+    store.upsert_account({
+        "id": "default",
+        "provider_type": "graph",
+        "from_name": "Sales",
+        "from_email": "sales@example.com",
+        "reply_to": "",
+        "status": "active",
+        "daily_send_limit": 100,
+        "hourly_send_limit": 10,
+        "last_test_at": "",
+        "created_at": "2026-04-04T00:00:00Z",
+        "updated_at": "2026-04-04T00:00:00Z",
+        "secrets_ciphertext": b"",
+        "graph_tenant_id": "tenant-1",
+        "graph_user_principal_name": "sales@example.com",
+        "sort_order": 0,
+    })
     store.create_campaign({
         "id": "cmp_2",
         "hunt_id": "hunt_1",

@@ -104,6 +104,23 @@ def test_message_lifecycle(tmp_path: Path):
     db_path = tmp_path / "email.db"
     store = EmailStore(str(db_path))
     store.init_db()
+    store.upsert_account({
+        "id": "acct_1",
+        "provider_type": "graph",
+        "from_name": "Sales",
+        "from_email": "sales@test.com",
+        "reply_to": "",
+        "status": "active",
+        "daily_send_limit": 100,
+        "hourly_send_limit": 10,
+        "last_test_at": "",
+        "created_at": "2026-08-14T00:00:00+00:00",
+        "updated_at": "2026-08-14T00:00:00+00:00",
+        "secrets_ciphertext": b"",
+        "graph_tenant_id": "",
+        "graph_user_principal_name": "",
+        "sort_order": 0,
+    })
     store.create_campaign({
         "id": "cmp_1",
         "hunt_id": "hunt_1",
@@ -173,6 +190,23 @@ def test_template_performance_aggregation(tmp_path: Path):
     db_path = tmp_path / "email.db"
     store = EmailStore(str(db_path))
     store.init_db()
+    store.upsert_account({
+        "id": "acct_1",
+        "provider_type": "graph",
+        "from_name": "Sales",
+        "from_email": "sales@test.com",
+        "reply_to": "",
+        "status": "active",
+        "daily_send_limit": 100,
+        "hourly_send_limit": 10,
+        "last_test_at": "",
+        "created_at": "2026-08-14T00:00:00+00:00",
+        "updated_at": "2026-08-14T00:00:00+00:00",
+        "secrets_ciphertext": b"",
+        "graph_tenant_id": "",
+        "graph_user_principal_name": "",
+        "sort_order": 0,
+    })
     store.create_campaign({
         "id": "cmp_tpl",
         "hunt_id": "hunt_tpl",
@@ -248,6 +282,23 @@ def test_template_performance_uses_custom_thresholds(tmp_path: Path):
     db_path = tmp_path / "email.db"
     store = EmailStore(str(db_path))
     store.init_db()
+    store.upsert_account({
+        "id": "acct_1",
+        "provider_type": "graph",
+        "from_name": "Sales",
+        "from_email": "sales@test.com",
+        "reply_to": "",
+        "status": "active",
+        "daily_send_limit": 100,
+        "hourly_send_limit": 10,
+        "last_test_at": "",
+        "created_at": "2026-08-14T00:00:00+00:00",
+        "updated_at": "2026-08-14T00:00:00+00:00",
+        "secrets_ciphertext": b"",
+        "graph_tenant_id": "",
+        "graph_user_principal_name": "",
+        "sort_order": 0,
+    })
     store.create_campaign({
         "id": "cmp_custom",
         "hunt_id": "hunt_custom",
@@ -309,6 +360,25 @@ def test_test_send_log_counts_toward_daily_quota(tmp_path: Path):
     db_path = tmp_path / "email.db"
     store = EmailStore(str(db_path))
     store.init_db()
+    # FK requires the account row to exist before any email_test_send_log
+    # rows reference it.
+    store.upsert_account({
+        "id": "acct_a",
+        "provider_type": "graph",
+        "from_name": "Sales",
+        "from_email": "sales@test.com",
+        "reply_to": "",
+        "status": "active",
+        "daily_send_limit": 100,
+        "hourly_send_limit": 10,
+        "last_test_at": "",
+        "created_at": "2026-08-14T00:00:00+00:00",
+        "updated_at": "2026-08-14T00:00:00+00:00",
+        "secrets_ciphertext": b"",
+        "graph_tenant_id": "",
+        "graph_user_principal_name": "",
+        "sort_order": 0,
+    })
     now_iso = "2026-08-14T10:00:00+00:00"
     # Empty to start with.
     assert store.count_sent_today_for_account("acct_a", now_iso=now_iso) == 0

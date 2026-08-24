@@ -143,8 +143,6 @@ class Settings(BaseSettings):
     email_from_name: str = ""
     email_from_address: str = ""
     email_reply_to: str = ""
-    email_smtp_last_test_at: str = ""
-    email_imap_last_test_at: str = ""
     email_sequence_enabled: bool = False
     email_auto_send_enabled: bool = False
     email_step1_delay_days: int = 0

@@ -15,8 +15,6 @@ def _settings(**overrides):
     base = {
         "email_provider_type": "graph",
         "email_from_address": "sales@example.com",
-        "email_smtp_last_test_at": "",
-        "email_imap_last_test_at": "",
         "graph_tenant_id": "tenant-1",
         "graph_client_id": "client-1",
         "graph_client_secret": "secret-1",

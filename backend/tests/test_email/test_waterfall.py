@@ -48,12 +48,10 @@ def _seed_full_setup(
     with store._connect() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO email_accounts
-            (id, provider_type, from_name, from_email, reply_to, smtp_host, smtp_port,
-             smtp_username, smtp_secret_encrypted, imap_host, imap_port, imap_username,
-             imap_secret_encrypted, use_tls, status, daily_send_limit, hourly_send_limit,
-             last_test_at, created_at, updated_at)
-            VALUES (?, 'smtp', 'Sales', 'sales@test.com', '', 'smtp.test.com', 587,
-                    'u', 'pw', '', 993, '', '', 1, 'active', 100, 100, '', ?, ?)""",
+            (id, provider_type, from_name, from_email, reply_to, status,
+             daily_send_limit, hourly_send_limit, last_test_at, created_at, updated_at)
+            VALUES (?, 'graph', 'Sales', 'sales@test.com', '', 'active',
+                    100, 100, '', ?, ?)""",
             (acc_id, now, now),
         )
         conn.execute(

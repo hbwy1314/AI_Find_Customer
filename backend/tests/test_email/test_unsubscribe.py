@@ -21,20 +21,15 @@ from emailing.unsubscribe import (
 
 
 @pytest.fixture
-def store() -> EmailStore:
-    # This fixture is shared with the API route tests below. Those
-    # tests build a real FastAPI app via `create_app()` which reads
-    # `get_settings().email_db_path` — so the fixture and the app
-    # MUST point at the same DB file, or the route's writes won't
-    # be visible to the test's `store` reads. We deliberately
-    # tolerate writing to the dev DB here because none of the route
-    # tests in this file fake `provider_message_id`; the only stub
-    # data (`x` / `y`) lives in the pure-function token tests which
-    # never touch this fixture. If that ever changes, the right
-    # answer is to make the API tests swap `get_settings` via
-    # monkeypatch to a tmp DB, not to break the shared-state contract
-    # silently.
-    s = EmailStore(get_settings().email_db_path)
+def store(tmp_path) -> EmailStore:
+    # Use a per-test tmp DB. The route tests below build a real
+    # FastAPI app via `create_app()` which reads
+    # `get_settings().email_db_path` — so they monkeypatch the
+    # `get_settings` symbol that `create_app` resolves against to
+    # also point at this same tmp DB. This gives every test
+    # isolation without breaking the shared-state contract that the
+    # API tests rely on.
+    s = EmailStore(str(tmp_path / "email.db"))
     s.init_db()
     return s
 
@@ -102,7 +97,28 @@ def test_is_unsubscribed_campaign_only_blocks_that_campaign(store: EmailStore) -
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client(store: EmailStore, monkeypatch) -> TestClient:
+    # `create_app()` reads `get_settings().email_db_path` to wire up
+    # the FastAPI dependency that hands the email store to route
+    # handlers. We need the route's writes to land in the same DB
+    # the test's `store` is reading from, so patch the settings the
+    # app actually resolves against. The route handlers also call
+    # `get_email_store()` which is a process-wide singleton — reset
+    # it so the next call picks up our patched settings.
+    import config.settings as settings_mod
+    import emailing.store as email_store_mod
+    fake = type("S", (), {
+        "email_db_path": store.db_path,
+        "email_reply_check_interval_seconds": 180,
+        "email_reply_detection_enabled": False,
+        "email_provider_type": "graph",
+        "graph_tenant_id": "",
+        "graph_client_id": "",
+        "graph_client_secret": "",
+        "graph_mailbox_upn": "",
+    })()
+    monkeypatch.setattr(settings_mod, "get_settings", lambda: fake)
+    monkeypatch.setattr(email_store_mod, "_email_store_singleton", None)
     return TestClient(create_app())
 
 
@@ -179,12 +195,11 @@ async def test_scheduler_skips_unsubscribed_recipient(store: EmailStore) -> None
         with store._connect() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO email_accounts
-                (id, provider_type, from_name, from_email, reply_to, smtp_host, smtp_port,
-                 smtp_username, smtp_secret_encrypted, imap_host, imap_port, imap_username,
-                 imap_secret_encrypted, use_tls, status, daily_send_limit, hourly_send_limit,
-                 last_test_at, created_at, updated_at)
-                VALUES (?, 'smtp', 'Sales', 'sales@test.com', '', 'smtp.test.com', 587,
-                        'u', 'pw', '', 993, '', '', 1, 'active', 100, 100, '', ?, ?)""",
+                (id, provider_type, from_name, from_email, reply_to, status,
+                 daily_send_limit, hourly_send_limit, last_test_at,
+                 created_at, updated_at)
+                VALUES (?, 'graph', 'Sales', 'sales@test.com', '', 'active',
+                        100, 100, '', ?, ?)""",
                 (acc_id, now, now),
             )
             conn.execute(
