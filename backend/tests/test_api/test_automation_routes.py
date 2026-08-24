@@ -181,6 +181,211 @@ def test_create_automation_job_from_hunt(monkeypatch):
     assert missing.status_code == 404
 
 
+def test_create_automation_job_from_hunt_carries_prior_leads(monkeypatch):
+    """Regression for the "提交后续任务 = 重新从 0 挖" bug.
+
+    Before this fix, `create_automation_job_from_hunt` only carried
+    the *config* fields (website_url, keywords, ...) through to the
+    new job, but dropped the prior hunt's `result.leads`. The consumer
+    then created a fresh `HuntRequest` with `leads=[]`, so the operator's
+    "continue mining" effectively discarded all the work the previous
+    hunt had done. The fix forwards the prior lead dicts as
+    `existing_leads` so the new hunt's initial state starts from the
+    real lead count and the lead-extract agent's dedup baseline is
+    correct.
+    """
+    app = create_app()
+    client = TestClient(app)
+
+    queued_payloads: list[dict] = []
+
+    class FakeQueue:
+        def init_db(self):
+            return None
+
+        def enqueue(self, payload, now_iso):
+            queued_payloads.append(payload)
+            return "job-x"
+
+        def get(self, job_id):
+            return {
+                "id": "job-x",
+                "status": "queued",
+                "created_at": "2026-04-05T00:00:00+00:00",
+                "updated_at": "2026-04-05T00:00:00+00:00",
+                "started_at": "",
+                "finished_at": "",
+                "attempt_count": 0,
+                "last_error": "",
+                "last_hunt_id": "",
+                "payload": queued_payloads[-1] if queued_payloads else {},
+            }
+
+    prior_leads = [
+        {
+            "company_name": "ACME Vape",
+            "website": "https://acme.example.com/",
+            "emails": ["sales@acme.example.com"],
+            "fit_score": 0.9,
+        },
+        {
+            "company_name": "Beta Wholesale",
+            "website": "https://beta.example.com/",
+            "emails": ["hello@beta.example.com"],
+            "fit_score": 0.7,
+        },
+    ]
+
+    monkeypatch.setattr("api.automation_routes._queue", lambda: FakeQueue())
+    monkeypatch.setattr(
+        "api.automation_routes.load_hunt",
+        lambda hunt_id: {
+            "payload": {
+                "website_url": "https://www.gdushun.com/",
+                "product_keywords": ["micro switch"],
+                "target_customer_profile": "Distributors",
+                "target_regions": ["United States"],
+            },
+            # This is the completed-hunt state on disk; the bug
+            # was that we never read this even though we had it.
+            "result": {
+                "leads": prior_leads,
+                "hunt_round": 3,
+            },
+        } if hunt_id == "hunt-prior" else None,
+    )
+
+    resp = client.post("/api/v1/automation/jobs/from-hunt/hunt-prior", json={
+        "target_lead_count": 300,
+        "max_rounds": 5,
+        "min_new_leads_threshold": 3,
+        "enable_email_craft": False,
+        "email_template_examples": [],
+        "email_template_notes": "",
+    })
+    assert resp.status_code == 200
+
+    # The new job's payload MUST carry the prior lead dicts so the
+    # consumer can seed them into the new hunt's initial state.
+    assert queued_payloads, "enqueue was never called"
+    assert "existing_leads" in queued_payloads[0]
+    assert queued_payloads[0]["existing_leads"] == prior_leads
+    # Sanity: the full lead dict (with scoring fields) is preserved,
+    # not just email addresses.
+    assert queued_payloads[0]["existing_leads"][0]["fit_score"] == 0.9
+
+    # If the prior hunt has no leads yet (just started), we still
+    # need an empty list — not `None` or a missing key — so the
+    # downstream Pydantic validator doesn't choke.
+    queued_payloads.clear()
+    monkeypatch.setattr(
+        "api.automation_routes.load_hunt",
+        lambda hunt_id: {
+            "payload": {"website_url": "https://x.example.com/"},
+            "result": {},  # no leads yet
+        } if hunt_id == "hunt-empty" else None,
+    )
+    resp2 = client.post("/api/v1/automation/jobs/from-hunt/hunt-empty", json={
+        "target_lead_count": 50, "max_rounds": 3, "min_new_leads_threshold": 5,
+        "enable_email_craft": False, "email_template_examples": [], "email_template_notes": "",
+    })
+    assert resp2.status_code == 200
+    assert queued_payloads[0]["existing_leads"] == []
+
+
+def test_create_automation_job_from_hunt_falls_back_to_top_level_fields(monkeypatch):
+    """Regression for "Hunt has no reusable payload" 422 on legacy hunts.
+
+    Old hunts written by `_initialize_hunt` only set top-level fields
+    (`hunt['website_url']`, `hunt['product_keywords']`, ...) without
+    nesting them under a `payload` key. The previous implementation
+    looked at `hunt.get('payload')` exclusively, so every legacy hunt
+    422'd on resume — even hunts that clearly had a valid config. The
+    fix falls back to top-level fields plus the LangGraph state under
+    `hunt['result']`.
+    """
+    app = create_app()
+    client = TestClient(app)
+
+    queued_payloads: list[dict] = []
+
+    class FakeQueue:
+        def init_db(self):
+            return None
+
+        def enqueue(self, payload, now_iso):
+            queued_payloads.append(payload)
+            return "job-fb"
+
+        def get(self, job_id):
+            return {
+                "id": "job-fb",
+                "status": "queued",
+                "created_at": "2026-08-24T00:00:00+00:00",
+                "updated_at": "2026-08-24T00:00:00+00:00",
+                "started_at": "",
+                "finished_at": "",
+                "attempt_count": 0,
+                "last_error": "",
+                "last_hunt_id": "",
+                "payload": queued_payloads[-1] if queued_payloads else {},
+            }
+
+    monkeypatch.setattr("api.automation_routes._queue", lambda: FakeQueue())
+    # Legacy layout: top-level fields, NO `payload` key, plus a
+    # `result` with the LangGraph state.
+    monkeypatch.setattr(
+        "api.automation_routes.load_hunt",
+        lambda hunt_id: {
+            "website_url": "https://romioecig.com/",
+            "product_keywords": ["vape", "e-cigarette"],
+            "target_customer_profile": "wholesale distributors",
+            "target_regions": ["United Kingdom"],
+            "result": {
+                "description": "Target UK-based E-cigarette Wholesale Distributors",
+                "leads": [
+                    {"company_name": "ACME", "website": "https://acme.example.com/"}
+                ],
+            },
+        } if hunt_id == "hunt-legacy" else None,
+    )
+
+    resp = client.post("/api/v1/automation/jobs/from-hunt/hunt-legacy", json={
+        "target_lead_count": 250, "max_rounds": 5, "min_new_leads_threshold": 3,
+        "enable_email_craft": False, "email_template_examples": [], "email_template_notes": "",
+    })
+    assert resp.status_code == 200
+    assert queued_payloads, "enqueue was never called"
+
+    p = queued_payloads[0]
+    # Top-level config fields were carried through, not 422'd.
+    assert p["website_url"] == "https://romioecig.com/"
+    assert p["product_keywords"] == ["vape", "e-cigarette"]
+    assert p["target_customer_profile"] == "wholesale distributors"
+    assert p["target_regions"] == ["United Kingdom"]
+    # The result-layer description filled in the missing key.
+    assert p["description"] == "Target UK-based E-cigarette Wholesale Distributors"
+    # And the result-layer leads were carried through as before.
+    assert p["existing_leads"] == [
+        {"company_name": "ACME", "website": "https://acme.example.com/"}
+    ]
+
+    # And the truly-empty case (no payload, no top-level fields, no
+    # result) still gets a clean 422 — the fallback must not silently
+    # enqueue a no-op job.
+    queued_payloads.clear()
+    monkeypatch.setattr(
+        "api.automation_routes.load_hunt",
+        lambda hunt_id: {"status": "completed"} if hunt_id == "hunt-bare" else None,
+    )
+    resp_empty = client.post("/api/v1/automation/jobs/from-hunt/hunt-bare", json={
+        "target_lead_count": 50, "max_rounds": 3, "min_new_leads_threshold": 5,
+        "enable_email_craft": False, "email_template_examples": [], "email_template_notes": "",
+    })
+    assert resp_empty.status_code == 422
+    assert queued_payloads == []
+
+
 def test_cancel_and_retry_automation_job(monkeypatch):
     app = create_app()
     client = TestClient(app)

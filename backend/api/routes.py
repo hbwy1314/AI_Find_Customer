@@ -121,6 +121,15 @@ class HuntRequest(BaseModel):
     email_template_examples: list[str] = Field(default_factory=list, description="Optional historical outreach emails or template samples from the user")
     email_template_notes: str = Field(default="", description="Optional notes about preferred style, offer, or constraints")
     template_seed: dict[str, Any] | None = None
+    # Pre-seeded leads for "continue mining" / "提交后续任务" flow. When
+    # non-empty, the consumer of this request is expected to dedup new
+    # leads against this list (final safety net already does so) and to
+    # populate `initial_state['leads']` so the next round starts from
+    # the prior lead count rather than zero. Empty for fresh hunts.
+    existing_leads: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Pre-seeded leads to merge with new results (continue-mining flow).",
+    )
 
 
 class ResumeRequest(BaseModel):
@@ -619,10 +628,21 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
         "seen_urls": [],
         "matched_platforms": [],
         "keyword_search_stats": {},
-        "leads": [],
+        # Seeded leads (continue-mining flow). `lead_extract_agent` reads
+        # `state.get("leads", [])` as the dedup baseline, so non-empty
+        # here is what makes a "提交后续任务" actually continue from the
+        # previous hunt's lead set instead of starting at zero. The
+        # agent's own final-safety-net dedup still runs at the end of
+        # each round; this just makes round-over-round lead counts
+        # sensible and prevents the operator from having to re-collect
+        # leads they already have.
+        "leads": list(request.existing_leads),
         "email_sequences": [],
         "hunt_round": 1,
-        "prev_round_lead_count": 0,
+        # prev_round_lead_count must be seeded too, otherwise the
+        # evaluator would log "new this round: N - 0 = N" every round
+        # (huge number) instead of just the deltas.
+        "prev_round_lead_count": len(request.existing_leads),
         "round_feedback": None,
         "current_stage": "start",
         "hunt_id": hunt_id,
@@ -1100,7 +1120,7 @@ def _initialize_hunt(request: HuntRequest) -> tuple[str, HuntRequest]:
         "result": None,
         "current_stage": None,
         "hunt_round": 0,
-        "leads_count": 0,
+        "leads_count": len(request.existing_leads),
         "email_sequences_count": 0,
         "error": None,
         "created_at": now_iso(),
@@ -1110,6 +1130,13 @@ def _initialize_hunt(request: HuntRequest) -> tuple[str, HuntRequest]:
         "target_regions": request.target_regions,
         "email_template_examples": request.email_template_examples,
         "email_template_notes": request.email_template_notes,
+        # Surface the seed leads so /api/hunts/{id}/result and the
+        # frontend can show them immediately, before the graph runs
+        # its first round. The actual LangGraph state still uses
+        # `request.existing_leads` as its `leads` baseline (see
+        # _run_hunt's initial_state) — this dict entry is for the
+        # operator's UI.
+        "existing_leads": list(request.existing_leads),
     }
     save_hunt(hunt_id, _hunts[hunt_id])
     prepared_request = request.model_copy(

@@ -249,9 +249,62 @@ async def create_automation_job_from_hunt(hunt_id: str, request: AutomationJobCo
     if not hunt:
         raise HTTPException(status_code=404, detail="Hunt not found")
 
-    payload = hunt.get("payload") if isinstance(hunt.get("payload"), dict) else {}
-    if not payload:
+    # The hunt dict's layout depends on which writer saved it:
+    #   - older / in-process hunts have the config fields spread at
+    #     the top level (hunt["website_url"], hunt["product_keywords"],
+    #     ...) because `_initialize_hunt` writes them there.
+    #   - newer hunts (or hunts that have been re-loaded from a
+    #     LangGraph result dict) have the full state under
+    #     hunt["result"], which is the "live" state during execution.
+    # Both layers are present after a hunt completes; we just need to
+    # look in both places. The previous code only looked at
+    # hunt["payload"] which was never written by either path — every
+    # "提交后续任务" therefore 422'd with "Hunt has no reusable
+    # payload" even when the hunt clearly had a full state to resume
+    # from.
+    payload_obj = hunt.get("payload")
+    if not isinstance(payload_obj, dict) or not payload_obj:
+        # Fall back to top-level fields (set by _initialize_hunt).
+        # These are the only fields _initialize_hunt writes at the
+        # top level; everything else lives under hunt["result"].
+        result_obj = hunt.get("result") if isinstance(hunt.get("result"), dict) else {}
+        payload_obj = {
+            "website_url": str(hunt.get("website_url", "") or result_obj.get("website_url", "") or ""),
+            "description": str(result_obj.get("description", "") or ""),
+            "product_keywords": list(hunt.get("product_keywords") or result_obj.get("product_keywords") or []),
+            "target_customer_profile": str(
+                hunt.get("target_customer_profile", "")
+                or result_obj.get("target_customer_profile", "")
+                or ""
+            ),
+            "target_regions": list(hunt.get("target_regions") or result_obj.get("target_regions") or []),
+            "uploaded_file_ids": list(result_obj.get("uploaded_files") or []),
+        }
+    payload = payload_obj
+    # Final guard: if we still don't have a website_url, description, or
+    # at least one keyword, the hunt is genuinely empty and the user
+    # would be staring at a blank form after re-queueing.
+    if not (payload.get("website_url") or payload.get("description") or payload.get("product_keywords")):
         raise HTTPException(status_code=422, detail="Hunt has no reusable payload")
+
+    # Forward the prior hunt's leads so the new hunt's initial state
+    # starts from the existing lead set rather than zero. Without this,
+    # the operator's "提交后续任务" effectively discarded all the work
+    # the previous hunt had already done: the consumer would create a
+    # brand-new HuntRequest with `leads=[]`, the lead-extract agent
+    # would re-search and re-collect companies the operator already
+    # had, and the final-safety-net dedup would silently prune them
+    # back out — so the operator saw no progress and a quota that
+    # didn't move.
+    #
+    # We carry the *full* lead dicts (with emails / decision_makers /
+    # fit_score / etc.) because the operator's UI renders them in the
+    # hunt detail and the email-craft agent still wants the scoring
+    # fields. The lead-extract agent's final-safety-net dedup keys on
+    # website domain (a108726) so there's no risk of dupes creeping
+    # in even if the user has tampered with the seed list.
+    prior_result = hunt.get("result") if isinstance(hunt.get("result"), dict) else {}
+    prior_leads = list(prior_result.get("leads") or [])
 
     next_payload = {
         "website_url": str(payload.get("website_url", "") or ""),
@@ -266,6 +319,9 @@ async def create_automation_job_from_hunt(hunt_id: str, request: AutomationJobCo
         "enable_email_craft": bool(request.enable_email_craft),
         "email_template_examples": list(request.email_template_examples),
         "email_template_notes": str(request.email_template_notes or ""),
+        # Carry the prior leads through. Consumer creates a fresh
+        # hunt with this as `existing_leads`; see HuntRequest.
+        "existing_leads": prior_leads,
     }
 
     queue = _queue()
