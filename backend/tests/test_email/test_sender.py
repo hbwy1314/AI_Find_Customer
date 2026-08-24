@@ -236,3 +236,165 @@ async def test_graph_send_falls_back_to_sendmail_when_two_step_send_fails(monkey
     # The provider_message_id stays empty in the sendMail path (no id back).
     assert result["provider_message_id"] == ""
     assert result["provider"] == "graph"
+
+
+# ---------------------------------------------------------------------------
+# Stub-guard: refuse to accept placeholder provider_message_id values.
+#
+# Background: a previous version of the scheduler hard-coded
+# `provider_message_id="x" / thread_key="y"` and wrote `status='sent'`
+# rows that never went through Graph. That polluted the daily-quota
+# counter and reply detection. The guard below is the last line of
+# defence — if any future code path returns a known stub token, we
+# refuse to mark the send successful so the operator can see a clean
+# failure instead of a fake success.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_send_email_rejects_stub_provider_message_id(monkeypatch):
+    """If `send_via_graph` ever returns `provider_message_id="x"` (or
+    any other known stub token), `send_email` flips the result to
+    `ok=False` with a clear error type so the scheduler doesn't mark
+    the row as sent.
+    """
+    account = {
+        "provider_type": "graph",
+        "from_name": "",
+        "from_email": "sales@example.com",
+        "reply_to": "",
+    }
+
+    async def fake_via_graph(*args, **kwargs):
+        return {
+            "ok": True,
+            "provider": "graph",
+            "provider_message_id": "x",  # the bad stub value
+            "thread_key": "y",
+            "sent_at": "2026-08-24T10:00:00+00:00",
+            "error": "",
+            "error_type": "",
+        }
+
+    # `send_email` does `from emailing.graph_client import send_via_graph`
+    # lazily, so patch the symbol on the graph_client module — that's the
+    # one the function will resolve at call time.
+    monkeypatch.setattr("emailing.graph_client.send_via_graph", fake_via_graph)
+
+    result = await send_email(
+        account,
+        to_email="buyer@example.com",
+        subject="Hi",
+        body_text="Hello",
+    )
+    assert result["ok"] is False, f"stub pm_id should be rejected; got: {result}"
+    assert result["provider_message_id"] == ""
+    assert result["error_type"] == "permanent_failure"
+    assert "stub_provider_message_id" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_send_email_rejects_stub_thread_key(monkeypatch):
+    """Symmetric guard for `thread_key` — same stub tokens, same response.
+    `thread_key` doesn't drive quota but reply-detector keys on it, so a
+    stub value would silently break the conversation linkage.
+    """
+    account = {
+        "provider_type": "graph",
+        "from_name": "",
+        "from_email": "sales@example.com",
+        "reply_to": "",
+    }
+
+    async def fake_via_graph(*args, **kwargs):
+        return {
+            "ok": True,
+            "provider": "graph",
+            "provider_message_id": "real-graph-id-AAMkAGI2",
+            "thread_key": "stub",
+            "sent_at": "2026-08-24T10:00:00+00:00",
+            "error": "",
+            "error_type": "",
+        }
+
+    monkeypatch.setattr("emailing.graph_client.send_via_graph", fake_via_graph)
+
+    result = await send_email(
+        account,
+        to_email="buyer@example.com",
+        subject="Hi",
+        body_text="Hello",
+    )
+    assert result["ok"] is False, f"stub thread_key should be rejected; got: {result}"
+
+
+@pytest.mark.asyncio
+async def test_send_email_allows_empty_provider_message_id(monkeypatch):
+    """The single-step `sendMail` fallback path legitimately returns
+    `provider_message_id=""` (no id back from sendMail). The stub-guard
+    must NOT reject empty string — only known stub tokens.
+    """
+    account = {
+        "provider_type": "graph",
+        "from_name": "",
+        "from_email": "sales@example.com",
+        "reply_to": "",
+    }
+
+    async def fake_via_graph(*args, **kwargs):
+        return {
+            "ok": True,
+            "provider": "graph",
+            "provider_message_id": "",  # legitimate: sendMail fallback
+            "thread_key": "graph-sendmail:foo:bar:Hi",
+            "sent_at": "2026-08-24T10:00:00+00:00",
+            "error": "",
+            "error_type": "",
+        }
+
+    monkeypatch.setattr("emailing.graph_client.send_via_graph", fake_via_graph)
+
+    result = await send_email(
+        account,
+        to_email="buyer@example.com",
+        subject="Hi",
+        body_text="Hello",
+    )
+    assert result["ok"] is True
+    assert result["provider_message_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_send_email_accepts_real_graph_id(monkeypatch):
+    """Real Graph `internetMessageId` looks like `<id@host>` or
+    `AAMkAGI2...` — these must pass through unchanged.
+    """
+    account = {
+        "provider_type": "graph",
+        "from_name": "",
+        "from_email": "sales@example.com",
+        "reply_to": "",
+    }
+
+    real_id = "<abc123@mail.example.com>"
+
+    async def fake_via_graph(*args, **kwargs):
+        return {
+            "ok": True,
+            "provider": "graph",
+            "provider_message_id": real_id,
+            "thread_key": "conv-xyz",
+            "sent_at": "2026-08-24T10:00:00+00:00",
+            "error": "",
+            "error_type": "",
+        }
+
+    monkeypatch.setattr("emailing.graph_client.send_via_graph", fake_via_graph)
+
+    result = await send_email(
+        account,
+        to_email="buyer@example.com",
+        subject="Hi",
+        body_text="Hello",
+    )
+    assert result["ok"] is True
+    assert result["provider_message_id"] == real_id

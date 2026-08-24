@@ -22,6 +22,18 @@ from emailing.unsubscribe import (
 
 @pytest.fixture
 def store() -> EmailStore:
+    # This fixture is shared with the API route tests below. Those
+    # tests build a real FastAPI app via `create_app()` which reads
+    # `get_settings().email_db_path` — so the fixture and the app
+    # MUST point at the same DB file, or the route's writes won't
+    # be visible to the test's `store` reads. We deliberately
+    # tolerate writing to the dev DB here because none of the route
+    # tests in this file fake `provider_message_id`; the only stub
+    # data (`x` / `y`) lives in the pure-function token tests which
+    # never touch this fixture. If that ever changes, the right
+    # answer is to make the API tests swap `get_settings` via
+    # monkeypatch to a tmp DB, not to break the shared-state contract
+    # silently.
     s = EmailStore(get_settings().email_db_path)
     s.init_db()
     return s

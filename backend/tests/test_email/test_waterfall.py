@@ -21,8 +21,14 @@ from emailing.store import EmailStore
 
 
 @pytest.fixture
-def store() -> EmailStore:
-    s = EmailStore(get_settings().email_db_path)
+def store(tmp_path) -> EmailStore:
+    # IMPORTANT: use a per-test tmp DB, NOT the dev `email_automation.db`.
+    # Earlier this fixture pointed at `get_settings().email_db_path`
+    # which meant `pytest` runs wrote fake `provider_message_id="x"` /
+    # `thread_key="y"` rows into the operator's live database and
+    # inflated the daily-quota counter. See commit that fixed this
+    # regression for the long version of that story.
+    s = EmailStore(str(tmp_path / "email.db"))
     s.init_db()
     return s
 
