@@ -24,7 +24,6 @@ from emailing.html_format import (
     render_preview_html,
 )
 
-
 # ── escaping ───────────────────────────────────────────────────────
 
 

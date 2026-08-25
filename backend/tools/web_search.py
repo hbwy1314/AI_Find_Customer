@@ -15,7 +15,6 @@ from __future__ import annotations
 import itertools
 import logging
 import threading
-from typing import Optional
 
 from config.settings import Settings, get_settings
 

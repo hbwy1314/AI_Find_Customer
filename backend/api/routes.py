@@ -477,6 +477,7 @@ async def _scan_hunt_replies() -> None:
             try:
                 from emailing import graph_client
                 from emailing.reply_detector import run_graph_reply_detection_once
+
                 # We use the canonical reply-detection loop which handles
                 # per-account UPNs and auto-reply filtering. The result's
                 # ``matches`` already carries the recipient-side info we
@@ -1369,8 +1370,8 @@ async def detect_email_sequence_replies(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     try:
-        from emailing.store import EmailStore
         from emailing.reply_detector import run_graph_reply_detection_once
+        from emailing.store import EmailStore
         store = EmailStore(settings.email_db_path)
         store.init_db()
         reply_result = await run_graph_reply_detection_once(store, None, recent_days=14, limit=50)

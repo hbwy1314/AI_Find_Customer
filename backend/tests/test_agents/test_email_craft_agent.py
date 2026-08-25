@@ -1838,6 +1838,7 @@ class TestSenderSignature:
         monkeypatch.delenv("EMAIL_SIGNATURE_BLOCK", raising=False)
         monkeypatch.delenv("EMAIL_FROM_NAME", raising=False)
         import importlib
+
         from config import settings as settings_mod
         importlib.reload(settings_mod)
         from agents import email_craft_agent as craft_mod
@@ -1850,6 +1851,7 @@ class TestSenderSignature:
         monkeypatch.setenv("EMAIL_SIGNATURE_BLOCK", "Alex from Acme")
         monkeypatch.delenv("EMAIL_FROM_NAME", raising=False)
         import importlib
+
         from config import settings as settings_mod
         importlib.reload(settings_mod)
         from agents import email_craft_agent as craft_mod
@@ -1862,6 +1864,7 @@ class TestSenderSignature:
         monkeypatch.delenv("EMAIL_SIGNATURE_BLOCK", raising=False)
         monkeypatch.setenv("EMAIL_FROM_NAME", "Sales Team")
         import importlib
+
         from config import settings as settings_mod
         importlib.reload(settings_mod)
         from agents import email_craft_agent as craft_mod

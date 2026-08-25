@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 
-from config.settings import get_settings
 from graph.state import HuntState
 from tools.llm_client import LLMTool
 

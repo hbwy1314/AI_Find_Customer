@@ -63,6 +63,10 @@ backend/uploads/
 *.db
 *.sqlite
 *.sqlite3
+backend/*.db
+backend/*.seen
+backend/template_seed_cache.json
+backend/automation_job.json
 
 # ── macOS ────────────────────────────────────────────────────
 .DS_Store

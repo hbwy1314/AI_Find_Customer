@@ -14,7 +14,6 @@ import sys
 sys.path.append(os.getcwd())
 
 from config.settings import get_settings
-from tools.llm_client import LLMTool
 
 # Configure logging to see what's happening
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -22,17 +21,17 @@ logger = logging.getLogger(__name__)
 
 async def test_connection():
     settings = get_settings()
-    
+
     print("\n" + "="*50)
     print(" LLM CONNECTIVITY TEST - ZAI/GLM")
     print("="*50)
-    
+
     # 1. Check Configuration
     print("\n[1] Checking Configuration:")
     print(f"    - Default Model:   {settings.llm_model}")
     print(f"    - Reasoning Model: {settings.reasoning_model}")
     print(f"    - ZAI Key:        {'SET (starts with ' + settings.zai_api_key[:5] + '...)' if settings.zai_api_key else 'NOT SET'}")
-    
+
     async def try_call(model: str, base_url: str, label: str):
         print(f"\n[Testing] {label}")
         print(f"    - Model: {model}")
@@ -49,7 +48,7 @@ async def test_connection():
             else:
                 # Native litellm provider
                 os.environ["ZAI_API_KEY"] = settings.zai_api_key
-            
+
             from litellm import acompletion
             print("    Calling...")
             response = await acompletion(
@@ -58,7 +57,7 @@ async def test_connection():
                 max_tokens=20,
                 temperature=0.1
             )
-            
+
             msg = response.choices[0].message
             print(f"    SUCCESS! Response: {msg.content.strip() if msg.content else 'NO CONTENT'}")
             return True

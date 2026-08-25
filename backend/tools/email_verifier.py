@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import re
 import socket
-from typing import Optional
 
 
 def _get_mx_records(domain: str) -> list[str]:
