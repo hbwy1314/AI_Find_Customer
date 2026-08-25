@@ -23,6 +23,12 @@ class SettingsPayload(BaseModel):
     reasoning_model: str = ""
     email_llm_model: str = ""
     email_reasoning_model: str = ""
+    # Platform-level system-prompt override. When enabled, the
+    # contents of ``llm_system_prompt_override`` are appended to every
+    # agent's system message at LLM-call time. Front-end exposes a
+    # textarea + toggle on the LLM settings page.
+    llm_system_prompt_override: str = ""
+    llm_system_prompt_enabled: str = ""
     # Optional custom OpenAI-compatible base URL. When set, the LLM
     # client routes every provider (openai, anthropic, openrouter, groq,
     # zai, moonshot, huggingface, togetherai) through it. Empty =
@@ -182,6 +188,8 @@ async def save_settings(payload: SettingsPayload):
         "email_llm_model": "EMAIL_LLM_MODEL",
         "email_reasoning_model": "EMAIL_REASONING_MODEL",
         "email_llm_api_base": "EMAIL_LLM_API_BASE",
+        "llm_system_prompt_override": "LLM_SYSTEM_PROMPT_OVERRIDE",
+        "llm_system_prompt_enabled": "LLM_SYSTEM_PROMPT_ENABLED",
         "openai_api_key": "OPENAI_API_KEY",
         "anthropic_api_key": "ANTHROPIC_API_KEY",
         "openrouter_api_key": "OPENROUTER_API_KEY",

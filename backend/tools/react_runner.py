@@ -245,8 +245,17 @@ async def react_loop(
     tool_schemas = [t.to_openai_schema() for t in tools]
     tool_map = {t.name: t for t in tools}
 
+    # Apply the platform-level system-prompt override here too, so
+    # ReAct agents (insight / lead_extract) get the same merged
+    # system message as single-shot ``LLMTool.generate`` calls. Done
+    # once up front so the trim / strip helpers later in the loop
+    # operate on the already-merged string and we don't risk
+    # accidentally re-appending the override after a trim.
+    from tools.llm_client import _apply_system_prompt_override
+    effective_system = _apply_system_prompt_override(system, _settings)
+
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system},
+        {"role": "system", "content": effective_system},
         {"role": "user", "content": user_prompt},
     ]
 

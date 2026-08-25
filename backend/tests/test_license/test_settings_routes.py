@@ -321,3 +321,76 @@ class TestMaskHelpers:
 
         assert _is_masked("sk-a****bcde") is True
         assert _is_masked("sk-fullkeyhere") is False
+
+
+# ── Platform-level system-prompt override (settings API) ───────────────────
+# The two new fields must round-trip cleanly through the settings API:
+#   - GET surfaces the raw override text + the boolean toggle
+#   - POST writes both env keys to the persisted settings store
+# We mock the underlying store so the test stays in-process.
+
+class TestSystemPromptOverrideSettings:
+    @pytest.mark.asyncio
+    async def test_get_surfaces_override_fields(self, client):
+        with (
+            patch(
+                "api.settings_routes.read_settings",
+                return_value={
+                    "LLM_SYSTEM_PROMPT_OVERRIDE": "OUTPUT JSON ONLY",
+                    "LLM_SYSTEM_PROMPT_ENABLED": "true",
+                },
+            ),
+            patch("api.settings_routes.is_configured", return_value=True),
+        ):
+            resp = await client.get("/api/settings")
+
+        assert resp.status_code == 200
+        # The frontend key map translates the env-var names back to
+        # camelCase. We assert the raw payload from the API (still
+        # env-var names) contains both new keys.
+        assert resp.json()["settings"]["LLM_SYSTEM_PROMPT_OVERRIDE"] == "OUTPUT JSON ONLY"
+        assert resp.json()["settings"]["LLM_SYSTEM_PROMPT_ENABLED"] == "true"
+
+    @pytest.mark.asyncio
+    async def test_post_persists_override_fields(self, client):
+        captured: dict[str, str] = {}
+
+        def fake_update(updates: dict[str, str]) -> None:
+            captured.update(updates)
+
+        with (
+            patch("api.settings_routes.read_settings", return_value={}),
+            patch("api.settings_routes.is_configured", return_value=True),
+            patch("api.settings_routes.update_settings", side_effect=fake_update),
+        ):
+            resp = await client.post(
+                "/api/settings",
+                json={
+                    "llm_system_prompt_override": "OUTPUT JSON ONLY",
+                    "llm_system_prompt_enabled": "true",
+                },
+            )
+
+        assert resp.status_code == 204
+        assert captured.get("LLM_SYSTEM_PROMPT_OVERRIDE") == "OUTPUT JSON ONLY"
+        assert captured.get("LLM_SYSTEM_PROMPT_ENABLED") == "true"
+
+    @pytest.mark.asyncio
+    async def test_post_disabling_toggle_writes_false(self, client):
+        captured: dict[str, str] = {}
+
+        def fake_update(updates: dict[str, str]) -> None:
+            captured.update(updates)
+
+        with (
+            patch("api.settings_routes.read_settings", return_value={}),
+            patch("api.settings_routes.is_configured", return_value=True),
+            patch("api.settings_routes.update_settings", side_effect=fake_update),
+        ):
+            resp = await client.post(
+                "/api/settings",
+                json={"llm_system_prompt_enabled": "false"},
+            )
+
+        assert resp.status_code == 204
+        assert captured.get("LLM_SYSTEM_PROMPT_ENABLED") == "false"

@@ -13,7 +13,32 @@ from tools.react_runner import (
     _has_required_fields,
     _trim_messages,
     _try_parse_json,
+    react_loop,
 )
+
+
+def _make_react_settings(**overrides) -> Settings:
+    """Minimal settings for react_loop — only the fields it touches."""
+    defaults = {
+        "openai_api_key": "sk-test",
+        "reasoning_model": "gpt-4o-mini",
+        "reasoning_temperature": 0.2,
+        "reasoning_max_tokens": 4096,
+        "react_max_iterations": 1,
+        "llm_requests_per_minute": 0,
+        "reasoning_requests_per_minute": 0,
+    }
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+def _final_json_response(content: str) -> SimpleNamespace:
+    """Build a litellm response with no tool_calls — react_loop treats this as the final answer."""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=content, tool_calls=None),
+        )],
+    )
 
 
 class TestCleanMarkdownFences:
@@ -158,3 +183,71 @@ class TestRPMControl:
         mock_get.assert_called_once_with("reasoning", 9)
         limiter.acquire.assert_awaited_once()
         mock_call.assert_awaited_once()
+
+
+# ── Platform-level system-prompt override (react_loop) ─────────────────────
+# ReAct agents (insight / lead_extract) build their own system message
+# inside react_loop. The platform override must land on the tail of that
+# message before it's sent to the LLM, just like in LLMTool.generate.
+
+import asyncio
+from tools.react_runner import ToolDef
+
+
+async def _noop_tool(**_kwargs) -> str:
+    return "{}"
+
+
+class TestReActLoopSystemPromptOverride:
+    @pytest.mark.asyncio
+    async def test_override_disabled_passes_system_through(self):
+        """When the override is off, the system message sent to the LLM
+        must be byte-for-byte the agent's own prompt — no surprise
+        behaviour for operators who haven't opted in."""
+        settings = _make_react_settings(
+            llm_system_prompt_enabled=False,
+            llm_system_prompt_override="SHOULD NOT APPEAR",
+        )
+        mock_resp = _final_json_response('{"answer": "ok"}')
+
+        async def fake_acompletion(*_args, **kwargs):
+            return mock_resp
+
+        with patch("tools.react_runner._acompletion_with_rpm_limit", side_effect=fake_acompletion) as mc:
+            await react_loop(
+                system="react agent system",
+                user_prompt="do the thing",
+                tools=[ToolDef(name="noop", description="d", parameters={}, fn=_noop_tool)],
+                settings=settings,
+                max_iterations=1,
+            )
+
+        sent_system = mc.call_args.kwargs["messages"][0]["content"]
+        assert sent_system == "react agent system"
+
+    @pytest.mark.asyncio
+    async def test_override_enabled_appends_to_system(self):
+        """When the override is on, it must be appended to react_loop's
+        own system message and reach the LLM as the tail of that block."""
+        settings = _make_react_settings(
+            llm_system_prompt_enabled=True,
+            llm_system_prompt_override="OUTPUT JSON ONLY",
+        )
+        mock_resp = _final_json_response('{"answer": "ok"}')
+
+        async def fake_acompletion(*_args, **kwargs):
+            return mock_resp
+
+        with patch("tools.react_runner._acompletion_with_rpm_limit", side_effect=fake_acompletion) as mc:
+            await react_loop(
+                system="react agent system",
+                user_prompt="do the thing",
+                tools=[ToolDef(name="noop", description="d", parameters={}, fn=_noop_tool)],
+                settings=settings,
+                max_iterations=1,
+            )
+
+        sent_system = mc.call_args.kwargs["messages"][0]["content"]
+        assert "react agent system" in sent_system
+        assert "[Platform override — highest priority]" in sent_system
+        assert sent_system.endswith("OUTPUT JSON ONLY")

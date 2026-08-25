@@ -149,6 +149,39 @@ def _inject_api_keys(settings: Settings, scope: str = "default") -> None:
         os.environ["ANTHROPIC_API_BASE"] = normalize_minimax_api_base(settings.minimax_api_base)
 
 
+def _apply_system_prompt_override(system: str, settings: Settings) -> str:
+    """Append the platform-level system-prompt override to an agent's
+    system message, if the override is enabled and non-empty.
+
+    The override is treated as the *last* and most authoritative
+    instruction (it lands at the tail of the system message, which
+    LLMs weight more heavily than the prefix). When the override is
+    disabled or empty, the original system is returned unchanged so
+    every existing agent behaves byte-for-byte the same as before.
+
+    Args:
+        system: The agent's own system prompt (may be empty).
+        settings: Settings singleton — we read
+            ``llm_system_prompt_enabled`` and ``llm_system_prompt_override``
+            from it.
+
+    Returns:
+        The (possibly extended) system message string.
+    """
+    if not bool(getattr(settings, "llm_system_prompt_enabled", False)):
+        return system
+    override = str(getattr(settings, "llm_system_prompt_override", "") or "").strip()
+    if not override:
+        return system
+    if not system:
+        return override
+    return (
+        f"{system}\n\n"
+        "[Platform override — highest priority]\n"
+        f"{override}"
+    )
+
+
 def _select_model(settings: Settings, model_type: str) -> str:
     if model_type == "reasoning":
         return settings.reasoning_model
@@ -251,9 +284,16 @@ class LLMTool:
         temp = temperature if temperature is not None else self._default_temperature
         tokens = max_tokens or self._default_max_tokens
 
+        # Append the platform-level system-prompt override (if enabled)
+        # to the agent's own system message. Done in-place here so every
+        # downstream code path (single-shot + ReAct) gets the same
+        # merged system string without having to remember to call the
+        # helper itself.
+        effective_system = _apply_system_prompt_override(system, self._settings)
+
         messages: list[dict[str, str]] = []
-        if system:
-            messages.append({"role": "system", "content": system})
+        if effective_system:
+            messages.append({"role": "system", "content": effective_system})
         messages.append({"role": "user", "content": prompt})
 
         kwargs: dict[str, Any] = {

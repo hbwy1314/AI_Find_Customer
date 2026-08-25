@@ -16,6 +16,10 @@ export const SETTINGS_KEY_MAP: Record<string, string> = {
   LLM_MODEL: "llm_model",
   REASONING_MODEL: "reasoning_model",
   LLM_API_BASE: "llm_api_base",
+  // Platform-level system-prompt override (appended to every agent's
+  // system message at LLM-call time when enabled).
+  LLM_SYSTEM_PROMPT_OVERRIDE: "llm_system_prompt_override",
+  LLM_SYSTEM_PROMPT_ENABLED: "llm_system_prompt_enabled",
   EMAIL_LLM_MODEL: "email_llm_model",
   EMAIL_REASONING_MODEL: "email_reasoning_model",
   EMAIL_LLM_API_BASE: "email_llm_api_base",

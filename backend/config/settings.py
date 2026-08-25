@@ -93,6 +93,16 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.3
     llm_max_tokens: int = 4096
     llm_requests_per_minute: int = 0
+    # Platform-level system-prompt override. When enabled, this string
+    # is appended to every agent's system message at LLM-call time
+    # (both ``LLMTool.generate`` and ``react_loop``), with a leading
+    # "[Platform override — highest priority]" marker so the model
+    # treats it as the last and most authoritative instruction. Empty
+    # + disabled = no effect, every agent behaves exactly as before.
+    # Operator-facing use cases: enforce JSON-only output, forbid
+    # certain phrasings, hard-coded brand voice, safety guardrails.
+    llm_system_prompt_override: str = ""
+    llm_system_prompt_enabled: bool = False
 
     # Reasoning model — used for ReAct agent decision-making (stronger reasoning)
     #   e.g. "gpt-4o", "anthropic/claude-3-5-sonnet-20241022", "openrouter/deepseek/deepseek-r1"

@@ -446,3 +446,123 @@ class TestLLMApiBaseInjection:
             "GROQ_API_BASE", "ZAI_API_BASE", "MOONSHOT_API_BASE",
         ):
             assert os.environ.get(k) == "https://api.vectorengine.cn/v1", f"{k} not set"
+
+
+# ── Platform-level system-prompt override ──────────────────────────────────
+# The override is a settings-driven tail-appended to every agent's
+# system message. It must:
+#   - be a no-op when disabled or empty
+#   - land at the END of the system message (highest-priority slot)
+#   - be clearly marked so the model treats it as authoritative
+#   - apply uniformly to every LLM call regardless of model_type
+
+from tools.llm_client import _apply_system_prompt_override  # noqa: E402
+
+
+class TestSystemPromptOverrideHelper:
+    def test_disabled_returns_unchanged(self):
+        s = _make_settings(
+            llm_system_prompt_enabled=False,
+            llm_system_prompt_override="OVERRIDE",
+        )
+        assert _apply_system_prompt_override("agent system", s) == "agent system"
+
+    def test_enabled_empty_returns_unchanged(self):
+        s = _make_settings(
+            llm_system_prompt_enabled=True,
+            llm_system_prompt_override="",
+        )
+        assert _apply_system_prompt_override("agent system", s) == "agent system"
+
+    def test_enabled_whitespace_only_returns_unchanged(self):
+        s = _make_settings(
+            llm_system_prompt_enabled=True,
+            llm_system_prompt_override="   \n  \t  ",
+        )
+        assert _apply_system_prompt_override("agent system", s) == "agent system"
+
+    def test_enabled_appends_with_marker(self):
+        s = _make_settings(
+            llm_system_prompt_enabled=True,
+            llm_system_prompt_override="Reply in JSON only.",
+        )
+        out = _apply_system_prompt_override("agent system", s)
+        assert out.startswith("agent system")
+        assert "[Platform override — highest priority]" in out
+        assert out.endswith("Reply in JSON only.")
+        # Override must be the LAST thing in the system message —
+        # models weight the tail of the system block more heavily.
+        assert out.index("Reply in JSON only.") > out.index("[Platform override")
+
+    def test_enabled_with_empty_agent_system(self):
+        s = _make_settings(
+            llm_system_prompt_enabled=True,
+            llm_system_prompt_override="Just override",
+        )
+        assert _apply_system_prompt_override("", s) == "Just override"
+
+
+class TestSystemPromptOverrideInGenerate:
+    @pytest.mark.asyncio
+    async def test_override_disabled_passes_system_through_unchanged(self):
+        tool = LLMTool(settings=_make_settings(
+            llm_system_prompt_enabled=False,
+            llm_system_prompt_override="SHOULD NOT APPEAR",
+        ))
+        mock_resp = _mock_completion("ok")
+        with patch("tools.llm_client.litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp) as mc:
+            await tool.generate("user", system="agent system")
+        sent_system = mc.call_args.kwargs["messages"][0]["content"]
+        assert sent_system == "agent system"
+        assert "SHOULD NOT APPEAR" not in sent_system
+
+    @pytest.mark.asyncio
+    async def test_override_enabled_appends_to_system(self):
+        tool = LLMTool(settings=_make_settings(
+            llm_system_prompt_enabled=True,
+            llm_system_prompt_override="OUTPUT JSON ONLY",
+        ))
+        mock_resp = _mock_completion("ok")
+        with patch("tools.llm_client.litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp) as mc:
+            await tool.generate("user", system="agent system")
+        sent_system = mc.call_args.kwargs["messages"][0]["content"]
+        assert sent_system.startswith("agent system")
+        assert "OUTPUT JSON ONLY" in sent_system
+        # Override lives at the tail, after the highest-priority marker.
+        assert sent_system.endswith("OUTPUT JSON ONLY")
+
+    @pytest.mark.asyncio
+    async def test_override_enabled_no_agent_system(self):
+        """Edge case: agent passed system='' and override is set — we still
+        want the override to flow through (otherwise the platform-level
+        constraint silently disappears for any agent that doesn't ship its
+        own system prompt)."""
+        tool = LLMTool(settings=_make_settings(
+            llm_system_prompt_enabled=True,
+            llm_system_prompt_override="BE POLITE",
+        ))
+        mock_resp = _mock_completion("ok")
+        with patch("tools.llm_client.litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp) as mc:
+            await tool.generate("user", system="")
+        msgs = mc.call_args.kwargs["messages"]
+        # When both agent and override would be empty, no system at all.
+        # When only the override is present, exactly one system message.
+        assert len(msgs) == 2
+        assert msgs[0] == {"role": "system", "content": "BE POLITE"}
+        assert msgs[1] == {"role": "user", "content": "user"}
+
+    @pytest.mark.asyncio
+    async def test_override_applies_to_reasoning_model_too(self):
+        tool = LLMTool(model_type="reasoning", settings=_make_settings(
+            llm_system_prompt_enabled=True,
+            llm_system_prompt_override="REASONING OVERRIDE",
+        ))
+        mock_resp = _mock_completion("ok")
+        with patch("tools.llm_client.litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp) as mc:
+            await tool.generate("user", system="react system")
+        sent_system = mc.call_args.kwargs["messages"][0]["content"]
+        assert "react system" in sent_system
+        assert "REASONING OVERRIDE" in sent_system
+        # And the model that received the call is the reasoning model,
+        # not the default — confirms we didn't accidentally swap scope.
+        assert mc.call_args.kwargs["model"] == "gpt-4o"
