@@ -500,14 +500,14 @@ export function AutomationJobPage() {
             </Button>
           )}
           <Button
-            variant="ghost"
+            variant="outline"
             size="sm"
-            className="text-muted-foreground hover:text-destructive"
+            className="border-destructive/40 text-destructive hover:bg-destructive hover:text-destructive-foreground"
             onClick={() => setShowDeleteDialog(true)}
             title="从历史记录中删除这个任务（不影响 hunt 本身）"
           >
-            <Trash2 className="h-4 w-4" />
-            <span className="ml-1 hidden sm:inline">删除</span>
+            <Trash2 className="h-4 w-4 mr-1" />
+            <span>删除</span>
           </Button>
         </div>
       </div>
