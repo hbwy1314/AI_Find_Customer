@@ -476,8 +476,30 @@ class TestSendEmailDraft:
         fake_settings.graph_client_id = "client-1"
         fake_settings.graph_client_secret = "secret"
         fake_settings.graph_mailbox_upn = "sales@recipient-test.io"
+        real_account = {
+            "id": "acct-test-1",
+            "from_email": "sales@recipient-test.io",
+            "from_name": "Sales",
+            "reply_to": "sales@recipient-test.io",
+            "provider_type": "graph",
+            "status": "active",
+            "graph_user_principal_name": "sales@recipient-test.io",
+        }
+        async def fake_send_via_graph(*_args, **_kwargs):
+            return {
+                "ok": True,
+                "provider": "graph",
+                "provider_message_id": "graph-test-id",
+                "thread_key": "tk",
+                "sent_at": "2026-08-25T00:00:00+00:00",
+            }
         with (
             patch("api.routes.get_settings", return_value=fake_settings),
+            patch("emailing.store.EmailStore.get_account", return_value=real_account),
+            patch("emailing.store.EmailStore.list_accounts_by_provider", return_value=[real_account]),
+            patch("emailing.store.EmailStore.get_campaign", return_value=None),
+            patch("emailing.store.EmailStore.list_campaigns_for_hunt", return_value=[]),
+            patch("emailing.graph_client.send_via_graph", new=fake_send_via_graph),
         ):
             resp = await client.post(
                 "/api/v1/hunts/send-1/email-sequences/0/send",
@@ -564,8 +586,30 @@ class TestSendEmailDraft:
         fake_settings.graph_client_id = "client-1"
         fake_settings.graph_client_secret = "secret"
         fake_settings.graph_mailbox_upn = "sales@recipient-test.io"
+        real_account = {
+            "id": "acct-test-1",
+            "from_email": "sales@recipient-test.io",
+            "from_name": "Sales",
+            "reply_to": "sales@recipient-test.io",
+            "provider_type": "graph",
+            "status": "active",
+            "graph_user_principal_name": "sales@recipient-test.io",
+        }
+        async def fake_send_via_graph(*_args, **_kwargs):
+            return {
+                "ok": True,
+                "provider": "graph",
+                "provider_message_id": "graph-test-id",
+                "thread_key": "tk",
+                "sent_at": "2026-08-25T00:00:00+00:00",
+            }
         with (
             patch("api.routes.get_settings", return_value=fake_settings),
+            patch("emailing.store.EmailStore.get_account", return_value=real_account),
+            patch("emailing.store.EmailStore.list_accounts_by_provider", return_value=[real_account]),
+            patch("emailing.store.EmailStore.get_campaign", return_value=None),
+            patch("emailing.store.EmailStore.list_campaigns_for_hunt", return_value=[]),
+            patch("emailing.graph_client.send_via_graph", new=fake_send_via_graph),
         ):
             resp = await client.post(
                 "/api/v1/hunts/send-4/email-sequences/0/send",
@@ -574,6 +618,50 @@ class TestSendEmailDraft:
         assert resp.status_code == 200
         second_email = _hunts["send-4"]["result"]["email_sequences"][0]["emails"][1]
         assert second_email.get("send_status", "") == ""
+
+    @pytest.mark.asyncio
+    async def test_send_email_draft_refuses_when_no_real_account_bound(self, client):
+        """If no campaign/account is bound and there's no active Graph
+        account on the system, the endpoint must refuse to send rather
+        than fall back to the empty `default` account (which would send
+        from an empty from_email and trigger a 502 at the Graph layer)."""
+        _hunts["send-noaccount"] = {
+            "status": "completed",
+            "result": {
+                "email_sequences": [
+                    {
+                        "lead": {"company_name": "Acme", "emails": ["hello@acmetest.io"]},
+                        "target": {"target_email": "buyer@acmetest.io"},
+                        "locale": "en_US",
+                        "emails": [{"sequence_number": 1, "subject": "Hello", "body_text": "Body"}],
+                        "review_summary": {"status": "approved", "score": 91},
+                        "auto_send_eligible": True,
+                    }
+                ],
+            },
+            "email_sequences_count": 1,
+        }
+
+        fake_settings = MagicMock()
+        fake_settings.email_from_address = "sales@recipient-test.io"
+        fake_settings.graph_tenant_id = "tenant-1"
+        fake_settings.graph_client_id = "client-1"
+        fake_settings.graph_client_secret = "secret"
+        fake_settings.graph_mailbox_upn = "sales@recipient-test.io"
+        with (
+            patch("api.routes.get_settings", return_value=fake_settings),
+            # No real account anywhere.
+            patch("emailing.store.EmailStore.get_account", return_value=None),
+            patch("emailing.store.EmailStore.list_accounts_by_provider", return_value=[]),
+            patch("emailing.store.EmailStore.get_campaign", return_value=None),
+            patch("emailing.store.EmailStore.list_campaigns_for_hunt", return_value=[]),
+        ):
+            resp = await client.post(
+                "/api/v1/hunts/send-noaccount/email-sequences/0/send",
+                json={"sequence_number": 1},
+            )
+        assert resp.status_code == 409
+        assert "No usable email account" in resp.json()["detail"]
 
     @pytest.mark.asyncio
     async def test_send_email_draft_requires_graph_configuration(self, client):

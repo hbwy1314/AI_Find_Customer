@@ -1304,7 +1304,58 @@ async def send_email_sequence_draft(
     from emailing.store import EmailStore
     store = EmailStore(settings.email_db_path)
     store.init_db()
-    account = store.get_account("default") or {}
+
+    # Resolve the actual sender account instead of the legacy
+    # "default" account. The hunt→campaign chain owns the real
+    # email_account_id (rebinds via create_email_campaign); the
+    # "default" row is a settings-derived fallback that, with our
+    # reserved-domain guard in place, will silently fail or send
+    # from an empty from_email. Walk the chain:
+    #   1) the sequence's own campaign_id (set when the FE created
+    #      a campaign via /email-campaigns)
+    #   2) the in-memory sequence's email_account_id (legacy path)
+    #   3) the first active Graph account on the system
+    # If we still can't find a real account, refuse to send rather
+    # than fall back to "default" — the user has no way to tell
+    # which mailbox the message went out from otherwise.
+    account: dict[str, Any] = {}
+    sequence_campaign_id = str(sequence.get("campaign_id", "") or "")
+    if not sequence_campaign_id:
+        for row in store.list_campaigns_for_hunt(hunt_id):
+            if str(row.get("hunt_id", "")) == hunt_id:
+                sequence_campaign_id = str(row.get("id", "") or "")
+                if sequence_campaign_id:
+                    break
+    if sequence_campaign_id:
+        campaign = store.get_campaign(sequence_campaign_id)
+        if campaign:
+            campaign_account_id = str(campaign.get("email_account_id", "") or "")
+            if campaign_account_id and campaign_account_id != "default":
+                account = store.get_account(campaign_account_id) or {}
+    if not account:
+        # In-memory sequence might carry an email_account_id from an
+        # older code path that wrote it directly onto the sequence.
+        legacy_account_id = str(sequence.get("email_account_id", "") or "")
+        if legacy_account_id and legacy_account_id != "default":
+            account = store.get_account(legacy_account_id) or {}
+    if not account:
+        # Last resort: pick the first active Graph account so the
+        # operator gets a sensible "from" address instead of "".
+        for candidate in store.list_accounts_by_provider("graph"):
+            if str(candidate.get("status", "")) == "active":
+                account = candidate
+                break
+    if not account or not str(account.get("from_email", "") or "").strip():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No usable email account is bound to this hunt's campaign. "
+                "Add a Graph account in Settings → 已连接邮箱, or create a "
+                "campaign from the email-campaigns endpoint that binds to "
+                "a real account, then try again."
+            ),
+        )
+
     from emailing import email_sender
     send_result = await email_sender.send_email(
         account,

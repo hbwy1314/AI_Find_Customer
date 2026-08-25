@@ -22,7 +22,11 @@ CREATE TABLE IF NOT EXISTS email_accounts (
   from_email TEXT NOT NULL,
   reply_to TEXT DEFAULT '',
   status TEXT NOT NULL DEFAULT 'active',
-  daily_send_limit INTEGER NOT NULL DEFAULT 50,
+  -- Daily/hourly send caps. Defaults match api.email_accounts_routes
+  -- and config.settings (20/day, 10/hour). Schema DEFAULT is only used
+  -- for rows created via raw SQL — the application code always passes
+  -- these explicitly. Keep the two in sync.
+  daily_send_limit INTEGER NOT NULL DEFAULT 20,
   hourly_send_limit INTEGER NOT NULL DEFAULT 10,
   last_test_at TEXT DEFAULT '',
   created_at TEXT NOT NULL,

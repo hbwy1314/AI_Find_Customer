@@ -67,6 +67,9 @@ backend/*.db
 backend/*.seen
 backend/template_seed_cache.json
 backend/automation_job.json
+# Mock library temp dirs (e.g. /tmp MOCK_EMAIL_DB_PATH leaks here)
+backend/MagicMock/
+backend/MagicMock/**
 
 # ── macOS ────────────────────────────────────────────────────
 .DS_Store
