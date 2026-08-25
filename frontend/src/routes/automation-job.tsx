@@ -333,20 +333,20 @@ export function AutomationJobPage() {
   });
   const deleteMutation = useMutation({
     mutationFn: () => api.deleteAutomationJob(jobId),
-    onSuccess: async (resp) => {
+    onSuccess: async () => {
       setShowDeleteDialog(false);
       await queryClient.invalidateQueries({ queryKey: ["automation-jobs"] });
       await queryClient.invalidateQueries({ queryKey: ["automation-status"] });
       await queryClient.invalidateQueries({ queryKey: ["automation-metrics", 24] });
-      // If we cancelled-and-deleted, the underlying hunt is also
-      // stopped. Best UX is to send the operator back to the
-      // dashboard so they see the new state immediately. We don't
-      // navigate to `/automation` because that path isn't a
+      // After the row is gone the route `/automation/$jobId` resolves
+      // to a job that no longer exists — the page would just sit
+      // there showing stale / loading data. Send the operator back
+      // to the task list regardless of whether we cancelled-and-
+      // deleted a running job or removed a finished/failed entry.
+      // We don't navigate to `/automation` because that path isn't a
       // registered TanStack route — it's only in the catch-all
       // `KNOWN_ROUTES` set, so TS would reject the literal here.
-      if (resp?.cancelled_first) {
-        navigate({ to: "/" });
-      }
+      navigate({ to: "/" });
     },
   });
 
