@@ -8,7 +8,7 @@ from httpx import ASGITransport, AsyncClient
 
 from api.app import create_app
 from api.routes import _hunts, _sse_queues
-from api.sse import _event_generator, _sse_event
+from api.sse import _broadcast_reply, _event_generator, _reply_subscribers, _sse_event
 
 
 @pytest.fixture
@@ -209,3 +209,84 @@ class TestSseEndpoint:
         assert "text/event-stream" in resp.headers["content-type"]
         assert "event: heartbeat" in resp.text
         assert "Waiting for consumer to claim" in resp.text
+
+
+class TestReplyBroadcast:
+    """Unit tests for `_broadcast_reply` — the in-process fan-out used
+    by the reply-detection loop to push `reply` events to every open
+    /replies/stream subscriber.
+    """
+
+    def setup_method(self):
+        # Each test gets a clean subscriber list so it can't leak
+        # state into the next one.
+        _reply_subscribers.clear()
+
+    def teardown_method(self):
+        _reply_subscribers.clear()
+
+    def test_broadcast_fans_out_to_all_subscribers(self):
+        q1: asyncio.Queue = asyncio.Queue()
+        q2: asyncio.Queue = asyncio.Queue()
+        _reply_subscribers.extend([q1, q2])
+
+        payload = {"id": "abc-123", "from_email": "buyer@acme.com", "subject": "Re: hello"}
+        _broadcast_reply(payload)
+
+        assert q1.get_nowait() == payload
+        assert q2.get_nowait() == payload
+
+    def test_broadcast_drops_oldest_on_full_queue(self):
+        # Simulate a slow client: queue is full to the brim before we
+        # try to push. The fan-out must drop the oldest event rather
+        # than block, otherwise the reply-detection loop would hang
+        # on a stuck browser tab.
+        q: asyncio.Queue = asyncio.Queue(maxsize=2)
+        _reply_subscribers.append(q)
+        q.put_nowait({"id": "old-1"})
+        q.put_nowait({"id": "old-2"})
+
+        _broadcast_reply({"id": "new-1"})
+
+        # Oldest entry is gone, the new event is at the back, and
+        # exactly two events are in the queue.
+        drained = []
+        while not q.empty():
+            drained.append(q.get_nowait())
+        assert drained == [{"id": "old-2"}, {"id": "new-1"}]
+
+    def test_broadcast_no_subscribers_is_noop(self):
+        # No one listening — should not raise, should not allocate.
+        _broadcast_reply({"id": "x"})
+        assert _reply_subscribers == []
+
+
+class TestReplyStreamEndpoint:
+    """Integration tests for GET /api/v1/replies/stream."""
+
+    @pytest.mark.asyncio
+    async def test_stream_returns_event_stream(self, client, monkeypatch):
+        # The reply-event generator normally blocks forever (heartbeat
+        # loop). Replace it with a deterministic two-event sequence
+        # so the test can finish quickly.
+        async def fake_generator():
+            yield _sse_event("heartbeat", {"connected_at": "2026-08-25T00:00:00+00:00"})
+            yield _sse_event("reply", {"id": "evt-1", "from_email": "buyer@acme.com"})
+
+        monkeypatch.setattr("api.sse._reply_event_generator", fake_generator)
+
+        # Need a session for the auth dep; the ASGI client uses
+        # testclient which is in _LOCAL_HOSTS so require_api_access
+        # short-circuits when API_ACCESS_TOKEN is unset. Make sure
+        # no token is configured in this test.
+        from config import settings as settings_mod
+        original = settings_mod.get_settings()
+        monkeypatch.setattr(original, "api_access_token", "")
+
+        resp = await client.get("/api/v1/replies/stream")
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+        body = resp.text
+        assert "event: heartbeat" in body
+        assert "event: reply" in body
+        assert "buyer@acme.com" in body

@@ -189,3 +189,43 @@ def render_send_batch_text(items: list[dict[str, Any]]) -> str:
     if len(items) > 10:
         lines.append(f"- 其余 {len(items) - 10} 封已省略")
     return "\n".join(lines)
+
+
+def render_reply_detected_text(matches: list[dict[str, Any]]) -> str:
+    """Push notification for inbound replies matched to a sent message.
+
+    Each `match` dict should have: lead_email, lead_name (optional),
+    subject, snippet. The lead_name defaults to the lead_email local
+    part if missing.
+
+    Renders up to 10 leads in the body; if there are more, a
+    "其余 N 条已省略" footer is appended so the Feishu message stays
+    under the bot's 4KB text limit.
+    """
+    if not matches:
+        return ""
+    lines = [f"AI Hunter 收到回信 | 本轮 {len(matches)} 条"]
+    for item in matches[:10]:
+        lead_name = str(item.get("lead_name", "") or "").strip()
+        lead_email = str(item.get("lead_email", "") or "-")
+        # Display "name <email>" when both are available; the local-part
+        # fallback keeps the line readable when we only have an address.
+        if lead_name and lead_name != lead_email:
+            who = f"{lead_name} <{lead_email}>"
+        else:
+            local = lead_email.split("@", 1)[0] if "@" in lead_email else lead_email
+            who = local or lead_email
+        subject = str(item.get("subject", "") or "").strip()
+        subject = subject[:60]  # keep one line tight
+        snippet = str(item.get("snippet", "") or "").strip().replace("\n", " ")
+        snippet = snippet[:120]
+        line = f"- {who}"
+        if subject:
+            line += f" | {subject}"
+        if snippet:
+            line += f"\n  {snippet}"
+        lines.append(line)
+    if len(matches) > 10:
+        lines.append(f"- 其余 {len(matches) - 10} 条已省略")
+    lines.append("已自动停止后续跟进邮件，可到 AI Hunter 详情页查看对话。")
+    return "\n".join(lines)

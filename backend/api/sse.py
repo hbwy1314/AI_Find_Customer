@@ -1,7 +1,16 @@
-"""SSE streaming endpoint — real-time hunt progress updates via Server-Sent Events.
+"""SSE streaming endpoints — real-time updates via Server-Sent Events.
 
-Uses queue-based broadcast from routes._broadcast for instant event delivery
-instead of polling.
+Two streams today:
+- `/hunts/{id}/stream` — hunt pipeline progress (uses the per-hunt
+  broadcast queue in `routes._sse_queues`).
+- `/replies/stream` — global reply-notification push. Any open
+  browser tab gets a `reply` event the moment the reply-detection
+  loop matches a new inbound message, so the bell badge updates
+  without waiting for the 30s poll.
+- `/automation/jobs/{id}/stream` — automation job progress.
+
+All streams emit a `heartbeat` event every ~30s so reverse proxies
+and load balancers don't kill an idle connection.
 """
 
 from __future__ import annotations
@@ -9,7 +18,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import AsyncGenerator
+import time
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -36,6 +47,79 @@ def _sse_event(event_type: str, data: dict) -> str:
     """Format a Server-Sent Event string."""
     json_data = json.dumps(data, ensure_ascii=False)
     return f"event: {event_type}\ndata: {json_data}\n\n"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Reply-event push channel
+# ---------------------------------------------------------------------------
+# Each browser tab that subscribes to /replies/stream gets its own
+# bounded queue. When the reply-detection loop matches a new inbound
+# message, it calls `_broadcast_reply()` which fans out to every
+# subscriber queue. Slow clients get their oldest queued event
+# dropped so they don't block newer ones.
+
+_REPLY_QUEUE_MAX = 200
+_reply_subscribers: list[asyncio.Queue] = []
+
+
+def _broadcast_reply(data: dict[str, Any]) -> None:
+    """Push a reply event to every active SSE subscriber.
+
+    Best-effort: full queues are drained for the offending subscriber
+    (slow client protection) and stale queues (closed connections) are
+    pruned. This function never raises — pushing a notification is
+    never allowed to break the reply-detection loop.
+    """
+    if not _reply_subscribers:
+        return
+    stale: list[asyncio.Queue] = []
+    for q in _reply_subscribers:
+        try:
+            q.put_nowait(data)
+        except asyncio.QueueFull:
+            # Drop the oldest to make room. If even that fails (e.g.
+            # another coroutine is also draining), mark the queue
+            # stale so we drop the subscription on the next pass.
+            try:
+                q.get_nowait()
+                q.put_nowait(data)
+            except Exception:  # noqa: BLE001
+                stale.append(q)
+    for q in stale:
+        try:
+            _reply_subscribers.remove(q)
+        except ValueError:
+            pass
+
+
+async def _reply_event_generator() -> AsyncGenerator[str, None]:
+    """Per-subscriber SSE stream for reply events."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=_REPLY_QUEUE_MAX)
+    _reply_subscribers.append(queue)
+    logger.info("[SSE] reply stream subscribed (total=%d)", len(_reply_subscribers))
+    try:
+        # Initial frame so the browser's EventSource flips to OPEN and
+        # the React effect can clear any "connecting" state.
+        yield _sse_event("heartbeat", {"connected_at": _now_iso()})
+        while True:
+            try:
+                # wait_for gives us a chance to send heartbeats even
+                # when no new replies are arriving — keeps proxies and
+                # load balancers from severing an idle connection.
+                data = await asyncio.wait_for(queue.get(), timeout=30.0)
+                yield _sse_event("reply", data)
+            except asyncio.TimeoutError:
+                yield _sse_event("heartbeat", {"ts": time.time()})
+    finally:
+        try:
+            _reply_subscribers.remove(queue)
+        except ValueError:
+            pass
+        logger.info("[SSE] reply stream unsubscribed (total=%d)", len(_reply_subscribers))
 
 
 async def _event_generator(hunt_id: str, queue: asyncio.Queue) -> AsyncGenerator[str, None]:
@@ -171,6 +255,30 @@ async def stream_automation_job(job_id: str):
 
     return StreamingResponse(
         _automation_job_event_generator(job_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@sse_router.get("/replies/stream", dependencies=[Depends(require_api_access)])
+async def stream_replies():
+    """Push a `reply` event to the browser for every newly matched reply.
+
+    Authenticated via the existing session cookie + CSRF double-submit
+    pipeline. EventSource doesn't allow custom headers, but the
+    browser sends the session cookie automatically, so this Just
+    Works as long as the user is logged in.
+
+    Events:
+    - `reply`:     new reply matched; `data` is a NotificationItem
+    - `heartbeat`: keep-alive every 30s
+    """
+    return StreamingResponse(
+        _reply_event_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

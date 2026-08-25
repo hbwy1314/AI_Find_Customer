@@ -4,6 +4,7 @@ from automation.notifier import (
     render_hunt_completed_text,
     render_hunt_failed_text,
     render_hunt_started_text,
+    render_reply_detected_text,
     render_send_batch_text,
     render_summary_text,
 )
@@ -88,3 +89,86 @@ def test_render_discovery_and_send_batch_text():
     assert "Acme" in discovery
     assert "邮件已发送" in sending
     assert "buyer@acme.com" in sending
+
+
+# ── render_reply_detected_text ──────────────────────────────────
+# Feishu push notification body for inbound replies matched to a
+# sent message. Renders up to 10 matches per batch; an N+1 line lists
+# the remaining count so the Feishu text stays under the 4KB limit.
+
+
+def test_render_reply_detected_text_empty_returns_empty_string():
+    assert render_reply_detected_text([]) == ""
+
+
+def test_render_reply_detected_text_basic():
+    text = render_reply_detected_text([
+        {
+            "lead_email": "buyer@acme.com",
+            "lead_name": "Alice from Acme",
+            "subject": "Re: Hello",
+            "snippet": "Thanks for reaching out — let's talk next week.",
+        },
+    ])
+    assert "AI Hunter 收到回信 | 本轮 1 条" in text
+    assert "Alice from Acme <buyer@acme.com>" in text
+    assert "Re: Hello" in text
+    assert "Thanks for reaching out" in text
+    assert "已自动停止后续跟进邮件" in text
+
+
+def test_render_reply_detected_text_caps_at_10_and_announces_remainder():
+    matches = [
+        {
+            "lead_email": f"buyer{i}@acme.com",
+            "lead_name": f"Buyer {i}",
+            "subject": f"Re: Quote #{i}",
+            "snippet": f"snippet {i}",
+        }
+        for i in range(12)
+    ]
+    text = render_reply_detected_text(matches)
+    assert "本轮 12 条" in text
+    # 10 leads in the body, 12th line is the remainder footer, 13th is
+    # the auto-stop reminder.
+    assert "其余 2 条已省略" in text
+    # The 11th and 12th lead are dropped from the body.
+    assert "buyer10@acme.com" not in text
+    assert "buyer11@acme.com" not in text
+    # The first 10 still made it.
+    assert "buyer0@acme.com" in text
+    assert "buyer9@acme.com" in text
+
+
+def test_render_reply_detected_text_falls_back_to_local_part_when_no_name():
+    text = render_reply_detected_text([
+        {
+            "lead_email": "sales@beta.com",
+            "lead_name": "",
+            "subject": "Re: Quote",
+            "snippet": "",
+        },
+    ])
+    # No name — fall back to the local part of the address (no angle brackets).
+    assert "sales" in text
+    assert "<sales@beta.com>" not in text
+    # Empty snippet must not produce a dangling "  " line — verify
+    # the lead line is immediately followed by the auto-stop footer
+    # (no extra line in between).
+    body_lines = text.splitlines()
+    lead_line = next(l for l in body_lines if l.startswith("- sales"))
+    footer_line = "已自动停止后续跟进邮件，可到 AI Hunter 详情页查看对话。"
+    assert body_lines[body_lines.index(lead_line) + 1] == footer_line
+
+
+def test_render_reply_detected_text_truncates_long_subject_and_snippet():
+    long_subject = "A" * 200
+    long_snippet = "B" * 300
+    text = render_reply_detected_text([
+        {"lead_email": "x@y.com", "lead_name": "X", "subject": long_subject, "snippet": long_snippet},
+    ])
+    # 60-char cap on subject, 120-char cap on snippet.
+    assert "A" * 60 in text
+    assert "A" * 61 not in text
+    assert "B" * 120 in text
+    assert "B" * 121 not in text
