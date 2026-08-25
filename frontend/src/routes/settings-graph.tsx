@@ -32,6 +32,7 @@ const SAVE_KEYS = [
   "graph_tenant_id", "graph_client_id", "graph_client_secret",
   "graph_mailbox_upn", "graph_default_scopes",
   "email_provider_type",
+  "email_auto_send_enabled",
 ];
 
 const SECRET_KEYS = ["graph_client_secret"];
@@ -453,6 +454,45 @@ export function GraphSettingsPage() {
                   查看已添加的邮箱 →
                 </Link>
               </div>
+            </CardContent>
+          </Card>
+
+          {/* Auto-send master switch */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">自动发送总开关</CardTitle>
+              <CardDescription>
+                关闭时：调度器照常生成邮件序列，但所有已就绪的发送任务都会停在 "仅草稿 / 待确认" 状态，
+                不会真的调 Graph 发出去。开启后，调度器每分钟轮询一次队列，把过了间隔时间的消息通过 Graph 发出去。
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <label
+                htmlFor="email_auto_send_enabled"
+                className="flex items-center gap-2 cursor-pointer"
+              >
+                <input
+                  id="email_auto_send_enabled"
+                  type="checkbox"
+                  checked={
+                    (form.values.email_auto_send_enabled ?? "false").toLowerCase() !== "false"
+                  }
+                  onChange={(e) =>
+                    form.handleChange(
+                      "email_auto_send_enabled",
+                      e.target.checked ? "true" : "false",
+                    )
+                  }
+                  className="h-4 w-4 rounded border-input"
+                />
+                <span className="text-sm font-medium leading-none">
+                  启用自动发送（走 Microsoft Graph）
+                </span>
+              </label>
+              <p className="text-xs text-muted-foreground">
+                关闭等同于把整个发送链路置于 "干跑" 模式 — 适合只生成内容、想人工审核后再发的场景。
+                实际生效要等下一次 save 按钮。
+              </p>
             </CardContent>
           </Card>
 
