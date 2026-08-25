@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { api, type EmailCampaignListItem, type EmailSequence, type HuntResult } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Clock, Globe, Loader2, RotateCcw, Target, Workflow, Mail, Building2, Send, Eye } from "lucide-react";
+import { Clock, Globe, Loader2, RotateCcw, Target, Trash2, Workflow, Mail, Building2, Send, Eye } from "lucide-react";
 import { Sheet, SheetBody, SheetHeader } from "@/components/ui/sheet";
 
 const EXECUTION_STAGES = [
@@ -270,8 +270,10 @@ function SequenceDetailSheet({
 export function AutomationJobPage() {
   const { jobId } = useParams({ from: "/automation/$jobId" });
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const [streamState, setStreamState] = useState<"idle" | "connecting" | "connected" | "fallback">("idle");
   const [selectedSequenceId, setSelectedSequenceId] = useState("");
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [activeSection, setActiveSection] = useState<"overview" | "pipeline" | "leads" | "templates" | "delivery">("overview");
   const [leadFilter, setLeadFilter] = useState("");
   const [templateFilter, setTemplateFilter] = useState("");
@@ -327,6 +329,24 @@ export function AutomationJobPage() {
       await queryClient.invalidateQueries({ queryKey: ["automation-jobs"] });
       await queryClient.invalidateQueries({ queryKey: ["automation-status"] });
       await queryClient.invalidateQueries({ queryKey: ["automation-metrics", 24] });
+    },
+  });
+  const deleteMutation = useMutation({
+    mutationFn: () => api.deleteAutomationJob(jobId),
+    onSuccess: async (resp) => {
+      setShowDeleteDialog(false);
+      await queryClient.invalidateQueries({ queryKey: ["automation-jobs"] });
+      await queryClient.invalidateQueries({ queryKey: ["automation-status"] });
+      await queryClient.invalidateQueries({ queryKey: ["automation-metrics", 24] });
+      // If we cancelled-and-deleted, the underlying hunt is also
+      // stopped. Best UX is to send the operator back to the
+      // dashboard so they see the new state immediately. We don't
+      // navigate to `/automation` because that path isn't a
+      // registered TanStack route — it's only in the catch-all
+      // `KNOWN_ROUTES` set, so TS would reject the literal here.
+      if (resp?.cancelled_first) {
+        navigate({ to: "/" });
+      }
     },
   });
 
@@ -479,8 +499,69 @@ export function AutomationJobPage() {
               {retryMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : "重新入队"}
             </Button>
           )}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-muted-foreground hover:text-destructive"
+            onClick={() => setShowDeleteDialog(true)}
+            title="从历史记录中删除这个任务（不影响 hunt 本身）"
+          >
+            <Trash2 className="h-4 w-4" />
+            <span className="ml-1 hidden sm:inline">删除</span>
+          </Button>
         </div>
       </div>
+
+      {showDeleteDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/50" onClick={() => !deleteMutation.isPending && setShowDeleteDialog(false)} />
+          <div className="relative z-10 bg-background rounded-xl shadow-2xl border w-full max-w-md mx-4 p-6 space-y-5">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-destructive/10">
+                <Trash2 className="h-5 w-5 text-destructive" />
+              </div>
+              <div>
+                <h2 className="text-lg font-bold">删除任务</h2>
+                <p className="text-sm text-muted-foreground">
+                  {job.status === "queued" || job.status === "running"
+                    ? "此任务正在运行/排队，会先取消再删除。"
+                    : "从任务历史中删除此条目。"}
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-md bg-muted/50 border p-3 text-xs text-muted-foreground space-y-1">
+              <p className="font-medium text-foreground">将删除：</p>
+              <p>↺ hunt_jobs 表中的任务记录（status={job.status}）</p>
+              <p className="font-medium text-foreground mt-1">将保留：</p>
+              <p>✓ hunt 本身 &nbsp;✓ 邮件 campaign &nbsp;✓ 已发邮件 &nbsp;✓ 线索数据</p>
+            </div>
+
+            <div className="flex gap-3 pt-1">
+              <Button
+                variant="outline"
+                className="flex-1"
+                onClick={() => setShowDeleteDialog(false)}
+                disabled={deleteMutation.isPending}
+              >
+                取消
+              </Button>
+              <Button
+                variant="destructive"
+                className="flex-1"
+                onClick={() => deleteMutation.mutate()}
+                disabled={deleteMutation.isPending}
+              >
+                {deleteMutation.isPending ? (
+                  <><Loader2 className="h-4 w-4 mr-2 animate-spin" />删除中...</>
+                ) : (
+                  <><Trash2 className="h-4 w-4 mr-2" />确认删除</>
+                )}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <Card className="border-dashed">
         <CardContent className="flex flex-wrap gap-2 py-4">

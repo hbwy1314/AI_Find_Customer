@@ -357,6 +357,40 @@ async def retry_automation_job(job_id: str):
     return _serialize_job(updated or job)
 
 
+@router.delete("/jobs/{job_id}", dependencies=[Depends(require_api_access)])
+async def delete_automation_job(job_id: str):
+    """Hard-delete a queued/completed/failed job from history.
+
+    If the job is still `running` (consumer actively working on it)
+    or `queued` (about to be claimed), we cancel it first so the
+    consumer's next `mark_completed` / `mark_failed` write is a no-op
+    rather than a confusing integrity error. The deletion itself
+    drops the `hunt_jobs` row; downstream artefacts (the actual
+    hunt, the email campaign, the email_messages) are intentionally
+    left alone — deleting the job is a UI-history cleanup, not a
+    blast-radius reset.
+    """
+    queue = _queue()
+    job = queue.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Automation job not found")
+    status = str(job.get("status", "") or "")
+    if status in ("queued", "running"):
+        queue.cancel(job_id, updated_at=now_iso())
+        hunt_id = str(job.get("last_hunt_id", "") or "")
+        if hunt_id:
+            request_hunt_cancel(hunt_id, reason="Cancelled by user via job delete")
+    deleted = queue.delete_job(job_id)
+    if not deleted:
+        # The row was cancelled-but-gone (e.g. a different request
+        # raced us and reaped it). That's still a successful delete
+        # from the operator's perspective — return 200 with
+        # `deleted=False` so the UI can decide what to render.
+        logger.info("[AutomationQueue] delete raced; job=%s already gone", job_id[:8])
+    logger.info("[AutomationQueue] deleted job=%s (was status=%s)", job_id[:8], status)
+    return {"ok": True, "job_id": job_id, "deleted": deleted, "cancelled_first": status in ("queued", "running")}
+
+
 @router.get("/status", dependencies=[Depends(require_api_access)])
 async def get_automation_status():
     return collect_automation_status(hunts=_hunts)

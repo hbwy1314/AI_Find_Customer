@@ -897,6 +897,12 @@ export const api = {
       method: "POST",
     }),
 
+  deleteAutomationJob: (jobId: string) =>
+    request<{ ok: boolean; job_id: string; deleted: boolean; cancelled_first: boolean }>(
+      `/automation/jobs/${jobId}`,
+      { method: "DELETE" },
+    ),
+
   getAutomationStatus: () =>
     request<AutomationStatus>("/automation/status"),
 

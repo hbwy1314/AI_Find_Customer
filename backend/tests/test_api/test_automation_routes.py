@@ -483,3 +483,139 @@ def test_cancel_running_job_requests_hunt_cancel(monkeypatch):
 
     assert cancelled.status_code == 200
     assert requested == [("hunt-123", "Cancelled by user via automation job")]
+
+
+def test_delete_completed_job_removes_row_without_cancel(monkeypatch):
+    """Deleting a terminal-status job should not touch the cancel path."""
+    app = create_app()
+    client = TestClient(app)
+
+    state = {
+        "id": "job-done",
+        "status": "completed",
+        "created_at": "2026-04-05T00:00:00+00:00",
+        "updated_at": "2026-04-05T01:00:00+00:00",
+        "started_at": "2026-04-05T00:00:10+00:00",
+        "finished_at": "2026-04-05T01:00:00+00:00",
+        "attempt_count": 1,
+        "last_error": "",
+        "last_hunt_id": "hunt-done",
+        "payload": {"website_url": "https://x.example.com/"},
+    }
+
+    cancelled_calls: list[str] = []
+    deleted_ids: list[str] = []
+
+    class FakeQueue:
+        def init_db(self):
+            return None
+
+        def get(self, job_id):
+            return state.copy() if job_id == "job-done" else None
+
+        def cancel(self, job_id, updated_at):
+            cancelled_calls.append(job_id)
+
+        def delete_job(self, job_id):
+            deleted_ids.append(job_id)
+            return True
+
+    requested = []
+    monkeypatch.setattr("api.automation_routes._queue", lambda: FakeQueue())
+    monkeypatch.setattr("api.automation_routes.request_hunt_cancel", lambda hunt_id, reason="": requested.append((hunt_id, reason)) or True)
+
+    resp = client.delete("/api/v1/automation/jobs/job-done")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"ok": True, "job_id": "job-done", "deleted": True, "cancelled_first": False}
+    # A completed job must NOT go through cancel — that would clobber
+    # finished_at and re-open the chance of a duplicate worker.
+    assert cancelled_calls == []
+    # We did call delete_job, and we did NOT ask the hunt to cancel.
+    assert deleted_ids == ["job-done"]
+    assert requested == []
+
+
+def test_delete_running_job_cancels_hunt_first(monkeypatch):
+    """Deleting a still-running job must cancel it (and its hunt) first,
+    otherwise the consumer's next mark_completed / mark_failed write
+    against a deleted row would surface as an integrity error."""
+    app = create_app()
+    client = TestClient(app)
+
+    state = {
+        "id": "job-live",
+        "status": "running",
+        "created_at": "2026-04-05T00:00:00+00:00",
+        "updated_at": "2026-04-05T00:01:00+00:00",
+        "started_at": "2026-04-05T00:00:10+00:00",
+        "finished_at": "",
+        "attempt_count": 1,
+        "last_error": "",
+        "last_hunt_id": "hunt-live",
+        "payload": {"website_url": "https://x.example.com/"},
+    }
+
+    cancelled = []
+    deleted = []
+    hunt_cancels = []
+
+    class FakeQueue:
+        def init_db(self):
+            return None
+
+        def get(self, job_id):
+            return state.copy() if job_id == "job-live" else None
+
+        def cancel(self, job_id, updated_at):
+            cancelled.append(job_id)
+            state["status"] = "failed"
+            state["finished_at"] = updated_at
+            state["last_error"] = "Cancelled by user"
+            state["progress_stage"] = "cancelled"
+
+        def delete_job(self, job_id):
+            deleted.append(job_id)
+            return True
+
+    monkeypatch.setattr("api.automation_routes._queue", lambda: FakeQueue())
+    monkeypatch.setattr(
+        "api.automation_routes.request_hunt_cancel",
+        lambda hunt_id, reason="": hunt_cancels.append((hunt_id, reason)) or True,
+    )
+
+    resp = client.delete("/api/v1/automation/jobs/job-live")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["cancelled_first"] is True
+    assert body["deleted"] is True
+    # Order matters: cancel must complete before delete.
+    assert cancelled == ["job-live"]
+    assert deleted == ["job-live"]
+    assert hunt_cancels == [("hunt-live", "Cancelled by user via job delete")]
+
+
+def test_delete_missing_job_returns_404(monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+
+    class FakeQueue:
+        def init_db(self):
+            return None
+
+        def get(self, job_id):
+            return None
+
+        def cancel(self, job_id, updated_at):
+            raise AssertionError("cancel must not be called for missing job")
+
+        def delete_job(self, job_id):
+            raise AssertionError("delete_job must not be called for missing job")
+
+    monkeypatch.setattr("api.automation_routes._queue", lambda: FakeQueue())
+    resp = client.delete("/api/v1/automation/jobs/never-existed")
+    assert resp.status_code == 404
+    assert "not found" in resp.json()["detail"].lower()

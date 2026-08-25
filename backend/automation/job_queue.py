@@ -327,6 +327,21 @@ class HuntJobQueue:
                 (updated_at, updated_at, job_id),
             )
 
+    def delete_job(self, job_id: str) -> bool:
+        """Hard-delete a job row from `hunt_jobs`. Returns True if a
+        row was actually removed, False if the id didn't exist.
+
+        Callers are responsible for cancelling first if the job is
+        currently `running` (or `queued`) — this method will yank
+        a live job's history out from under a consumer that's about
+        to call `mark_completed` / `mark_failed` against it. The
+        `DELETE /api/v1/automation/jobs/{job_id}` route handles that
+        ordering: it calls `cancel()` first, then `delete_job()`.
+        """
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM hunt_jobs WHERE id = ?", (job_id,))
+        return cur.rowcount > 0
+
     def update_progress(
         self,
         job_id: str,
