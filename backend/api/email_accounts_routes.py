@@ -440,6 +440,29 @@ async def test_send_email(
         f"时间: {datetime.now(timezone.utc).isoformat()}\n\n"
         "如果收到说明 Microsoft Graph 发送链路工作正常。"
     )
+
+    # Refuse reserved/test domains up front so the operator gets a
+    # clear error in the UI (instead of a Graph-sent 550 bouncing back
+    # as an NDR). The same guard lives in email_sender.send_email as a
+    # last-line defence, but failing here keeps the row out of
+    # email_test_send_log entirely.
+    from emailing.email_sender import _is_reserved_recipient
+    reserved = _is_reserved_recipient(payload.to_email.strip())
+    if reserved:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "reserved_recipient",
+                "to_email": payload.to_email.strip(),
+                "reason": reserved,
+                "message": (
+                    f"收件人 {payload.to_email.strip()} 在保留域名列表中（{reserved}），"
+                    "AI Hunter 不会真的发出去。请用你自己的真实邮箱地址测试发送链路，"
+                    "或者把 '收件人' 留空让它发到本账号自己。"
+                ),
+            },
+        )
+
     sent = await email_sender.send_email(
         account,
         to_email=payload.to_email.strip(),

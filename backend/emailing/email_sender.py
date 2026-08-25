@@ -33,6 +33,48 @@ def _normalise_provider(provider: str) -> str:
 _STUB_PROVIDER_IDS: frozenset[str] = frozenset({"x", "y", "test", "stub", "fake", "mock", "placeholder"})
 
 
+# Recipient domains we should NEVER actually send to. Per RFC 2606
+# (example.com/.example/.test/.invalid/.localhost) and a few common
+# test/reserved patterns. Production traffic to these addresses always
+# bounces (550 5.1.1 User unknown) and pollutes the mailbox backend
+# with NDRs. The guard short-circuits before Graph is called, so the
+# 25 mailbox tenants never see a stray test send again.
+_RESERVED_RECIPIENT_DOMAINS: frozenset[str] = frozenset({
+    "example.com", "example.org", "example.net",
+    "acme.com", "acme.org", "acme.net",
+    "localhost", "localhost.localdomain",
+    "test.com", "test.org", "test.local",
+    "invalid",
+    # RFC 6761: these TLDs are reserved for testing/documentation.
+    ".test", ".example", ".invalid", ".localhost",
+})
+
+
+def _is_reserved_recipient(email: str) -> str | None:
+    """Return a human-readable reason if ``email`` targets a reserved
+    domain that AI Hunter should never actually send to; otherwise None.
+
+    The check is conservative: the local-part and the right-most
+    label(s) are lowercased and compared against the blocklist, plus
+    a TLD-only check for the RFC 6761 reserved TLDs.
+    """
+    if not email or "@" not in email:
+        return "malformed_recipient"
+    local, _, domain = email.strip().rpartition("@")
+    if not local or not domain:
+        return "malformed_recipient"
+    domain_lower = domain.lower().strip().rstrip(".")
+    if not domain_lower:
+        return "malformed_recipient"
+    if domain_lower in _RESERVED_RECIPIENT_DOMAINS:
+        return f"reserved_domain:{domain_lower}"
+    # Reserved TLDs (RFC 6761).
+    for tld in (".test", ".example", ".invalid", ".localhost"):
+        if domain_lower.endswith(tld):
+            return f"reserved_tld:{tld}"
+    return None
+
+
 async def send_email(
     account: dict[str, Any],
     *,
@@ -61,6 +103,27 @@ async def send_email(
             "thread_key": thread_key or subject,
             "sent_at": "",
             "error": "missing_recipient",
+            "error_type": "invalid_recipient",
+        }
+
+    # Reserved-domain guard. Refuse to actually send to RFC 2606 / 6761
+    # reserved addresses (example.com, acme.com, .test, .invalid, ...).
+    # Production traffic to these always bounces and clutters the
+    # tenant's mailbox with NDRs. Short-circuits before Graph is
+    # called so the bad send never leaves our network.
+    reserved_reason = _is_reserved_recipient(to_email)
+    if reserved_reason:
+        logger.warning(
+            "[EmailSender] refusing send to reserved recipient %s (%s); subject=%r",
+            to_email, reserved_reason, subject,
+        )
+        return {
+            "ok": False,
+            "provider": _normalise_provider(account.get("provider_type")),
+            "provider_message_id": "",
+            "thread_key": thread_key or subject,
+            "sent_at": "",
+            "error": f"reserved_recipient:{reserved_reason}",
             "error_type": "invalid_recipient",
         }
 

@@ -451,8 +451,8 @@ class TestSendEmailDraft:
             "result": {
                 "email_sequences": [
                     {
-                        "lead": {"company_name": "Acme", "emails": ["hello@acme.com"]},
-                        "target": {"target_email": "buyer@acme.com"},
+                        "lead": {"company_name": "Acme", "emails": ["hello@acmetest.io"]},
+                        "target": {"target_email": "buyer@acmetest.io"},
                         "locale": "en_US",
                         "emails": [
                             {
@@ -470,12 +470,12 @@ class TestSendEmailDraft:
         }
 
         fake_settings = MagicMock()
-        fake_settings.email_from_address = "sales@example.com"
+        fake_settings.email_from_address = "sales@recipient-test.io"
         fake_settings.email_auto_send_enabled = False
         fake_settings.graph_tenant_id = "tenant-1"
         fake_settings.graph_client_id = "client-1"
         fake_settings.graph_client_secret = "secret"
-        fake_settings.graph_mailbox_upn = "sales@example.com"
+        fake_settings.graph_mailbox_upn = "sales@recipient-test.io"
         with (
             patch("api.routes.get_settings", return_value=fake_settings),
         ):
@@ -486,7 +486,7 @@ class TestSendEmailDraft:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] in {"ok", "sent"}
-        assert data["sent_to"] == "buyer@acme.com"
+        assert data["sent_to"] == "buyer@acmetest.io"
         assert _hunts["send-1"]["result"]["email_sequences"][0]["emails"][0]["send_status"] == "sent"
 
     @pytest.mark.asyncio
@@ -544,7 +544,7 @@ class TestSendEmailDraft:
             "result": {
                 "email_sequences": [
                     {
-                        "lead": {"company_name": "Acme", "emails": ["hello@acme.com"]},
+                        "lead": {"company_name": "Acme", "emails": ["hello@acmetest.io"]},
                         "locale": "en_US",
                         "emails": [
                             {"sequence_number": 1, "subject": "Hello", "body_text": "Body"},
@@ -559,11 +559,11 @@ class TestSendEmailDraft:
         }
 
         fake_settings = MagicMock()
-        fake_settings.email_from_address = "sales@example.com"
+        fake_settings.email_from_address = "sales@recipient-test.io"
         fake_settings.graph_tenant_id = "tenant-1"
         fake_settings.graph_client_id = "client-1"
         fake_settings.graph_client_secret = "secret"
-        fake_settings.graph_mailbox_upn = "sales@example.com"
+        fake_settings.graph_mailbox_upn = "sales@recipient-test.io"
         with (
             patch("api.routes.get_settings", return_value=fake_settings),
         ):

@@ -31,7 +31,7 @@ async def test_send_email_legacy_smtp_provider_is_coerced_to_graph(monkeypatch):
         "from_email": "sales@example.com",
         "reply_to": "",
     }
-    result = await send_email(account, to_email="buyer@example.com", subject="Hi", body_text="Hello")
+    result = await send_email(account, to_email="buyer@recipient-test.io", subject="Hi", body_text="Hello")
     assert result["ok"] is True
     assert result["provider"] == "graph"
 
@@ -71,7 +71,7 @@ async def test_graph_send_uses_two_step_create_then_send(monkeypatch):
 
     result = await send_via_graph(
         account,
-        to_email="buyer@example.com",
+        to_email="buyer@recipient-test.io",
         subject="Hi",
         body_text="Hello",
     )
@@ -112,7 +112,7 @@ async def test_graph_send_does_not_set_message_id_header(monkeypatch):
 
     await send_via_graph(
         account,
-        to_email="buyer@example.com",
+        to_email="buyer@recipient-test.io",
         subject="Hi",
         body_text="Hello",
     )
@@ -145,7 +145,7 @@ async def test_graph_send_create_failure_surfaces_as_error(monkeypatch):
 
     result = await send_via_graph(
         account,
-        to_email="buyer@example.com",
+        to_email="buyer@recipient-test.io",
         subject="Hi",
         body_text="Hello",
     )
@@ -188,7 +188,7 @@ async def test_graph_send_does_not_set_from_in_create_payload(monkeypatch):
 
     result = await send_via_graph(
         account,
-        to_email="buyer@example.com",
+        to_email="buyer@recipient-test.io",
         subject="Hi",
         body_text="Hello",
     )
@@ -228,7 +228,7 @@ async def test_graph_send_falls_back_to_sendmail_when_two_step_send_fails(monkey
 
     result = await send_via_graph(
         account,
-        to_email="buyer@example.com",
+        to_email="buyer@recipient-test.io",
         subject="Hi",
         body_text="Hello",
     )
@@ -282,7 +282,7 @@ async def test_send_email_rejects_stub_provider_message_id(monkeypatch):
 
     result = await send_email(
         account,
-        to_email="buyer@example.com",
+        to_email="buyer@recipient-test.io",
         subject="Hi",
         body_text="Hello",
     )
@@ -320,7 +320,7 @@ async def test_send_email_rejects_stub_thread_key(monkeypatch):
 
     result = await send_email(
         account,
-        to_email="buyer@example.com",
+        to_email="buyer@recipient-test.io",
         subject="Hi",
         body_text="Hello",
     )
@@ -355,7 +355,7 @@ async def test_send_email_allows_empty_provider_message_id(monkeypatch):
 
     result = await send_email(
         account,
-        to_email="buyer@example.com",
+        to_email="buyer@recipient-test.io",
         subject="Hi",
         body_text="Hello",
     )
@@ -392,9 +392,79 @@ async def test_send_email_accepts_real_graph_id(monkeypatch):
 
     result = await send_email(
         account,
-        to_email="buyer@example.com",
+        to_email="buyer@recipient-test.io",
         subject="Hi",
         body_text="Hello",
     )
     assert result["ok"] is True
     assert result["provider_message_id"] == real_id
+
+
+# ── reserved-recipient guard ─────────────────────────────────────
+# Short-circuits the send before Graph is called when the recipient
+# is a known test/reserved domain (RFC 2606 / 6761). Catches the
+# "buyer@acme.com / hello@acme.com" smoke-test case that was leaking
+# into the tenant's mailbox as 550 bounces.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blocked",
+    [
+        "buyer@acme.com",
+        "hello@acme.com",
+        "anyone@example.com",
+        "anyone@example.org",
+        "anything@test.com",
+        "anyone@host.invalid",
+        "anyone@service.localhost",
+        "anyone@subdomain.test",  # reserved TLD
+    ],
+)
+async def test_send_email_rejects_reserved_recipient_domains(monkeypatch, blocked):
+    # If the guard ever leaks, Graph will be called — that would mean
+    # the test environment is wrong, not that the guard is wrong.
+    called = {"count": 0}
+
+    async def fake_send(*_args, **_kwargs):
+        called["count"] += 1
+        return {"ok": True, "provider_message_id": "graph-real-id", "thread_key": "tk"}
+
+    monkeypatch.setattr(
+        "emailing.graph_client.send_via_graph", fake_send, raising=False
+    )
+
+    result = await send_email(
+        {"provider_type": "graph", "from_email": "ops@real-tenant.com"},
+        to_email=blocked,
+        subject="test",
+        body_text="test",
+    )
+    assert result["ok"] is False
+    assert result["error_type"] == "invalid_recipient"
+    assert "reserved_recipient" in result["error"]
+    # And — critically — Graph was NOT called.
+    assert called["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_send_email_allows_normal_recipient(monkeypatch):
+    async def fake_send(*_args, **_kwargs):
+        return {
+            "ok": True,
+            "provider_message_id": "graph-real-id",
+            "thread_key": "tk",
+        }
+
+    monkeypatch.setattr(
+        "emailing.graph_client.send_via_graph", fake_send, raising=False
+    )
+
+    result = await send_email(
+        {"provider_type": "graph", "from_email": "ops@real-tenant.com"},
+        to_email="real-buyer@some-real-company.com",
+        subject="Hi",
+        body_text="Hello",
+    )
+    assert result["ok"] is True
+    assert result["provider_message_id"] == "graph-real-id"
