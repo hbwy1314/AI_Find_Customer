@@ -34,6 +34,13 @@ def _make_settings(**overrides) -> Settings:
         "email_reasoning_model": "",
         "email_llm_requests_per_minute": 0,
         "email_reasoning_requests_per_minute": 0,
+        # Pin the platform-level override off so tests don't pick up a
+        # real value from the developer's .env (e.g. "邮件内容全部
+        # 使用中文"). Each test that exercises the override explicitly
+        # passes ``llm_system_prompt_enabled=True`` and a specific
+        # override string.
+        "llm_system_prompt_enabled": False,
+        "llm_system_prompt_override": "",
     }
     defaults.update(overrides)
     return Settings(**defaults)
@@ -490,9 +497,12 @@ class TestSystemPromptOverrideHelper:
         assert out.startswith("agent system")
         assert "STRICT PLATFORM OVERRIDE" in out
         assert "highest priority" in out
-        assert out.endswith("Reply in JSON only.")
-        # Override must be the LAST thing in the system message —
-        # models weight the tail of the system block more heavily.
+        # Override sits inside the bordered marker block, which closes
+        # with a `═══` line. That's the only thing after the override
+        # text — the agent's own system prompt is what comes before.
+        assert "Reply in JSON only." in out
+        # The override text must be located AFTER the marker intro,
+        # so models see the precedence declaration first.
         assert out.index("Reply in JSON only.") > out.index("STRICT PLATFORM OVERRIDE")
 
     def test_enabled_with_empty_agent_system(self):
@@ -529,8 +539,12 @@ class TestSystemPromptOverrideInGenerate:
         sent_system = mc.call_args.kwargs["messages"][0]["content"]
         assert sent_system.startswith("agent system")
         assert "OUTPUT JSON ONLY" in sent_system
-        # Override lives at the tail, after the highest-priority marker.
-        assert sent_system.endswith("OUTPUT JSON ONLY")
+        # Override lives inside the bordered marker block, after the
+        # STRICT-intro line. Marker closes with a `═══` line right
+        # after the override — the override itself comes before that
+        # closer.
+        assert "STRICT PLATFORM OVERRIDE" in sent_system
+        assert sent_system.index("OUTPUT JSON ONLY") > sent_system.index("STRICT PLATFORM OVERRIDE")
 
     @pytest.mark.asyncio
     async def test_override_enabled_no_agent_system(self):

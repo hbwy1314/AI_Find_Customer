@@ -27,6 +27,11 @@ def _make_react_settings(**overrides) -> Settings:
         "react_max_iterations": 1,
         "llm_requests_per_minute": 0,
         "reasoning_requests_per_minute": 0,
+        # Same default as test_llm_client._make_settings — pin the
+        # platform override off so tests don't inherit values from a
+        # developer's .env.
+        "llm_system_prompt_enabled": False,
+        "llm_system_prompt_override": "",
     }
     defaults.update(overrides)
     return Settings(**defaults)
@@ -251,4 +256,8 @@ class TestReActLoopSystemPromptOverride:
         assert "react agent system" in sent_system
         assert "STRICT PLATFORM OVERRIDE" in sent_system
         assert "highest priority" in sent_system
-        assert sent_system.endswith("OUTPUT JSON ONLY")
+        # Override text is inside the bordered marker block, before
+        # the closing `═══` line. Order matters: marker intro first,
+        # then the operator's override text.
+        assert "OUTPUT JSON ONLY" in sent_system
+        assert sent_system.index("OUTPUT JSON ONLY") > sent_system.index("STRICT PLATFORM OVERRIDE")
