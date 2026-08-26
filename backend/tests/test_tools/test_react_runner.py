@@ -249,5 +249,6 @@ class TestReActLoopSystemPromptOverride:
 
         sent_system = mc.call_args.kwargs["messages"][0]["content"]
         assert "react agent system" in sent_system
-        assert "[Platform override — highest priority]" in sent_system
+        assert "STRICT PLATFORM OVERRIDE" in sent_system
+        assert "highest priority" in sent_system
         assert sent_system.endswith("OUTPUT JSON ONLY")

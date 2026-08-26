@@ -488,11 +488,12 @@ class TestSystemPromptOverrideHelper:
         )
         out = _apply_system_prompt_override("agent system", s)
         assert out.startswith("agent system")
-        assert "[Platform override — highest priority]" in out
+        assert "STRICT PLATFORM OVERRIDE" in out
+        assert "highest priority" in out
         assert out.endswith("Reply in JSON only.")
         # Override must be the LAST thing in the system message —
         # models weight the tail of the system block more heavily.
-        assert out.index("Reply in JSON only.") > out.index("[Platform override")
+        assert out.index("Reply in JSON only.") > out.index("STRICT PLATFORM OVERRIDE")
 
     def test_enabled_with_empty_agent_system(self):
         s = _make_settings(

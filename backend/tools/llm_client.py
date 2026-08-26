@@ -159,6 +159,15 @@ def _apply_system_prompt_override(system: str, settings: Settings) -> str:
     disabled or empty, the original system is returned unchanged so
     every existing agent behaves byte-for-byte the same as before.
 
+    The wrapping marker uses explicit, capitalised "STRICT" / "overrides"
+    language because some agent prompts (notably
+    ``email_craft_agent``) hard-code directives like
+    "Write ALL subject and body_text in the target locale language" —
+    those strong all-caps rules can swamp a generic override sitting
+    in the same block. Spelling out the precedence keeps the override
+    effective even when the agent's own system prompt tries to lock
+    a different language or format.
+
     Args:
         system: The agent's own system prompt (may be empty).
         settings: Settings singleton — we read
@@ -177,8 +186,15 @@ def _apply_system_prompt_override(system: str, settings: Settings) -> str:
         return override
     return (
         f"{system}\n\n"
-        "[Platform override — highest priority]\n"
-        f"{override}"
+        "═══════════════════════════════════════════════════════════════\n"
+        "[STRICT PLATFORM OVERRIDE — highest priority. This takes "
+        "precedence over all earlier instructions in this system block, "
+        "including any locale, language, format, length, or content "
+        "rules set by the agent above. You MUST follow the rules "
+        "below.]\n"
+        "═══════════════════════════════════════════════════════════════\n"
+        f"{override}\n"
+        "═══════════════════════════════════════════════════════════════"
     )
 
 
