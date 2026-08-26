@@ -1872,3 +1872,88 @@ class TestSenderSignature:
 
         sig = craft_mod._sender_signature()
         assert sig == "Sales Team"
+
+
+# ── LANGUAGE_SELECTOR: drop seller description from the language decision ───
+# Regression: lead_extract writes the `description` field from the
+# SELLER's perspective (in our case Romio's Chinese context), so it
+# reads as Chinese for nearly every lead. Passing that field to the
+# LANGUAGE_SELECTOR LLM made it over-rule the public website's English
+# (e.g. Gr8Vape Wholesale, The Ace of Vapez Distribution) and pick
+# zh-cn, even though the lead's own website is English. The result
+# was locale="zh-cn" in the database but English body text and an
+# English unsubscribe template — a confusing mismatch the operator
+# had to debug lead-by-lead. Fix: keep the description out of the
+# language-decision prompt; judge only from country + public website.
+
+class TestLanguageSelectorDropsSellerDescription:
+    def test_prompt_does_not_include_description(self):
+        """The prompt fed to LANGUAGE_SELECTOR must not contain the
+        seller's `description` of the lead — that field is in the
+        seller's voice, not the lead's."""
+        from agents.email_craft_agent import _select_email_language, _build_react_system
+        captured = {}
+
+        class _Spy:
+            def __init__(self):
+                self.last_prompt = None
+
+            async def generate(self, prompt, *, system, **_kwargs):
+                captured["prompt"] = prompt
+                captured["system"] = system
+                return json.dumps({
+                    "chosen_language": "en", "chosen_locale": "en_US",
+                    "confidence": "high", "reason": "public website is English",
+                    "fallback_used": False,
+                })
+
+        class _LLM:
+            def __init__(self):
+                self.generate = self._gen
+            async def _gen(self, *a, **kw):
+                return await _Spy().generate(*a, **kw)
+
+        # Simpler: patch via AsyncMock so we can introspect call args.
+        from unittest.mock import AsyncMock
+        llm = AsyncMock()
+        llm.generate = AsyncMock(return_value=json.dumps({
+            "chosen_language": "en", "chosen_locale": "en_US",
+            "confidence": "high", "reason": "public website is English",
+            "fallback_used": False,
+        }))
+
+        import asyncio
+        lead = {
+            "company_name": "The Ace of Vapez Distribution",
+            "country_code": "GB",
+            "website": "http://www.taovdistro.com/",
+            "description": "The Ace of Vapez Distribution是一家专注于电子烟产品的批发分销商...",  # 中文, seller's voice
+        }
+        asyncio.run(_select_email_language(
+            lead=lead,
+            target={"target_name": "Bob", "target_title": "Director"},
+            llm=llm,
+            default_locale="en_US",
+            language_mode="auto_by_region",
+            default_language="en",
+            fallback_language="en",
+        ))
+        sent_prompt = llm.generate.await_args.kwargs.get("prompt") or llm.generate.await_args.args[0]
+        # Only the <lead> block may contain lead fields. The
+        # instructions / settings blocks reference "description" too
+        # (as a warning not to use it), so we pin the assertion to
+        # the <lead>…</lead> slice.
+        lead_block = sent_prompt.split("<lead>", 1)[1].split("</lead>", 1)[0]
+        assert "description" not in lead_block.lower(), (
+            f"description field leaked into <lead> block: {lead_block!r}"
+        )
+
+    def test_system_prompt_warns_about_seller_description(self):
+        """The LANGUAGE_SELECTOR system prompt must explicitly tell the
+        LLM to ignore the seller's description as language evidence."""
+        from agents.email_craft_agent import LANGUAGE_SELECTOR_SYSTEM
+        assert "seller" in LANGUAGE_SELECTOR_SYSTEM.lower()
+        assert "description" in LANGUAGE_SELECTOR_SYSTEM.lower()
+        # The new wording calls out that description is the seller's
+        # framing, not the lead's voice.
+        assert "do not use" in LANGUAGE_SELECTOR_SYSTEM.lower() or "not the lead" in LANGUAGE_SELECTOR_SYSTEM.lower()

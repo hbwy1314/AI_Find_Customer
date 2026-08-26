@@ -679,6 +679,12 @@ Priority:
 3. If evidence is weak or mixed, prefer English.
 4. Do not force a local language only because of country if business evidence suggests English is safer.
 
+Do NOT use the seller's own description of the lead (the "description" field
+in our internal lead record, written from the seller's perspective) as
+language evidence. That field is the seller's framing, not the lead's
+public voice. Judge only from the lead's country and public website /
+social channels.
+
 Return JSON only:
 {
   "chosen_language": "...",
@@ -1655,14 +1661,14 @@ async def _select_email_language(
         f"<lead>\n"
         f"company_name: {lead.get('company_name', '')}\n"
         f"website: {lead.get('website', '')}\n"
-        f"description: {lead.get('description', '')}\n"
         f"country_code: {lead.get('country_code', '')}\n"
         f"contact_name: {target.get('target_name', '')}\n"
         f"contact_title: {target.get('target_title', '')}\n"
         f"</lead>\n\n"
         f"<instructions>\n"
-        f"Choose the most appropriate outbound email language.\n"
-        f"Use local language only when there is strong evidence it is the better business choice.\n"
+        f"Choose the most appropriate outbound email language from the lead's own signals (country and public website). "
+        f"Do NOT use the seller's internal description of the lead as evidence — that field is the seller's framing, not the lead's voice. "
+        f"Use local language only when there is strong evidence it is the better business choice. "
         f"If uncertain, choose English.\n"
         f"</instructions>"
     )
