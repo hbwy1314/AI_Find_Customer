@@ -1,4 +1,5 @@
 from emailing.body_format import (
+    _append_closing_if_missing,
     format_email_sequence_bodies,
     format_plaintext_email_body,
 )
@@ -142,3 +143,75 @@ def test_format_email_sequence_bodies_idempotent_without_footer():
     assert once == twice
     assert "不再接收此类邮件" not in once
     assert "不再接收此类邮件" not in twice
+
+
+# ── Signature back-fill (regression: "部分邮件 SYSTEM 部分没有") ──────
+# The LLM sometimes writes its own closing ("Best regards, John"),
+# which used to short-circuit the signature back-fill and silently
+# drop the operator's configured signature block. The helper now
+# appends the signature independently of the closing detection.
+
+def test_signature_appended_when_closing_already_present():
+    """Body has 'Best regards' but no signature — the configured
+    signature must still be appended. This is the Gr8Vape-class
+    inconsistency the operator hit."""
+    body = (
+        "Dear Manu,\n\n"
+        "GR8 VAPE LTD's catalogue of disposable vapes and pods lines up "
+        "with our Romio DASH and PILOT ranges.\n\n"
+        "Best regards,\nJohn Smith"
+    )
+    out = _append_closing_if_missing(body, locale="en_US", signature="SYSTEM")
+    assert "SYSTEM" in out, f"signature dropped: {out!r}"
+    # Existing closing kept, signature appended below it.
+    assert "Best regards" in out
+    assert out.rstrip().endswith("SYSTEM")
+
+
+def test_signature_not_duplicated_when_already_present():
+    body = "Hi,\n\nWe supply pods in bulk.\n\nBest regards,\nSYSTEM"
+    out = _append_closing_if_missing(body, locale="en_US", signature="SYSTEM")
+    # Body already ends with the configured signature — must not be
+    # appended a second time.
+    assert out.count("SYSTEM") == 1
+
+
+def test_signature_and_closing_both_appended_when_both_missing():
+    body = "Hi, we make micro switches for industrial controls."
+    out = _append_closing_if_missing(body, locale="en_US", signature="SYSTEM")
+    assert "Best regards" in out
+    assert "SYSTEM" in out
+    # Order: closing before signature.
+    assert out.index("Best regards") < out.index("SYSTEM")
+
+
+def test_signature_skipped_when_setting_is_empty():
+    """Empty signature is a no-op even when closing is also missing —
+    the locale default closing is still back-filled, no signature
+    is appended."""
+    body = "Hi, we make micro switches."
+    out = _append_closing_if_missing(body, locale="en_US", signature="")
+    assert "Best regards" in out
+    assert "SYSTEM" not in out
+
+
+def test_signature_preserved_for_chinese_locale():
+    body = "您好,我们供应工业级微动开关。\n\n此致敬礼"
+    out = _append_closing_if_missing(body, locale="zh_CN", signature="SYSTEM")
+    assert "SYSTEM" in out
+    assert out.rstrip().endswith("SYSTEM")
+
+
+def test_format_plaintext_email_body_end_to_end_with_signature():
+    """End-to-end: the LLM wrote a closing but no signature. The
+    top-level formatter must still surface the operator's signature
+    in the final body."""
+    body = (
+        "Dear Manu,\n\n"
+        "GR8 VAPE LTD distributes vape hardware in the UK; our Romio "
+        "DASH has 20000 puffs and could fit your catalogue.\n\n"
+        "Best regards,\nJohn"
+    )
+    out = format_plaintext_email_body(body, locale="en_US", signature="SYSTEM")
+    assert "SYSTEM" in out
+    assert out.rstrip().endswith("SYSTEM")

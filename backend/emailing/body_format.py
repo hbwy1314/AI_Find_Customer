@@ -103,21 +103,34 @@ def _closing_for_locale(locale: str | None) -> str:
 
 
 def _append_closing_if_missing(text: str, locale: str | None, signature: str | None) -> str:
-    """Append a localised closing (and optional signature) when the
-    body text is missing one. No-op when a closing is already present
-    or when ``text`` is empty.
+    """Back-fill a localised closing and/or signature when the body
+    text is missing them.
+
+    The previous version short-circuited whenever a recognised
+    closing was present, which meant a configured signature (e.g. a
+    brand string the operator pins in Settings) was silently
+    discarded whenever the LLM happened to write "Best regards" on
+    its own. That produced the "part of my emails have the signature,
+    part don't" inconsistency. This rewrite treats the closing and
+    the signature independently: missing closing is back-filled, and
+    missing signature is appended after the closing (or after the
+    existing closing when the LLM already wrote one). The signature
+    is only skipped when it is empty or when the body already
+    contains it verbatim — preventing double-stamping on re-runs.
     """
     normalized = (text or "").rstrip()
     if not normalized:
         return text
-    if _has_known_closing(normalized):
-        return text
-    closing = _closing_for_locale(locale)
-    pieces = [normalized, closing]
     sig = (signature or "").strip()
+    if sig and sig in normalized:
+        # Body already has the configured signature; never double it.
+        return normalized
+    if not _has_known_closing(normalized):
+        closing = _closing_for_locale(locale)
+        normalized = f"{normalized}\n\n{closing}" if closing else normalized
     if sig:
-        pieces.append(sig)
-    return "\n\n".join(pieces)
+        normalized = f"{normalized}\n\n{sig}"
+    return normalized
 
 
 def format_plaintext_email_body(
