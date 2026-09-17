@@ -14,9 +14,11 @@ a drop-in replacement at every call-site; it now also returns a
 
 from __future__ import annotations
 
-from typing import Optional
+import hmac
+import os
+from typing import Any, Optional
 
-from fastapi import Header, HTTPException, Query, Request, status
+from fastapi import Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict
 
 from config.settings import get_settings
@@ -77,31 +79,28 @@ def require_api_access(
     request: Request,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None),
-    api_key: str | None = Query(default=None),
 ) -> UserCtx | None:
     """Validate the request. Returns a UserCtx for session users, else None.
 
     Raises HTTPException for non-local, unauthenticated requests when
     `API_ACCESS_TOKEN` is set.
     """
-    return _resolve_ctx(request, authorization, x_api_key, api_key, raise_on_fail=True)
+    return _resolve_ctx(request, authorization, x_api_key, raise_on_fail=True)
 
 
 def optional_user(
     request: Request,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None),
-    api_key: str | None = Query(default=None),
 ) -> UserCtx | None:
     """Same as `require_api_access` but never raises — returns None for anonymous."""
-    return _resolve_ctx(request, authorization, x_api_key, api_key, raise_on_fail=False)
+    return _resolve_ctx(request, authorization, x_api_key, raise_on_fail=False)
 
 
 def _resolve_ctx(
     request: Request,
     authorization: str | None,
     x_api_key: str | None,
-    api_key: str | None,
     *,
     raise_on_fail: bool,
 ) -> UserCtx | None:
@@ -145,7 +144,10 @@ def _resolve_ctx(
             return ctx
 
     # 2. Fall through to API token / localhost dev bypass.
-    expected = settings.api_access_token.strip()
+    # Read the process environment as well as the cached Settings object.
+    # This keeps tests and long-running processes correct when a settings
+    # update rotates the access token before the cache is refreshed.
+    expected = (os.environ.get("API_ACCESS_TOKEN") or settings.api_access_token).strip()
     if not expected:
         if _is_local(request):
             ctx = UserCtx(user_id=0, role="dev", email="", via="localhost")
@@ -158,8 +160,8 @@ def _resolve_ctx(
             )
         return None
 
-    provided = x_api_key or api_key or _extract_bearer_token(authorization)
-    if provided == expected:
+    provided = x_api_key or _extract_bearer_token(authorization)
+    if provided and hmac.compare_digest(provided, expected):
         ctx = UserCtx(user_id=0, role="admin", email="", via="api_token")
         request.state.user_ctx = ctx
         return ctx
@@ -193,9 +195,26 @@ def require_user(request: Request) -> UserCtx:
 
 def require_admin(request: Request) -> UserCtx:
     user = _current_user_from(request)
-    if user.role != "admin":
+    # Localhost development bypass is already restricted by the network gate;
+    # keep it usable for the local settings UI while requiring a real admin
+    # role for remote/session users.
+    if user.role not in {"admin", "dev"}:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Administrator role required",
         )
+    return user
+
+
+def require_resource_access(request: Request, owner_id: Any) -> UserCtx:
+    """Require access to a user-owned resource without leaking its existence."""
+    user = _current_user_from(request)
+    if user.via != "session" or user.role in {"admin", "dev"}:
+        return user
+    try:
+        resource_owner = int(owner_id or 0)
+    except (TypeError, ValueError):
+        resource_owner = 0
+    if resource_owner != user.user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found")
     return user

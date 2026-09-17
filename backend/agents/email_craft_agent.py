@@ -437,6 +437,11 @@ def _personalize_per_lead_enabled(settings: Any = None) -> bool:
     value = getattr(settings, "email_personalize_per_lead", True)
     if isinstance(value, bool):
         return value
+    if not isinstance(value, (str, int, float)):
+        # Test doubles and malformed configuration objects must not silently
+        # enable the expensive per-lead mode. Only an explicit truthy value
+        # should change the configured default.
+        return False
     try:
         return bool(int(value))
     except (TypeError, ValueError):
@@ -1582,7 +1587,15 @@ async def _validate_and_revise_sequence(
             issues=dedup_issues,
             suggestions=dedup_suggestions,
         )
-        if revised is None:
+        if (
+            not isinstance(revised, dict)
+            or not isinstance(revised.get("emails"), list)
+            or not revised.get("emails")
+        ):
+            # A validator/rewrite model can return a diagnostics object
+            # without the required sequence. Keep the last usable draft
+            # instead of feeding that object into the next iteration and
+            # losing the entire email sequence.
             return current, last_summary
         current = revised
 
@@ -2397,6 +2410,11 @@ async def email_craft_node(state: HuntState) -> dict:
     email_template_examples = list(state.get("email_template_examples", []) or [])
     email_template_notes = str(state.get("email_template_notes", "") or "")
     prepared_template_seed = state.get("template_seed") if isinstance(state.get("template_seed"), dict) else None
+    progress_callback = state.get("email_progress_callback")
+
+    def report_progress(completed: int, generated: int, sequence: dict[str, Any] | None = None) -> None:
+        if callable(progress_callback):
+            progress_callback(completed=completed, total=len(leads), generated=generated, sequence=sequence)
     llm = LLMTool(
         model_type="email",
         hunt_id=hunt_id,
@@ -2437,8 +2455,19 @@ async def email_craft_node(state: HuntState) -> dict:
             result["generation_mode"] = "personalized"
             return result
 
+        results: list[dict[str, Any] | None] = []
         try:
-            results = await asyncio.gather(*(_craft_personalized(item) for item in craft_items))
+            async def _indexed_craft(index: int, item: tuple[dict[str, Any], dict[str, str], list[dict[str, str]]]) -> tuple[int, dict[str, Any] | None]:
+                return index, await _craft_personalized(item)
+
+            ordered_results: list[dict[str, Any] | None] = [None] * len(craft_items)
+            tasks = [asyncio.create_task(_indexed_craft(index, item)) for index, item in enumerate(craft_items)]
+            for task in asyncio.as_completed(tasks):
+                index, result = await task
+                ordered_results[index] = result
+                results.append(result)
+                report_progress(len(results), 1 if result is not None else 0, result)
+            results = ordered_results
         finally:
             await llm.close()
 
@@ -2576,6 +2605,7 @@ async def email_craft_node(state: HuntState) -> dict:
                             applied["auto_send_eligible"] = _review_allows_send(review_summary, settings)
                             applied["generation_mode"] = "template_pool_personalized"
                 email_sequences.append(applied)
+                report_progress(len(email_sequences), 1, applied)
     finally:
         await llm.close()
 

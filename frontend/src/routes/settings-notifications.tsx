@@ -16,11 +16,11 @@ export function NotificationsSettingsPage() {
       description="实时通知、周期汇总、异常告警都从这里发。"
       saveKeys={SAVE_KEYS}
     >
-      {({ values, handleChange }) => (
+      {({ values, handleChange, saveValues }) => (
         <AutomationNotifyPanel
           values={values}
           onChange={handleChange}
-          onPersist={async () => {/* handled by SettingsSubPage footer */}}
+          onPersist={(payload) => saveValues(payload)}
         />
       )}
     </SettingsSubPage>

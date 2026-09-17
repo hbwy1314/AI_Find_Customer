@@ -66,13 +66,17 @@ export function NotificationBell() {
       try {
         const item = JSON.parse((e as MessageEvent).data) as NotificationItem;
         if (!item?.id) return;
+        let inserted = false;
         setItems((prev) => {
+          if (prev.some((x) => x.id === item.id)) return prev;
+          inserted = true;
           // Dedupe by id; cap at 30 to match the REST limit.
-          const filtered = prev.filter((x) => x.id !== item.id);
-          return [item, ...filtered].slice(0, 30);
+          return [item, ...prev].slice(0, 30);
         });
-        setUnread((u) => u + 1);
-        triggerPulse();
+        if (inserted) {
+          setUnread((u) => u + 1);
+          triggerPulse();
+        }
       } catch (err) {
         console.error("[bell] failed to parse SSE reply event", err);
       }

@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from agents.email_craft_agent import _active_step_specs
 from api.hunt_store import load_hunt, now_iso, save_hunt
-from api.security import require_api_access
+from api.security import require_admin, require_api_access, require_resource_access, require_user
 from config.settings import get_settings
 from emailing.policy import expand_email_targets
 from emailing.readiness import ensure_inbound_tested, ensure_outbound_ready, ensure_outbound_tested
@@ -45,38 +48,57 @@ def _render_email_html(body_text: str, locale: str | None = None) -> str:
     return render_preview_html(body_text, locale=locale)
 
 
-def _default_account(store: EmailStore) -> dict[str, Any]:
-    settings = get_settings()
-    account_id = "default"
-    existing = store.get_account(account_id)
-    current = now_iso()
-    payload = {
-        "id": account_id,
-        "provider_type": "graph",
-        "from_name": settings.email_from_name,
-        "from_email": settings.email_from_address,
-        "reply_to": settings.email_reply_to or settings.email_from_address,
-        # Legacy SMTP/IMAP columns are kept on the row with empty values
-        # for schema back-compat. The Graph fields are what the sender
-        # actually reads.
-        "smtp_host": "",
-        "smtp_port": 587,
-        "smtp_username": "",
-        "smtp_secret_encrypted": "",
-        "imap_host": "",
-        "imap_port": 993,
-        "imap_username": "",
-        "imap_secret_encrypted": "",
-        "use_tls": 1,
-        "status": "active",
-        "daily_send_limit": settings.email_daily_send_limit,
-        "hourly_send_limit": settings.email_hourly_send_limit,
-        "last_test_at": "",
-        "created_at": existing.get("created_at", current) if existing else current,
-        "updated_at": current,
-    }
-    store.upsert_account(payload)
-    return store.get_account(account_id) or payload
+def _pick_account_for_campaign(
+    store: EmailStore,
+    *,
+    owner_user_id: int | None = None,
+    now_iso_str: str | None = None,
+) -> dict[str, Any] | None:
+    """Pick an active account with remaining quota for a new campaign.
+    
+    Returns the first active Graph account (by sort_order) that has
+    not exceeded its daily or hourly send limit. Returns None when
+    every account is capped out or no accounts exist.
+    
+    When owner_user_id is provided, only considers accounts owned by
+    that user or system accounts (owner_user_id=0).
+    """
+    current = now_iso_str or now_iso()
+    candidates = []
+    for row in store.list_accounts():
+        if str(row.get("status", "active")) != "active":
+            continue
+        if str(row.get("provider_type", "graph")) != "graph":
+            continue
+        account_id = str(row.get("id", "") or "")
+        if not account_id or account_id == "default":
+            continue
+        # Multi-tenant filter: skip accounts not owned by this user
+        if owner_user_id is not None:
+            account_owner = int(row.get("owner_user_id", 0) or 0)
+            if account_owner != 0 and account_owner != owner_user_id:
+                continue
+        
+        # Check daily limit
+        daily_limit = int(row.get("daily_send_limit", 0) or 0)
+        if daily_limit > 0:
+            used_today = store.count_sent_today_for_account(account_id, now_iso=current)
+            if used_today >= daily_limit:
+                continue
+        
+        # Check hourly limit
+        hourly_limit = int(row.get("hourly_send_limit", 0) or 0)
+        if hourly_limit > 0:
+            used_hour = store.count_sent_last_hour_for_account(account_id, now_iso=current)
+            if used_hour >= hourly_limit:
+                continue
+        
+        # This account has remaining quota
+        candidates.append(row)
+    
+    # list_accounts() already sorts by sort_order, created_at, so the
+    # first candidate is the one with the lowest sort_order
+    return candidates[0] if candidates else None
 
 
 def _sequence_is_campaign_ready(sequence: dict[str, Any]) -> bool:
@@ -159,6 +181,7 @@ def _write_summary_to_hunt(store: EmailStore, hunt_id: str, campaign_id: str) ->
 
 class CreateCampaignRequest(BaseModel):
     name: str = "Outbound Campaign"
+    email_account_id: str | None = None
 
 
 class CampaignResponse(BaseModel):
@@ -167,27 +190,59 @@ class CampaignResponse(BaseModel):
     sequence_count: int
 
 
-@router.post("/hunts/{hunt_id}/email-campaigns", response_model=CampaignResponse, dependencies=[Depends(require_api_access)])
-async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
+async def _create_email_campaign_internal(
+    hunt_id: str,
+    payload: CreateCampaignRequest,
+    *,
+    owner_user_id: int = 0,
+) -> CampaignResponse:
+    """Create a campaign without requiring an HTTP Request context.
+
+    Called by the automation consumer directly (no session / no Request).
+    The HTTP route ``create_email_campaign`` wraps this after doing its
+    own access-control check.
+    """
     hunt = load_hunt(hunt_id)
     if not hunt or not isinstance(hunt.get("result"), dict):
-        raise HTTPException(status_code=404, detail="Hunt result not found")
+        raise ValueError(f"Hunt {hunt_id} result not found")
     sequences = hunt["result"].get("email_sequences", [])
     if not isinstance(sequences, list) or not sequences:
-        raise HTTPException(status_code=400, detail="No generated email sequences found for this hunt")
+        raise ValueError("No generated email sequences found for this hunt")
+
+    existing_campaigns = _store().list_campaigns_for_hunt(hunt_id)
+    for existing in existing_campaigns:
+        if str(existing.get("name", "")) == payload.name and str(existing.get("status", "")) in {"draft", "active", "paused"}:
+            summary = _campaign_summary(_store(), str(existing["id"]))
+            return CampaignResponse(
+                campaign_id=str(existing["id"]),
+                status=str(existing.get("status", "draft")),
+                sequence_count=int(summary["sequence_count"]),
+            )
 
     settings = get_settings()
     try:
         ensure_outbound_ready(settings)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError:
+        raise
 
     store = _store()
-    account = _default_account(store)
+    requested_account_id = str(payload.email_account_id or "").strip()
+    if requested_account_id:
+        account = store.get_account(requested_account_id)
+        if not account or str(account.get("status", "active")) != "active":
+            raise ValueError("Selected email account is not active")
+    else:
+        account = _pick_account_for_campaign(store, owner_user_id=owner_user_id)
+        if not account:
+            raise ValueError(
+                "No available email account found. All accounts have reached "
+                "their send limits or no active Graph accounts are configured."
+            )
     campaign_id = str(uuid.uuid4())
     created = now_iso()
     store.create_campaign({
         "id": campaign_id,
+        "owner_user_id": owner_user_id or int(hunt.get("owner_user_id", 0) or 0),
         "hunt_id": hunt_id,
         "email_account_id": account["id"],
         "name": payload.name,
@@ -205,6 +260,7 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
         "updated_at": created,
     })
     base_time = datetime.now(timezone.utc)
+    created_lead_keys: set[str] = set()
     for seq in sequences:
         lead = seq.get("lead") or {}
         primary_target = seq.get("target") or {}
@@ -233,13 +289,15 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
         if template_status in {"underperforming", "exhausted"}:
             continue
         for target in targets:
-            lead_key = (
-                str((lead.get("website") or lead.get("company_name") or "")).lower()
-                + "|"
-                + str(target.get("target_email") or "").lower()
-            )
-            if store.has_contact_history_for_lead_key(lead_key):
+            lead_identity = str(lead.get("website") or lead.get("company_name") or "").strip().lower()
+            if not lead_identity:
+                lead_identity = hashlib.sha256(
+                    json.dumps(lead, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+                ).hexdigest()
+            lead_key = f"lead:{lead_identity}"
+            if lead_key in created_lead_keys or store.has_contact_history_for_lead_key(lead_key):
                 continue
+            created_lead_keys.add(lead_key)
             sequence_id = str(uuid.uuid4())
             store.create_sequence({
                 "id": sequence_id,
@@ -264,12 +322,9 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
                 "next_scheduled_at": "",
                 "created_at": created,
                 "updated_at": created,
+                "email_account_id": account["id"] if requested_account_id else "",
             })
             next_scheduled = ""
-            # Fallback for the LLM's `suggested_send_day`: when the model
-            # omits the field (or sets 0) we anchor the message to the
-            # configured step cadence. Prevents review flags like
-            # "第 1 封的发送日应为 0" caused by missing JSON fields.
             step_specs = _active_step_specs()
             for index, email in enumerate(emails):
                 step_number = int(email.get("sequence_number", 1) or 1)
@@ -283,13 +338,9 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
                     day_value = int(llm_day) if llm_day is not None else fallback_day
                 except (TypeError, ValueError):
                     day_value = fallback_day
-                # If the LLM said 0 but the step expects a later day
-                # (only possible when steps > 1), trust the LLM and let
-                # it land on day 0 — operators can pause before then.
                 if day_value < 0:
                     day_value = 0
-                delay_days = day_value
-                scheduled_at = (base_time + timedelta(days=delay_days)).isoformat()
+                scheduled_at = (base_time + timedelta(days=day_value)).isoformat()
                 if step_number == 1:
                     next_scheduled = scheduled_at
                 store.create_message({
@@ -300,12 +351,6 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
                     "locale": str(seq.get("locale") or "en_US"),
                     "subject": str(email.get("subject", "") or ""),
                     "body_text": str(email.get("body_text", "") or ""),
-                    # Render the HTML body now (with a placeholder
-                    # unsubscribe URL) so the in-product preview can
-                    # render it and we don't have to re-render at
-                    # send time. The real per-recipient token is
-                    # swapped in by the scheduler right before the
-                    # Graph call.
                     "body_html": _render_email_html(
                         str(email.get("body_text", "") or ""),
                         locale=str(seq.get("locale") or "") or None,
@@ -320,15 +365,6 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
                     "updated_at": created,
                 })
             store.update_sequence_status(sequence_id, status="scheduled", updated_at=created, next_scheduled_at=next_scheduled)
-            # Waterfall recipient pool: every sendable email becomes a
-            # ``pending`` row in priority order. The scheduler sends the
-            # first one, marks it ``waiting_reply``, and after
-            # ``email_recipient_waterfall_days`` with no reply, advances
-            # to the next pending row. Single-email sequences behave
-            # exactly like the legacy code (pool size 1). We also
-            # forward each email's role-based flag so the scheduler
-            # can skip shared inboxes (info@/sales@/...) and advance
-            # to the next named recipient immediately.
             target_emails = [
                 str(t.get("target_email") or "").strip().lower()
                 for t in targets
@@ -336,9 +372,7 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
             ]
             if target_emails:
                 is_role_based_per_email = {
-                    str(t.get("target_email") or "").strip().lower(): bool(
-                        t.get("is_role_based")
-                    )
+                    str(t.get("target_email") or "").strip().lower(): bool(t.get("is_role_based"))
                     for t in targets
                     if str(t.get("target_email") or "").strip()
                 }
@@ -353,38 +387,138 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest):
     return CampaignResponse(campaign_id=campaign_id, status="draft", sequence_count=summary["sequence_count"])
 
 
+@router.post("/hunts/{hunt_id}/email-campaigns", response_model=CampaignResponse, dependencies=[Depends(require_api_access)])
+async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest, request: Request):
+    hunt = load_hunt(hunt_id)
+    if not hunt or not isinstance(hunt.get("result"), dict):
+        raise HTTPException(status_code=404, detail="Hunt result not found")
+    require_resource_access(request, hunt.get("owner_user_id"))
+    owner = require_user(request)
+    account_owner_id = int(hunt.get("owner_user_id", 0) or 0) if owner.via != "session" else owner.user_id
+    # Account-level access check for the chosen mailbox
+    store = _store()
+    requested_account_id = str(payload.email_account_id or "").strip()
+    if requested_account_id:
+        account = store.get_account(requested_account_id)
+        if not account or str(account.get("status", "active")) != "active":
+            raise HTTPException(status_code=400, detail="Selected email account is not active")
+        require_resource_access(request, account.get("owner_user_id"))
+    else:
+        account = _pick_account_for_campaign(store, owner_user_id=account_owner_id)
+        if not account:
+            raise HTTPException(
+                status_code=409,
+                detail="No available email account found. All accounts have reached their send limits."
+            )
+        require_resource_access(request, account.get("owner_user_id"))
+    try:
+        return await _create_email_campaign_internal(hunt_id, payload, owner_user_id=account_owner_id)
+    except ValueError as exc:
+        # Re-raise readiness errors (missing config) as 409 so callers
+        # can distinguish "config not ready" from "bad request".
+        detail = str(exc)
+        status_code = 409 if any(
+            marker in detail.lower()
+            for marker in ("not configured", "not tested", "missing", "graph", "smtp", "provider")
+        ) else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+
+
 @router.get("/hunts/{hunt_id}/email-campaigns", dependencies=[Depends(require_api_access)])
-async def list_email_campaigns(hunt_id: str):
+async def list_email_campaigns(hunt_id: str, request: Request):
+    hunt = load_hunt(hunt_id)
+    if not hunt:
+        raise HTTPException(status_code=404, detail="Hunt not found")
+    require_resource_access(request, hunt.get("owner_user_id"))
     store = _store()
     campaigns = store.list_campaigns_for_hunt(hunt_id)
     return [{"campaign": c, **_campaign_summary(store, c["id"])} for c in campaigns]
 
 
-@router.post("/email-campaigns/{campaign_id}/start", dependencies=[Depends(require_api_access)])
-async def start_email_campaign(campaign_id: str):
+async def _start_email_campaign_internal(campaign_id: str) -> dict[str, str]:
+    """Start a campaign without requiring an HTTP Request context.
+
+    Called by the automation consumer directly (no session / no Request).
+    The HTTP route ``start_email_campaign`` wraps this after doing its
+    own access-control check.
+    """
     store = _store()
     campaign = store.get_campaign(campaign_id)
     if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
+        raise ValueError(f"Campaign {campaign_id} not found")
     settings = get_settings()
     try:
         ensure_outbound_tested(settings)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if str(campaign.get("email_account_id", "")) == "default":
-        _default_account(store)
+    except ValueError:
+        raise
+    campaign_account_id = str(campaign.get("email_account_id", ""))
     updated = now_iso()
+    if campaign_account_id == "default":
+        # Legacy campaign: rebind to a real account before starting
+        logger = logging.getLogger(__name__)
+        real_account = _pick_account_for_campaign(
+            store,
+            owner_user_id=int(campaign.get("owner_user_id", 0) or 0),
+            now_iso_str=updated,
+        )
+        if not real_account:
+            raise ValueError(
+                "Cannot start campaign: no available email accounts found. "
+                "All accounts have reached their send limits or no Graph accounts exist."
+            )
+        # Rebind campaign from 'default' to real account
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE email_campaigns SET email_account_id = ?, updated_at = ? WHERE id = ?",
+                (real_account["id"], updated, campaign_id),
+            )
+        logger.info(
+            "Rebound legacy campaign %s from 'default' to account %s (%s)",
+            campaign_id[:8], real_account["id"], real_account.get("from_email")
+        )
+        if not real_account:
+            raise ValueError(
+                "Cannot start campaign: no available email accounts found. "
+                "All accounts have reached their send limits or no Graph accounts exist."
+            )
+        # Rebind campaign from 'default' to real account
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE email_campaigns SET email_account_id = ?, updated_at = ? WHERE id = ?",
+                (real_account["id"], updated, campaign_id),
+            )
+        logger.info(
+            "Rebound legacy campaign %s from 'default' to account %s (%s)",
+            campaign_id[:8], real_account["id"], real_account.get("from_email")
+        )
     store.update_campaign_status(campaign_id, "active", updated_at=updated)
     _write_summary_to_hunt(store, str(campaign["hunt_id"]), campaign_id)
     return {"campaign_id": campaign_id, "status": "active"}
 
 
-@router.post("/email-campaigns/{campaign_id}/pause", dependencies=[Depends(require_api_access)])
-async def pause_email_campaign(campaign_id: str):
+@router.post("/email-campaigns/{campaign_id}/start", dependencies=[Depends(require_api_access)])
+async def start_email_campaign(campaign_id: str, request: Request):
     store = _store()
     campaign = store.get_campaign(campaign_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
+    hunt = load_hunt(str(campaign["hunt_id"]))
+    require_resource_access(request, (hunt or {}).get("owner_user_id"))
+    try:
+        result = await _start_email_campaign_internal(campaign_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return result
+
+
+@router.post("/email-campaigns/{campaign_id}/pause", dependencies=[Depends(require_api_access)])
+async def pause_email_campaign(campaign_id: str, request: Request):
+    store = _store()
+    campaign = store.get_campaign(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    hunt = load_hunt(str(campaign["hunt_id"]))
+    require_resource_access(request, (hunt or {}).get("owner_user_id"))
     updated = now_iso()
     store.update_campaign_status(campaign_id, "paused", updated_at=updated)
     _write_summary_to_hunt(store, str(campaign["hunt_id"]), campaign_id)
@@ -392,11 +526,13 @@ async def pause_email_campaign(campaign_id: str):
 
 
 @router.get("/email-sequences/{sequence_id}", dependencies=[Depends(require_api_access)])
-async def get_email_sequence(sequence_id: str):
+async def get_email_sequence(sequence_id: str, request: Request):
     store = _store()
     sequence = store.get_sequence(sequence_id)
     if not sequence:
         raise HTTPException(status_code=404, detail="Sequence not found")
+    hunt = load_hunt(str(sequence.get("hunt_id", "")))
+    require_resource_access(request, (hunt or {}).get("owner_user_id"))
     messages = store.list_messages_for_sequence(sequence_id)
     reply_events = store.list_reply_events_for_sequence(sequence_id)
     return {"sequence": sequence, "messages": messages, "reply_events": reply_events}
@@ -422,7 +558,10 @@ async def render_email_html(payload: dict[str, str]):
     return {"body_html": render_preview_html(body_text, locale=locale)}
 
 
-@router.post("/email-scheduler/run", dependencies=[Depends(require_api_access)])
+@router.post(
+    "/email-scheduler/run",
+    dependencies=[Depends(require_api_access), Depends(require_admin)],
+)
 async def run_email_scheduler():
     store = _store()
     try:
@@ -432,7 +571,10 @@ async def run_email_scheduler():
     return await run_scheduler_once(store)
 
 
-@router.post("/email-replies/check", dependencies=[Depends(require_api_access)])
+@router.post(
+    "/email-replies/check",
+    dependencies=[Depends(require_api_access), Depends(require_admin)],
+)
 async def run_email_reply_check():
     store = _store()
     settings = get_settings()
@@ -440,5 +582,28 @@ async def run_email_reply_check():
         ensure_inbound_tested(settings)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    account = _default_account(store)
-    return await run_graph_reply_detection_once(store, account)
+    
+    from emailing import graph_client
+    # Poll all distinct Graph mailboxes, same as the background loop
+    poll_accounts: list[dict[str, Any] | None] = []
+    seen_upns: set[str] = set()
+    for acct in store.list_accounts_by_provider("graph"):
+        if str(acct.get("status", "active")) != "active":
+            continue
+        upn = graph_client.account_upn(acct)
+        if not upn or upn in seen_upns:
+            continue
+        seen_upns.add(upn)
+        poll_accounts.append(acct)
+    global_upn = graph_client.account_upn(None)
+    if global_upn and global_upn not in seen_upns:
+        poll_accounts.append(None)
+    if not poll_accounts:
+        poll_accounts = [None]
+    
+    result = {"checked": 0, "matched": 0, "skipped": 0, "ignored": 0}
+    for poll_account in poll_accounts:
+        part = await run_graph_reply_detection_once(store, poll_account)
+        for key in ("checked", "matched", "skipped", "ignored"):
+            result[key] += int(part.get(key, 0) or 0)
+    return result

@@ -207,7 +207,7 @@ def process_inbound_messages(
             continue
 
         received_at = str(inbound.get("received_at", "") or current)
-        store.create_reply_event({
+        created = store.create_reply_event({
             "id": str(uuid.uuid4()),
             "sequence_id": str(sequence["id"]),
             "message_id": str(sent_message.get("id", "") or ""),
@@ -218,6 +218,9 @@ def process_inbound_messages(
             "raw_ref": raw_ref,
             "created_at": current,
         })
+        if not created:
+            skipped += 1
+            continue
         store.update_sequence_status(
             str(sequence["id"]),
             status="replied",
@@ -259,6 +262,7 @@ def process_inbound_messages(
         # 30s poll. Best-effort: never raise out of the detection loop.
         try:
             from api.sse import _broadcast_reply
+            campaign = store.get_campaign(str(sequence.get("campaign_id", "") or "")) or {}
             _broadcast_reply({
                 "id": str(uuid.uuid4()),
                 "sequence_id": str(sequence["id"]),
@@ -268,6 +272,7 @@ def process_inbound_messages(
                 "subject": subject,
                 "snippet": snippet,
                 "received_at": received_at,
+                "owner_user_id": int(campaign.get("owner_user_id", 0) or 0),
             })
         except Exception:
             # SSE is best-effort; an import error or broadcast hiccup

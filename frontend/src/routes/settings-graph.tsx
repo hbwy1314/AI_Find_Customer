@@ -52,6 +52,7 @@ function SyncFromAzureDialog({ onClose }: { onClose: () => void }) {
     { created: number; skipped: number } | null
   >(null);
   const [state, setState] = useState<SyncState>({ kind: "loading" });
+  const [syncAttempt, setSyncAttempt] = useState(0);
 
   // First render: fetch the user list (backend calls Graph /users).
   useEffect(() => {
@@ -70,7 +71,7 @@ function SyncFromAzureDialog({ onClose }: { onClose: () => void }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [syncAttempt]);
 
   const filtered = useMemo(() => {
     if (state.kind !== "ok") return [];
@@ -147,7 +148,15 @@ function SyncFromAzureDialog({ onClose }: { onClose: () => void }) {
                 {state.hint ? <p className="mt-1 text-xs">{state.hint}</p> : null}
               </div>
             </div>
-            <Button variant="outline" onClick={() => setState({ kind: "loading" })}>重试</Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setState({ kind: "loading" });
+                setSyncAttempt((value) => value + 1);
+              }}
+            >
+              重试
+            </Button>
           </div>
         ) : (
           <>

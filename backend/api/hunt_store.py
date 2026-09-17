@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,28 @@ from typing import Any
 from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Atomic write via temp file + replace to prevent partial writes on crash."""
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        # Inherit original file permissions before replace
+        if path.exists():
+            stat_info = path.stat()
+            os.chown(tmp_name, stat_info.st_uid, stat_info.st_gid)
+            os.chmod(tmp_name, stat_info.st_mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _hunts_dir() -> Path:
@@ -30,9 +54,10 @@ def save_hunt(hunt_id: str, hunt_data: dict[str, Any]) -> None:
     try:
         path = _hunts_dir() / f"{hunt_id}.json"
         payload = {"hunt_id": hunt_id, **hunt_data}
-        path.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
+        _write_json_atomic(path, payload)
     except Exception as e:
         logger.warning("[HuntStore] Failed to save hunt %s: %s", hunt_id[:8], e)
+        raise
 
 
 def load_all_hunts(*, mark_interrupted: bool = False) -> dict[str, dict[str, Any]]:
@@ -56,7 +81,7 @@ def load_all_hunts(*, mark_interrupted: bool = False) -> dict[str, dict[str, Any
                 data["completed_at"] = now_iso()
                 # Persist the updated status so it survives future restarts
                 payload = {"hunt_id": hid, **data}
-                path.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
+                _write_json_atomic(path, payload)
                 logger.info("[HuntStore] Marked interrupted hunt %s as failed", hid[:8])
             hunts[hid] = data
             logger.debug("[HuntStore] Loaded hunt %s (status=%s)", hid[:8], data.get("status"))

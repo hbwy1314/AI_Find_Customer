@@ -5,12 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from api.hunt_store import load_hunt, now_iso
 from api.routes import _hunts, _unique_leads_count, request_hunt_cancel
-from api.security import require_api_access
+from api.security import require_api_access, require_resource_access, require_user
 from automation.job_queue import HuntJobQueue
 from automation.metrics import collect_automation_metrics, collect_automation_status
 from config.settings import get_settings
@@ -56,6 +56,19 @@ def _email_store() -> EmailStore:
     store = EmailStore(settings.email_db_path)
     store.init_db()
     return store
+
+
+def _require_job_access(request: Request, job: dict[str, Any]) -> None:
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    require_resource_access(request, payload.get("owner_user_id", 0))
+
+
+def _job_is_visible(request: Request, job: dict[str, Any]) -> bool:
+    try:
+        _require_job_access(request, job)
+    except HTTPException:
+        return False
+    return True
 
 
 def _lead_preview(leads: list[Any], limit: int = 20) -> list[dict[str, Any]]:
@@ -205,9 +218,12 @@ def _serialize_job(job: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.post("/jobs", dependencies=[Depends(require_api_access)])
-async def create_automation_job(request: AutomationJobRequest):
+async def create_automation_job(request: AutomationJobRequest, http_request: Request):
+    owner = require_user(http_request)
+    payload = request.model_dump()
+    payload["owner_user_id"] = owner.user_id if owner.via == "session" else 0
     queue = _queue()
-    job_id = queue.enqueue(request.model_dump(), now_iso=now_iso())
+    job_id = queue.enqueue(payload, now_iso=now_iso())
     logger.info(
         "[AutomationQueue] enqueued job=%s website=%s target_leads=%s email_craft=%s",
         job_id[:8],
@@ -216,38 +232,52 @@ async def create_automation_job(request: AutomationJobRequest):
         request.enable_email_craft,
     )
     job = queue.get(job_id)
-    return _serialize_job(job or {"id": job_id, "payload": request.model_dump()})
+    return _serialize_job(job or {"id": job_id, "payload": payload})
 
 
 @router.get("/jobs", dependencies=[Depends(require_api_access)])
-async def list_automation_jobs(limit: int = Query(default=50, ge=1, le=200)):
+async def list_automation_jobs(request: Request, limit: int = Query(default=50, ge=1, le=200)):
     queue = _queue()
-    return [_serialize_job(job) for job in queue.list_jobs(limit=limit)]
+    return [
+        _serialize_job(job)
+        for job in queue.list_jobs(limit=limit)
+        if _job_is_visible(request, job)
+    ]
 
 
 @router.get("/jobs/{job_id}", dependencies=[Depends(require_api_access)])
-async def get_automation_job(job_id: str):
+async def get_automation_job(job_id: str, request: Request):
     queue = _queue()
     job = queue.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Automation job not found")
+    _require_job_access(request, job)
     return _serialize_job(job)
 
 
 @router.get("/jobs/by-hunt/{hunt_id}", dependencies=[Depends(require_api_access)])
-async def get_automation_job_by_hunt(hunt_id: str):
+async def get_automation_job_by_hunt(hunt_id: str, request: Request):
+    hunt = load_hunt(hunt_id)
+    if hunt:
+        require_resource_access(request, hunt.get("owner_user_id"))
     queue = _queue()
     job = queue.get_by_hunt_id(hunt_id)
     if not job:
         raise HTTPException(status_code=404, detail="Automation job not found for hunt")
+    _require_job_access(request, job)
     return _serialize_job(job)
 
 
 @router.post("/jobs/from-hunt/{hunt_id}", dependencies=[Depends(require_api_access)])
-async def create_automation_job_from_hunt(hunt_id: str, request: AutomationJobContinueRequest):
+async def create_automation_job_from_hunt(
+    hunt_id: str,
+    request: AutomationJobContinueRequest,
+    http_request: Request,
+):
     hunt = load_hunt(hunt_id)
     if not hunt:
         raise HTTPException(status_code=404, detail="Hunt not found")
+    owner = require_resource_access(http_request, hunt.get("owner_user_id"))
 
     # The hunt dict's layout depends on which writer saved it:
     #   - older / in-process hunts have the config fields spread at
@@ -322,6 +352,7 @@ async def create_automation_job_from_hunt(hunt_id: str, request: AutomationJobCo
         # Carry the prior leads through. Consumer creates a fresh
         # hunt with this as `existing_leads`; see HuntRequest.
         "existing_leads": prior_leads,
+        "owner_user_id": owner.user_id if owner.via == "session" else int(hunt.get("owner_user_id", 0) or 0),
     }
 
     queue = _queue()
@@ -331,11 +362,12 @@ async def create_automation_job_from_hunt(hunt_id: str, request: AutomationJobCo
 
 
 @router.post("/jobs/{job_id}/cancel", dependencies=[Depends(require_api_access)])
-async def cancel_automation_job(job_id: str):
+async def cancel_automation_job(job_id: str, request: Request):
     queue = _queue()
     job = queue.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Automation job not found")
+    _require_job_access(request, job)
     queue.cancel(job_id, updated_at=now_iso())
     hunt_id = str(job.get("last_hunt_id", "") or "")
     if hunt_id:
@@ -346,11 +378,22 @@ async def cancel_automation_job(job_id: str):
 
 
 @router.post("/jobs/{job_id}/retry", dependencies=[Depends(require_api_access)])
-async def retry_automation_job(job_id: str):
+async def retry_automation_job(job_id: str, request: Request):
     queue = _queue()
     job = queue.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Automation job not found")
+    _require_job_access(request, job)
+    hunt_id = str(job.get("last_hunt_id", "") or "")
+    hunt = load_hunt(hunt_id) if hunt_id else None
+    if hunt and isinstance(hunt.get("result"), dict):
+        payload = dict(job.get("payload") or {})
+        result = hunt["result"]
+        payload["existing_leads"] = list(result.get("leads") or [])
+        payload.setdefault("website_url", str(hunt.get("website_url", "") or result.get("website_url", "") or ""))
+        payload.setdefault("product_keywords", list(hunt.get("product_keywords") or result.get("product_keywords") or []))
+        payload.setdefault("target_regions", list(hunt.get("target_regions") or result.get("target_regions") or []))
+        queue.update_payload(job_id, payload, updated_at=now_iso())
     queue.retry_now(job_id, updated_at=now_iso())
     logger.info("[AutomationQueue] retried job=%s", job_id[:8])
     updated = queue.get(job_id)
@@ -358,7 +401,7 @@ async def retry_automation_job(job_id: str):
 
 
 @router.delete("/jobs/{job_id}", dependencies=[Depends(require_api_access)])
-async def delete_automation_job(job_id: str):
+async def delete_automation_job(job_id: str, request: Request):
     """Hard-delete a queued/completed/failed job from history.
 
     If the job is still `running` (consumer actively working on it)
@@ -374,6 +417,7 @@ async def delete_automation_job(job_id: str):
     job = queue.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Automation job not found")
+    _require_job_access(request, job)
     status = str(job.get("status", "") or "")
     if status in ("queued", "running"):
         queue.cancel(job_id, updated_at=now_iso())

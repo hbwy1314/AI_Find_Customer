@@ -81,7 +81,10 @@ def test_create_and_start_email_campaign(monkeypatch, tmp_path):
     res = client.post("/api/v1/hunts/hunt_1/email-campaigns", json={"name": "Test Campaign"})
     assert res.status_code == 200
     campaign_id = res.json()["campaign_id"]
-    assert res.json()["sequence_count"] == 2
+    # One lead owns one sequence; its candidate addresses are stored in the
+    # sequence's waterfall recipient pool instead of creating duplicate
+    # sequences that would send the same step twice.
+    assert res.json()["sequence_count"] == 1
 
     res = client.post(f"/api/v1/email-campaigns/{campaign_id}/start")
     assert res.status_code == 200
@@ -714,3 +717,163 @@ def test_email_routes_require_token_when_configured(monkeypatch, tmp_path):
     get_settings.cache_clear()
     assert unauthorized.status_code == 401
     assert authorized.status_code == 200
+
+
+def test_pick_account_for_campaign_selects_first_available(monkeypatch, tmp_path):
+    """Verify that _pick_account_for_campaign selects first account below limits."""
+    from api.email_routes import _pick_account_for_campaign
+    from emailing.store import EmailStore
+    
+    store = EmailStore(str(tmp_path / "email.db"))
+    store.init_db()
+    
+    # Create 3 accounts with sort_order
+    now = "2026-09-16T10:00:00Z"
+    for i, (account_id, sort_order) in enumerate([("acct_a", 0), ("acct_b", 1), ("acct_c", 2)]):
+        store.upsert_account({
+            "id": account_id,
+            "provider_type": "graph",
+            "from_name": f"Sender {i}",
+            "from_email": f"test{i}@example.com",
+            "reply_to": "",
+            "status": "active",
+            "daily_send_limit": 5,
+            "hourly_send_limit": 3,
+            "graph_user_principal_name": f"test{i}@example.com",
+            "sort_order": sort_order,
+            "created_at": now,
+            "updated_at": now,
+        })
+    
+    # Simulate acct_a reached daily limit
+    monkeypatch.setattr(
+        "emailing.store.EmailStore.count_sent_today_for_account",
+        lambda self, account_id, now_iso: 5 if account_id == "acct_a" else 0
+    )
+    monkeypatch.setattr(
+        "emailing.store.EmailStore.count_sent_last_hour_for_account",
+        lambda self, account_id, now_iso: 0
+    )
+    
+    # Should pick acct_b (sort_order=1) since acct_a is capped
+    account = _pick_account_for_campaign(store, now_iso_str=now)
+    assert account is not None
+    assert account["id"] == "acct_b"
+
+
+def test_pick_account_for_campaign_returns_none_when_all_capped(monkeypatch, tmp_path):
+    """Verify that _pick_account_for_campaign returns None when all accounts reached limits."""
+    from api.email_routes import _pick_account_for_campaign
+    from emailing.store import EmailStore
+    
+    store = EmailStore(str(tmp_path / "email.db"))
+    store.init_db()
+    
+    now = "2026-09-16T10:00:00Z"
+    store.upsert_account({
+        "id": "acct_only",
+        "provider_type": "graph",
+        "from_name": "Only Sender",
+        "from_email": "only@example.com",
+        "reply_to": "",
+        "status": "active",
+        "daily_send_limit": 5,
+        "hourly_send_limit": 3,
+        "graph_user_principal_name": "only@example.com",
+        "sort_order": 0,
+        "created_at": now,
+        "updated_at": now,
+    })
+    
+    # Simulate account reached daily limit
+    monkeypatch.setattr(
+        "emailing.store.EmailStore.count_sent_today_for_account",
+        lambda self, account_id, now_iso: 5
+    )
+    monkeypatch.setattr(
+        "emailing.store.EmailStore.count_sent_last_hour_for_account",
+        lambda self, account_id, now_iso: 3
+    )
+    
+    account = _pick_account_for_campaign(store, now_iso_str=now)
+    assert account is None
+
+
+def test_pick_account_for_campaign_selects_first_available(monkeypatch, tmp_path):
+    """Verify that _pick_account_for_campaign selects first account below limits."""
+    from api.email_routes import _pick_account_for_campaign
+    from emailing.store import EmailStore
+    
+    store = EmailStore(str(tmp_path / "email.db"))
+    store.init_db()
+    
+    # Create 3 accounts with sort_order
+    now = "2026-09-16T10:00:00Z"
+    for i, (account_id, sort_order) in enumerate([("acct_a", 0), ("acct_b", 1), ("acct_c", 2)]):
+        store.upsert_account({
+            "id": account_id,
+            "provider_type": "graph",
+            "from_name": f"Sender {i}",
+            "from_email": f"test{i}@example.com",
+            "reply_to": "",
+            "status": "active",
+            "daily_send_limit": 5,
+            "hourly_send_limit": 3,
+            "graph_user_principal_name": f"test{i}@example.com",
+            "sort_order": sort_order,
+            "created_at": now,
+            "updated_at": now,
+        })
+    
+    # Simulate acct_a reached daily limit
+    monkeypatch.setattr(
+        "emailing.store.EmailStore.count_sent_today_for_account",
+        lambda self, account_id, now_iso: 5 if account_id == "acct_a" else 0
+    )
+    monkeypatch.setattr(
+        "emailing.store.EmailStore.count_sent_last_hour_for_account",
+        lambda self, account_id, now_iso: 0
+    )
+    
+    # Should pick acct_b (sort_order=1) since acct_a is capped
+    account = _pick_account_for_campaign(store, now_iso_str=now)
+    assert account is not None
+    assert account["id"] == "acct_b"
+
+
+def test_pick_account_for_campaign_returns_none_when_all_capped(monkeypatch, tmp_path):
+    """Verify that _pick_account_for_campaign returns None when all accounts reached limits."""
+    from api.email_routes import _pick_account_for_campaign
+    from emailing.store import EmailStore
+    
+    store = EmailStore(str(tmp_path / "email.db"))
+    store.init_db()
+    
+    now = "2026-09-16T10:00:00Z"
+    store.upsert_account({
+        "id": "acct_only",
+        "provider_type": "graph",
+        "from_name": "Only Sender",
+        "from_email": "only@example.com",
+        "reply_to": "",
+        "status": "active",
+        "daily_send_limit": 5,
+        "hourly_send_limit": 3,
+        "graph_user_principal_name": "only@example.com",
+        "sort_order": 0,
+        "created_at": now,
+        "updated_at": now,
+    })
+    
+    # Simulate account reached daily limit
+    monkeypatch.setattr(
+        "emailing.store.EmailStore.count_sent_today_for_account",
+        lambda self, account_id, now_iso: 5
+    )
+    monkeypatch.setattr(
+        "emailing.store.EmailStore.count_sent_last_hour_for_account",
+        lambda self, account_id, now_iso: 3
+    )
+    
+    account = _pick_account_for_campaign(store, now_iso_str=now)
+    assert account is None

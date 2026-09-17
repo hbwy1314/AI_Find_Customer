@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from api.hunt_store import load_hunt, save_hunt
 from config.settings import get_settings
@@ -13,9 +15,57 @@ from emailing.policy import is_role_based_email
 from emailing.store import EmailStore
 from emailing.unsubscribe import build_mailto_unsubscribe, build_unsubscribe_url, issue_token
 
+_scheduler_lock = asyncio.Lock()
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _send_timezone(settings) -> ZoneInfo:
+    try:
+        return ZoneInfo(str(getattr(settings, "email_timezone", "UTC") or "UTC"))
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def _parse_clock(value: str, fallback: tuple[int, int]) -> tuple[int, int]:
+    try:
+        hour, minute = (int(part) for part in str(value).split(":", 1))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    except (TypeError, ValueError):
+        pass
+    return fallback
+
+
+def _next_business_time(current: datetime, settings) -> datetime:
+    """Return the earliest allowed local send time, converted to UTC."""
+    zone = _send_timezone(settings)
+    local = current.astimezone(zone)
+    start_h, start_m = _parse_clock(getattr(settings, "email_business_hours_start", "09:00"), (9, 0))
+    end_h, end_m = _parse_clock(getattr(settings, "email_business_hours_end", "18:00"), (18, 0))
+    start_minutes = start_h * 60 + start_m
+    end_minutes = end_h * 60 + end_m
+    if start_minutes == end_minutes:
+        return current
+
+    for _ in range(8):
+        if bool(getattr(settings, "email_weekdays_only", True)) and local.weekday() >= 5:
+            local = (local + timedelta(days=7 - local.weekday())).replace(
+                hour=start_h, minute=start_m, second=0, microsecond=0
+            )
+            continue
+        minutes = local.hour * 60 + local.minute
+        if minutes < start_minutes:
+            local = local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+        elif minutes >= end_minutes:
+            local = (local + timedelta(days=1)).replace(
+                hour=start_h, minute=start_m, second=0, microsecond=0
+            )
+            continue
+        return local.astimezone(timezone.utc)
+    return current
 
 
 def _advance_expired_recipients(store: EmailStore, current_iso: str) -> int:
@@ -53,7 +103,8 @@ def _advance_expired_recipients(store: EmailStore, current_iso: str) -> int:
     expired = store.waiting_recipients_older_than(cutoff)
     flipped = 0
     for r in expired:
-        store.advance_waiting_recipient(str(r["id"]), updated_at=current_iso)
+        if not store.advance_waiting_recipient(str(r["id"]), updated_at=current_iso):
+            continue
         flipped += 1
         # Pick the next pending recipient for this sequence. If none
         # remain, the sequence is exhausted — nothing more to send.
@@ -83,11 +134,9 @@ def _advance_expired_recipients(store: EmailStore, current_iso: str) -> int:
         # fresh pending row. The previous message stays as `sent`
         # for history. The new row will be picked up on the next
         # scheduler pass.
-        latest = store.latest_message_for_sequence(str(r["sequence_id"]))
+        latest = store.latest_sent_message_for_sequence(str(r["sequence_id"]))
         if latest:
-            store.clone_pending_message_after(
-                str(latest["id"]), scheduled_at=current_iso
-            )
+            store.clone_pending_message_after(str(latest["id"]), scheduled_at=current_iso)
     return flipped
 
 
@@ -153,7 +202,7 @@ def _refresh_hunt_email_summary(store: EmailStore, hunt_id: str, campaign_id: st
     save_hunt(hunt_id, hunt)
 
 
-async def run_scheduler_once(
+async def _run_scheduler_once(
     store: EmailStore,
     *,
     now_iso: str | None = None,
@@ -168,7 +217,12 @@ async def run_scheduler_once(
     # that's been waiting gets a fresh shot on the very next pass.
     _advance_expired_recipients(store, current)
 
-    jobs = store.list_pending_messages_ready(current)
+    current_dt = datetime.fromisoformat(current.replace("Z", "+00:00"))
+    if current_dt.tzinfo is None:
+        current_dt = current_dt.replace(tzinfo=timezone.utc)
+    stale_before = (current_dt - timedelta(minutes=15)).isoformat()
+    jobs = store.claim_pending_messages_ready(current, stale_before_iso=stale_before)
+    settings = get_settings()
     sent = 0
     failed = 0
     skipped = 0
@@ -176,13 +230,36 @@ async def run_scheduler_once(
     # scheduler pass with many jobs for the same account doesn't re-query
     # the count for every send.
     sent_today_cache: dict[str, int] = {}
+    sent_hour_cache: dict[str, int] = {}
     for job in jobs:
+        message_id = str(job["id"])
+        claim_token = str(job.get("claim_token", "") or "")
         sequence = store.get_sequence(str(job.get("sequence_id", "")))
         if not sequence or sequence.get("status") in {"replied", "stopped", "completed", "failed", "exhausted"}:
+            store.mark_message_failed(
+                message_id,
+                failure_reason="sequence_unavailable",
+                updated_at=current,
+                claim_token=claim_token,
+            )
             skipped += 1
             continue
         campaign = store.get_campaign(str(sequence.get("campaign_id", "")))
         if not campaign or campaign.get("status") != "active":
+            store.release_message_claim(
+                message_id, claim_token=claim_token, updated_at=current
+            )
+            skipped += 1
+            continue
+        step_number = int(job.get("step_number", 1) or 1)
+        current_step = int(sequence.get("current_step", 0) or 0)
+        if step_number > current_step + 1:
+            store.release_message_claim(
+                message_id,
+                claim_token=claim_token,
+                updated_at=current,
+                scheduled_at=(current_dt + timedelta(minutes=5)).isoformat(),
+            )
             skipped += 1
             continue
         # Resolve the effective outbound account: the sequence-level
@@ -197,8 +274,24 @@ async def run_scheduler_once(
         if account is None:
             account = store.get_account(str(campaign.get("email_account_id", "")))
         if not account or account.get("status") != "active":
-            store.mark_message_failed(str(job["id"]), failure_reason="inactive_email_account", updated_at=current)
+            store.mark_message_failed(
+                message_id,
+                failure_reason="inactive_email_account",
+                updated_at=current,
+                claim_token=claim_token,
+            )
             failed += 1
+            continue
+
+        allowed_at = _next_business_time(current_dt, settings)
+        if allowed_at > current_dt:
+            store.release_message_claim(
+                message_id,
+                claim_token=claim_token,
+                updated_at=current,
+                scheduled_at=allowed_at.isoformat(),
+            )
+            skipped += 1
             continue
 
         # Per-account daily limit guard. When the bound account reached its
@@ -206,6 +299,22 @@ async def run_scheduler_once(
         # of the same provider; only when every mailbox is capped out do we
         # defer to tomorrow (counter resets at 00:00 UTC).
         account_id = str(account.get("id", "") or "")
+        hourly_limit = int(account.get("hourly_send_limit", 0) or 0)
+        if hourly_limit > 0:
+            used_hour = sent_hour_cache.get(account_id)
+            if used_hour is None:
+                used_hour = store.count_sent_last_hour_for_account(account_id, now_iso=current)
+                sent_hour_cache[account_id] = used_hour
+            if used_hour >= hourly_limit:
+                retry_at = current_dt + timedelta(hours=1, seconds=5)
+                store.release_message_claim(
+                    message_id,
+                    claim_token=claim_token,
+                    updated_at=current,
+                    scheduled_at=retry_at.isoformat(),
+                )
+                skipped += 1
+                continue
         daily_limit = int(account.get("daily_send_limit", 0) or 0)
         if daily_limit > 0:
             used_today = sent_today_cache.get(account_id)
@@ -223,29 +332,53 @@ async def run_scheduler_once(
                     account = fallback
                     account_id = str(fallback["id"])
                     daily_limit = int(fallback.get("daily_send_limit", 0) or 0)
-                    used_today = sent_today_cache.get(account_id, 0)
+                    # Always refresh from store after switching accounts so the
+                    # cache never carries a stale 0 from a first-time lookup
+                    # that happened before any sends were recorded for this
+                    # fallback account in the current scheduler pass.
+                    used_today = sent_today_cache.get(account_id)
+                    if used_today is None:
+                        used_today = store.count_sent_today_for_account(account_id, now_iso=current)
+                        sent_today_cache[account_id] = used_today
                 if daily_limit > 0 and used_today >= daily_limit:
                     # Re-queue for the same time tomorrow (or +24h from now if
                     # already past midnight) so the campaign doesn't appear stuck.
-                    next_day = (
-                        datetime.fromisoformat(current.replace("Z", "+00:00"))
-                        if "T" in current
-                        else datetime.now(timezone.utc)
+                    zone = _send_timezone(settings)
+                    next_local = (current_dt.astimezone(zone) + timedelta(days=1)).replace(
+                        hour=0, minute=5, second=0, microsecond=0
                     )
-                    if next_day.tzinfo is None:
-                        next_day = next_day.replace(tzinfo=timezone.utc)
-                    next_at = next_day.replace(hour=0, minute=5, second=0, microsecond=0)
-                    if next_at <= next_day:
-                        next_at = next_at + timedelta(days=1)
+                    next_at = next_local.astimezone(timezone.utc)
                     store.update_sequence_status(
                         str(sequence["id"]),
                         status=str(sequence.get("status", "running") or "running"),
                         updated_at=current,
                         next_scheduled_at=next_at.isoformat(),
                     )
+                    store.release_message_claim(
+                        message_id,
+                        claim_token=claim_token,
+                        updated_at=current,
+                        scheduled_at=next_at.isoformat(),
+                    )
                     # Don't mark the message as failed — the campaign is healthy, just capped.
                     skipped += 1
                     continue
+
+        if not store.reserve_send_quota(
+            account_id,
+            message_id,
+            daily_limit=int(account.get("daily_send_limit", 0) or 0),
+            hourly_limit=int(account.get("hourly_send_limit", 0) or 0),
+            now_iso=current,
+        ):
+            store.release_message_claim(
+                message_id,
+                claim_token=claim_token,
+                updated_at=current,
+                scheduled_at=(current_dt + timedelta(minutes=5)).isoformat(),
+            )
+            skipped += 1
+            continue
 
         template_id = str(sequence.get("template_id", "") or "")
         if template_id:
@@ -259,6 +392,7 @@ async def run_scheduler_once(
             template_status = str((template_perf or {}).get("status", "") or "")
             if template_status in {"underperforming", "exhausted"}:
                 store.cancel_future_pending_messages(str(sequence["id"]), updated_at=current)
+                store.cancel_claimed_message(message_id, claim_token=claim_token, updated_at=current)
                 store.update_sequence_status(
                     str(sequence["id"]),
                     status="stopped",
@@ -283,9 +417,10 @@ async def run_scheduler_once(
             recipient = str(sequence.get("lead_email", "") or "").strip()
         if not recipient:
             store.mark_message_failed(
-                str(job["id"]),
+                message_id,
                 failure_reason="no_recipient",
                 updated_at=current,
+                claim_token=claim_token,
             )
             failed += 1
             continue
@@ -312,9 +447,10 @@ async def run_scheduler_once(
             # re-queue. The clone below (if a next candidate exists)
             # is the message that will actually be sent.
             store.mark_message_failed(
-                str(job["id"]),
+                message_id,
                 failure_reason="recipient_role_based",
                 updated_at=current,
+                claim_token=claim_token,
             )
             next_rec = store.next_pending_recipient(str(sequence["id"]))
             if next_rec is not None:
@@ -323,13 +459,13 @@ async def run_scheduler_once(
                     lead_email=str(next_rec["email"]),
                     updated_at=current,
                 )
-                latest = store.latest_message_for_sequence(str(sequence["id"]))
+                latest = store.get_message(message_id)
                 if latest:
                     new_msg_id = store.clone_pending_message_after(
                         str(latest["id"]), scheduled_at=current
                     )
                     if new_msg_id:
-                        new_job = store.get_message(new_msg_id)
+                        new_job = store.claim_message(new_msg_id, claimed_at=current)
                         if new_job:
                             jobs.append(new_job)
                 skipped += 1
@@ -338,9 +474,10 @@ async def run_scheduler_once(
             # current message failed and park the sequence as
             # exhausted so the UI shows the reason.
             store.mark_message_failed(
-                str(job["id"]),
+                message_id,
                 failure_reason="recipient_role_based",
                 updated_at=current,
+                claim_token=claim_token,
             )
             store.update_sequence_status(
                 str(sequence["id"]),
@@ -362,9 +499,10 @@ async def run_scheduler_once(
             # message so the operator notices and adds a real
             # decision-maker email.
             store.mark_message_failed(
-                str(job["id"]),
+                message_id,
                 failure_reason="recipient_role_based",
                 updated_at=current,
+                claim_token=claim_token,
             )
             store.update_sequence_status(
                 str(sequence["id"]),
@@ -386,9 +524,10 @@ async def run_scheduler_once(
             scope=f"campaign:{str(sequence.get('campaign_id', '') or '')}",
         ):
             store.mark_message_failed(
-                str(job["id"]),
+                message_id,
                 failure_reason="recipient_unsubscribed",
                 updated_at=current,
+                claim_token=claim_token,
             )
             store.update_sequence_status(
                 str(sequence["id"]),
@@ -429,26 +568,31 @@ async def run_scheduler_once(
                 unsubscribe_url=un_url,
             )
 
-        result = await sender(
-            account,
-            to_email=recipient,
-            subject=str(job.get("subject", "") or ""),
-            body_text=str(job.get("body_text", "") or ""),
-            reply_to=str(account.get("reply_to", "") or ""),
-            thread_key=str(job.get("thread_key", "") or ""),
-            list_unsubscribe_url=un_url or None,
-            list_unsubscribe_mailto=un_mailto or None,
-            body_html=body_html or None,
-        )
+        try:
+            result = await sender(
+                account,
+                to_email=recipient,
+                subject=str(job.get("subject", "") or ""),
+                body_text=str(job.get("body_text", "") or ""),
+                reply_to=str(account.get("reply_to", "") or ""),
+                thread_key=str(job.get("thread_key", "") or ""),
+                list_unsubscribe_url=un_url or None,
+                list_unsubscribe_mailto=un_mailto or None,
+                body_html=body_html or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
         if result.get("ok"):
             store.mark_message_sent(
-                str(job["id"]),
+                message_id,
                 provider_message_id=str(result.get("provider_message_id", "") or ""),
                 thread_key=str(result.get("thread_key", "") or ""),
                 sent_at=current,
+                claim_token=claim_token,
             )
+            store.finalize_send_quota(message_id, sent=True, updated_at=current)
             sent_today_cache[account_id] = sent_today_cache.get(account_id, 0) + 1
-            step_number = int(job.get("step_number", 1) or 1)
+            sent_hour_cache[account_id] = sent_hour_cache.get(account_id, 0) + 1
             # WATERFALL: mark this recipient as waiting_reply so the
             # scheduler will time it out and clone a fresh message
             # for the next recipient if no reply arrives. Done BEFORE
@@ -492,14 +636,17 @@ async def run_scheduler_once(
                 next_scheduled_at=next_sched,
                 stop_reason=stop_reason,
             )
+            store.refresh_campaign_status(str(sequence["campaign_id"]), updated_at=current)
             sent += 1
         else:
             error_kind = str(result.get("error_type", "") or result.get("error", "") or "send_failed")
             store.mark_message_failed(
-                str(job["id"]),
+                message_id,
                 failure_reason=error_kind,
                 updated_at=current,
+                claim_token=claim_token,
             )
+            store.finalize_send_quota(message_id, sent=False, updated_at=current)
             # WATERFALL: don't park the whole sequence on a single
             # send failure — just retire this recipient (e.g. bad
             # address, mailbox full) and let the next pending one
@@ -526,6 +673,7 @@ async def run_scheduler_once(
                     updated_at=current,
                     stop_reason=stop_reason,
                 )
+                store.refresh_campaign_status(str(sequence["campaign_id"]), updated_at=current)
                 # If a next pending recipient exists, clone a fresh
                 # message for it in THIS pass so the scheduler
                 # immediately retries with the next candidate. Without
@@ -539,13 +687,13 @@ async def run_scheduler_once(
                         lead_email=str(next_rec["email"]),
                         updated_at=current,
                     )
-                    latest = store.latest_message_for_sequence(str(sequence["id"]))
+                    latest = store.get_message(message_id)
                     if latest:
                         new_msg_id = store.clone_pending_message_after(
                             str(latest["id"]), scheduled_at=current
                         )
                         if new_msg_id:
-                            new_job = store.get_message(new_msg_id)
+                            new_job = store.claim_message(new_msg_id, claimed_at=current)
                             if new_job:
                                 jobs.append(new_job)
             else:
@@ -558,6 +706,18 @@ async def run_scheduler_once(
                     updated_at=current,
                     stop_reason=error_kind,
                 )
+                store.refresh_campaign_status(str(sequence["campaign_id"]), updated_at=current)
             failed += 1
         _refresh_hunt_email_summary(store, str(sequence["hunt_id"]), str(sequence["campaign_id"]))
     return {"sent": sent, "failed": failed, "skipped": skipped}
+
+
+async def run_scheduler_once(
+    store: EmailStore,
+    *,
+    now_iso: str | None = None,
+    sender: Callable[..., Awaitable[dict[str, Any]]] = send_email,
+) -> dict[str, int]:
+    """Run one scheduler pass with process-wide serialization."""
+    async with _scheduler_lock:
+        return await _run_scheduler_once(store, now_iso=now_iso, sender=sender)

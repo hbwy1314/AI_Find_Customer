@@ -29,6 +29,19 @@ def test_collect_automation_status_and_metrics(monkeypatch, tmp_path):
 
     store = EmailStore(email_db)
     store.init_db()
+    store.upsert_account({
+        "id": "acct_1",
+        "provider_type": "graph",
+        "from_name": "Sales",
+        "from_email": "sales@example.com",
+        "reply_to": "",
+        "status": "active",
+        "daily_send_limit": 100,
+        "hourly_send_limit": 100,
+        "last_test_at": "",
+        "created_at": "9999-04-04T00:00:00+00:00",
+        "updated_at": "9999-04-04T00:00:00+00:00",
+    })
     store.create_campaign({
         "id": "cmp_1",
         "hunt_id": "hunt_1",

@@ -882,7 +882,8 @@ JINA_API_KEY=your-jina-key
 ## 前后端联调说明
 
 - 前端默认通过 Vite 代理把 `/api` 转发到 `http://localhost:8000`
-- 如果后端配置了 `API_ACCESS_TOKEN`，前端需要额外设置 `VITE_API_ACCESS_TOKEN`
+- 浏览器前端统一使用登录会话 Cookie，不要把 `API_ACCESS_TOKEN` 注入 `VITE_*` 变量或浏览器构建产物
+- `API_ACCESS_TOKEN` 仅用于 CLI、服务间调用等能够安全发送 `X-API-Key`/Bearer Header 的客户端
 - 未配置 `API_ACCESS_TOKEN` 时，后端只允许 localhost 访问，远程机器访问会返回 `403`
 
 ## 常用接口

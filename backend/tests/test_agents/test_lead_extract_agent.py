@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +19,7 @@ from agents.lead_extract_agent import (
     _verify_lead_emails,
     lead_extract_node,
 )
+from emailing.store import EmailStore
 
 
 def _base_state(**overrides):
@@ -369,6 +372,7 @@ class TestQuickGate:
 
     @pytest.mark.asyncio
     async def test_quick_gate_keeps_possible_channel_even_with_competitor_risk(self):
+        """QuickGate should allow distributors even with high competitor_risk."""
         llm = AsyncMock()
         llm.generate = AsyncMock(return_value=json.dumps({
             "pass_gate": True,
@@ -376,18 +380,20 @@ class TestQuickGate:
             "customer_role_guess": "distributor",
             "competitor_risk": "high",
             "confidence": 0.61,
-            "reason": "Sells related products but appears to act as distributor/importer.",
+            "reason": "Sells related products but appears to act as channel partner.",
             "risk_flags": ["possible_competitor"],
         }))
 
+        # Use description without B2B keywords to test actual LLM logic
         passed, gate = await _quick_gate_candidate(
-            {"title": "Acme Electrical", "maps_data": {"description": "Distributor of industrial switches"}},
+            {"title": "Acme Electrical Supply", "maps_data": {"description": "Electrical components supplier"}},
             llm,
             {"products": ["micro switch"]},
         )
 
         assert passed is True
         assert gate["customer_role_guess"] == "distributor"
+        # High competitor_risk is allowed when role is distributor/importer/wholesaler
         assert gate["competitor_risk"] == "high"
 
     @pytest.mark.asyncio
@@ -477,6 +483,32 @@ class TestLeadExtractNode:
 
         # solartech.de already in leads, only pvdist.com should be processed
         assert any(l.get("company_name") == "SolarTech" for l in result["leads"])
+
+    @pytest.mark.asyncio
+    async def test_skips_global_candidate_before_deep_scrape(self):
+        state = _base_state(
+            search_results=[
+                {
+                    "title": "Known Solar",
+                    "link": "https://known-solar.example/",
+                    "source": "google_maps",
+                    "maps_data": {"website": "https://known-solar.example/"},
+                },
+            ],
+        )
+        registry = MagicMock()
+        registry.list_lead_registry_keys.return_value = {"domain:known-solar.example"}
+
+        with (
+            patch("agents.lead_extract_agent.EmailStore", return_value=registry),
+            patch("agents.lead_extract_agent.get_settings") as mock_settings,
+            patch("agents.lead_extract_agent._scrape_and_extract", new_callable=AsyncMock) as mock_scrape,
+        ):
+            mock_settings.return_value.scrape_concurrency = 5
+            result = await lead_extract_node(state)
+
+        assert result.get("leads", []) == []
+        mock_scrape.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_updates_keyword_stats(self):
@@ -703,6 +735,326 @@ class TestLeadExtractNode:
 
         # Only realcompany.com should be processed, google/tiktok filtered
         assert call_count["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_does_not_dedupe_same_name_different_regions(self):
+        """Same company name in different regions should NOT be deduped if they have different identities."""
+        import tempfile
+
+        from agents.lead_identity import lead_identity_keys
+        from emailing.store import EmailStore
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EmailStore(str(db_path))
+            store.init_db()
+            
+            # Hunt A already found "Vape Store" in Germany
+            hunt_a_lead = {
+                "company_name": "Vape Store",
+                "website": "https://vape-berlin.com",
+                "emails": [],
+                "phone_numbers": [],
+            }
+            store.reserve_lead_keys([hunt_a_lead], hunt_id="hunt-a", key_fn=lead_identity_keys, now_iso="2026-01-01")
+            
+            # Hunt B searches and finds "Vape Store" in Poland (different place_id, different website)
+            state = _base_state(
+                hunt_id="hunt-b",
+                search_results=[
+                    {
+                        "link": "https://maps.google.com/?cid=999",
+                        "title": "Vape Store",
+                        "source_keyword": "kw1",
+                        "maps_data": {
+                            "place_id": "ChIJ_poland_vape_store",
+                            "title": "Vape Store",
+                            "address": "Warsaw, Poland",
+                        },
+                    }
+                ],
+            )
+
+            # ReAct returns Polish Vape Store with different website
+            react_result = json.dumps({
+                "company_name": "Vape Store Warsaw",
+                "website": "https://vape-warsaw.pl",
+                "industry": "Retail",
+                "description": "Vape retailer in Poland",
+                "emails": ["contact@vape-warsaw.pl"],
+                "phone_numbers": [],
+                "social_media": {},
+                "decision_makers": [],
+                "address": "Warsaw, Poland",
+                "match_score": 0.75,
+                "fit_reasons": ["Vape retailer in Poland"],
+                "disqualify_reasons": [],
+            })
+
+            with patch("agents.lead_extract_agent.JinaReaderTool") as MockJina, \
+                 patch("agents.lead_extract_agent.LLMTool") as MockLLM, \
+                 patch("agents.lead_extract_agent.GoogleSearchTool") as MockGoogle, \
+                 patch("agents.lead_extract_agent.react_loop", return_value=react_result), \
+                 patch("agents.lead_extract_agent.get_settings") as mock_settings, \
+                 patch("agents.lead_extract_agent.EmailStore", return_value=store):
+
+                mock_settings.return_value.scrape_concurrency = 5
+                mock_settings.return_value.email_db_path = str(db_path)
+
+                jina_instance = AsyncMock()
+                jina_instance.close = AsyncMock()
+                MockJina.return_value = jina_instance
+
+                llm_instance = AsyncMock()
+                llm_instance.close = AsyncMock()
+                # QuickGate passes
+                llm_instance.generate = AsyncMock(return_value=json.dumps({
+                    "pass_gate": True,
+                    "entity_type": "company",
+                    "customer_role_guess": "retailer",
+                    "competitor_risk": "low",
+                    "confidence": 0.8,
+                    "reason": "Vape retailer",
+                    "risk_flags": []
+                }))
+                MockLLM.return_value = llm_instance
+
+                google_instance = AsyncMock()
+                google_instance.close = AsyncMock()
+                MockGoogle.return_value = google_instance
+
+                result = await lead_extract_node(state)
+
+            # Should NOT be filtered by global dedup because different website/place_id
+            assert len(result["leads"]) == 1
+            assert result["leads"][0]["company_name"] == "Vape Store Warsaw"
+            assert result["leads"][0]["website"] == "https://vape-warsaw.pl"
+
+    @pytest.mark.asyncio
+    async def test_continue_hunt_preserves_old_leads_and_dedupes_new(self):
+        """Continue hunt should keep existing leads and not re-scrape them."""
+        import tempfile
+
+        from agents.lead_identity import lead_identity_keys
+        from emailing.store import EmailStore
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            store = EmailStore(str(db_path))
+            store.init_db()
+            
+            # Hunt A already has 2 leads
+            existing_leads = [
+                {
+                    "company_name": "Existing Lead A",
+                    "website": "https://existing-a.com",
+                    "emails": ["contact@existing-a.com"],
+                    "phone_numbers": [],
+                },
+                {
+                    "company_name": "Existing Lead B",
+                    "website": "https://existing-b.com",
+                    "emails": [],
+                    "phone_numbers": [],
+                }
+            ]
+            store.reserve_lead_keys(existing_leads, hunt_id="hunt-a", key_fn=lead_identity_keys, now_iso="2026-01-01")
+            
+            # Continue hunt: search finds 3 candidates
+            # 1. existing-a.com (should be filtered)
+            # 2. existing-b.com (should be filtered)
+            # 3. new-c.com (should be processed)
+            state = _base_state(
+                hunt_id="hunt-a",
+                hunt_round=2,
+                leads=existing_leads,  # existing_leads are passed as "leads" in state
+                search_results=[
+                    {"link": "https://existing-a.com", "title": "Existing Lead A", "source_keyword": "kw1"},
+                    {"link": "https://existing-b.com", "title": "Existing Lead B", "source_keyword": "kw1"},
+                    {"link": "https://new-c.com", "title": "New Lead C", "source_keyword": "kw1"},
+                ],
+            )
+
+            # ReAct only called for new-c.com
+            react_result = json.dumps({
+                "company_name": "New Lead C",
+                "website": "https://new-c.com",
+                "industry": "Manufacturing",
+                "description": "New company",
+                "emails": ["sales@new-c.com"],
+                "phone_numbers": [],
+                "social_media": {},
+                "decision_makers": [],
+                "address": "Berlin, Germany",
+                "match_score": 0.8,
+                "fit_reasons": ["Manufacturing company in Germany"],
+                "disqualify_reasons": [],
+            })
+
+            scrape_call_count = {"n": 0}
+            
+            async def counting_react_loop(**kwargs):
+                scrape_call_count["n"] += 1
+                return react_result
+
+            with patch("agents.lead_extract_agent.JinaReaderTool") as MockJina, \
+                 patch("agents.lead_extract_agent.LLMTool") as MockLLM, \
+                 patch("agents.lead_extract_agent.GoogleSearchTool") as MockGoogle, \
+                 patch("agents.lead_extract_agent.react_loop", side_effect=counting_react_loop), \
+                 patch("agents.lead_extract_agent.get_settings") as mock_settings, \
+                 patch("agents.lead_extract_agent.EmailStore", return_value=store):
+
+                mock_settings.return_value.scrape_concurrency = 5
+                mock_settings.return_value.email_db_path = str(db_path)
+
+                MockJina.return_value = AsyncMock(close=AsyncMock())
+                MockLLM.return_value = AsyncMock(close=AsyncMock())
+                MockGoogle.return_value = AsyncMock(close=AsyncMock())
+
+                result = await lead_extract_node(state)
+
+            # Should only scrape new-c.com (existing-a and existing-b filtered by global dedup)
+            assert scrape_call_count["n"] == 1
+            
+            # Result should contain all 3 leads: 2 existing + 1 new
+            assert len(result["leads"]) == 3
+            
+            # Verify all leads are present
+            company_names = {lead["company_name"] for lead in result["leads"]}
+            assert company_names == {"Existing Lead A", "Existing Lead B", "New Lead C"}
+            
+            # Verify the new lead was added
+            new_lead = next(l for l in result["leads"] if l["company_name"] == "New Lead C")
+            assert new_lead["website"] == "https://new-c.com"
+            assert new_lead["emails"] == ["sales@new-c.com"]
+
+    @pytest.mark.asyncio
+    async def test_same_company_name_different_regions_not_deduped(self):
+        """Same company name in different regions should NOT be deduplicated."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test_registry.db"
+            store = EmailStore(str(db_path))
+            
+            # Hunt searches for "Vape Store" in multiple regions
+            # Finds 3 candidates with same name but different locations
+            state = _base_state(
+                hunt_id="hunt-vape",
+                hunt_round=1,
+                leads=[],
+                search_results=[
+                    {
+                        "link": "https://vapestore-berlin.de",
+                        "title": "Vape Store",
+                        "source_keyword": "vape store Germany",
+                        "maps_data": {
+                            "place_id": "ChIJ1234_berlin",
+                            "title": "Vape Store",
+                            "address": "Berlin, Germany",
+                        }
+                    },
+                    {
+                        "link": "https://vapestore-london.co.uk",
+                        "title": "Vape Store",
+                        "source_keyword": "vape store UK",
+                        "maps_data": {
+                            "place_id": "ChIJ5678_london",
+                            "title": "Vape Store",
+                            "address": "London, UK",
+                        }
+                    },
+                    {
+                        "link": "https://vapestore-paris.fr",
+                        "title": "Vape Store",
+                        "source_keyword": "vape store France",
+                        "maps_data": {
+                            "place_id": "ChIJ9012_paris",
+                            "title": "Vape Store",
+                            "address": "Paris, France",
+                        }
+                    },
+                ],
+            )
+
+            react_results = [
+                json.dumps({
+                    "company_name": "Vape Store Berlin",
+                    "website": "https://vapestore-berlin.de",
+                    "industry": "Retail",
+                    "description": "Vape shop in Berlin",
+                    "emails": ["info@vapestore-berlin.de"],
+                    "phone_numbers": ["+49301234567"],
+                    "social_media": {},
+                    "decision_makers": [],
+                    "address": "Berlin, Germany",
+                    "match_score": 0.75,
+                    "fit_reasons": ["Vape retailer in Germany"],
+                    "disqualify_reasons": [],
+                }),
+                json.dumps({
+                    "company_name": "Vape Store London",
+                    "website": "https://vapestore-london.co.uk",
+                    "industry": "Retail",
+                    "description": "Vape shop in London",
+                    "emails": ["sales@vapestore-london.co.uk"],
+                    "phone_numbers": ["+442071234567"],
+                    "social_media": {},
+                    "decision_makers": [],
+                    "address": "London, UK",
+                    "match_score": 0.73,
+                    "fit_reasons": ["Vape retailer in UK"],
+                    "disqualify_reasons": [],
+                }),
+                json.dumps({
+                    "company_name": "Vape Store Paris",
+                    "website": "https://vapestore-paris.fr",
+                    "industry": "Retail",
+                    "description": "Vape shop in Paris",
+                    "emails": ["contact@vapestore-paris.fr"],
+                    "phone_numbers": ["+33145123456"],
+                    "social_media": {},
+                    "decision_makers": [],
+                    "address": "Paris, France",
+                    "match_score": 0.72,
+                    "fit_reasons": ["Vape retailer in France"],
+                    "disqualify_reasons": [],
+                }),
+            ]
+
+            call_index = {"i": 0}
+            
+            async def indexed_react_loop(**kwargs):
+                result = react_results[call_index["i"]]
+                call_index["i"] += 1
+                return result
+
+            with patch("agents.lead_extract_agent.JinaReaderTool") as MockJina, \
+                 patch("agents.lead_extract_agent.LLMTool") as MockLLM, \
+                 patch("agents.lead_extract_agent.GoogleSearchTool") as MockGoogle, \
+                 patch("agents.lead_extract_agent.react_loop", side_effect=indexed_react_loop), \
+                 patch("agents.lead_extract_agent.get_settings") as mock_settings, \
+                 patch("agents.lead_extract_agent.EmailStore", return_value=store):
+
+                mock_settings.return_value.scrape_concurrency = 5
+                mock_settings.return_value.email_db_path = str(db_path)
+
+                MockJina.return_value = AsyncMock(close=AsyncMock())
+                MockLLM.return_value = AsyncMock(close=AsyncMock())
+                MockGoogle.return_value = AsyncMock(close=AsyncMock())
+
+                result = await lead_extract_node(state)
+
+            # All 3 candidates should be scraped (not deduplicated by company name alone)
+            assert call_index["i"] == 3
+            
+            # Result should contain all 3 leads
+            assert len(result["leads"]) == 3
+            
+            # Verify each lead has unique identity
+            domains = {lead["website"] for lead in result["leads"]}
+            assert len(domains) == 3
+            assert "https://vapestore-berlin.de" in domains
+            assert "https://vapestore-london.co.uk" in domains
+            assert "https://vapestore-paris.fr" in domains
 
 
 class TestCollectedContactsMerge:
@@ -1170,3 +1522,275 @@ class TestFinalDedupSafetyNet:
         # When website is empty, dedup key should fall back to company_name
         name_key = (lead["company_name"] or "").strip().lower()
         assert name_key == "acme vapes"
+
+
+class TestExistingLeadsGlobalDedup:
+    """Test that existing_leads are filtered against global registry to prevent
+    cross-hunt duplicates from being preserved during continue mining."""
+
+    def test_existing_leads_filtered_against_global_registry(self, tmp_path: Path):
+        """Existing leads from other hunts should be removed when continuing mining."""
+        from agents.lead_identity import lead_identity_keys
+        from emailing.store import EmailStore
+
+        store = EmailStore(str(tmp_path / "test.db"))
+        store.init_db()
+
+        # Hunt A registered these leads first
+        lead_a1 = {"company_name": "Acme Corp", "website": "https://acme.com", "emails": ["info@acme.com"]}
+        lead_a2 = {"company_name": "Beta Ltd", "website": "https://beta.com", "emails": []}
+
+        store.reserve_lead_keys(
+            [lead_a1, lead_a2],
+            hunt_id="hunt-alpha",
+            key_fn=lead_identity_keys,
+            now_iso="2026-01-01",
+        )
+
+        # Hunt B's existing_leads accidentally contains duplicates from Hunt A
+        # (this happens when user continues mining and search results overlap)
+        existing_leads = [
+            {"company_name": "Acme Corp", "website": "https://acme.com", "emails": ["info@acme.com"]},  # from hunt-alpha
+            {"company_name": "Beta Ltd", "website": "https://beta.com", "emails": []},  # from hunt-alpha
+            {"company_name": "Gamma Inc", "website": "https://gamma.com", "emails": []},  # actually belongs to hunt-beta
+        ]
+
+        # Simulate filtering existing_leads against global registry
+        filtered = []
+        for lead in existing_leads:
+            keys = lead_identity_keys(lead)
+            # Check if any key belongs to a different hunt
+            belongs_to_other = False
+            for key in keys:
+                owner = store.get_hunt_id_for_key(key)
+                if owner and owner != "hunt-beta":
+                    belongs_to_other = True
+                    break
+            if not belongs_to_other:
+                filtered.append(lead)
+
+        # Only Gamma Inc should remain (not registered by any hunt yet)
+        assert len(filtered) == 1
+        assert filtered[0]["company_name"] == "Gamma Inc"
+
+    def test_existing_leads_preserved_when_belonging_to_current_hunt(self, tmp_path: Path):
+        """Leads originally from current hunt should be preserved."""
+        from agents.lead_identity import lead_identity_keys
+        from emailing.store import EmailStore
+
+        store = EmailStore(str(tmp_path / "test.db"))
+        store.init_db()
+
+        # Hunt A registered its own leads
+        lead_a1 = {"company_name": "Acme Corp", "website": "https://acme.com", "emails": []}
+        lead_a2 = {"company_name": "Beta Ltd", "website": "https://beta.com", "emails": []}
+
+        store.reserve_lead_keys(
+            [lead_a1, lead_a2],
+            hunt_id="hunt-alpha",
+            key_fn=lead_identity_keys,
+            now_iso="2026-01-01",
+        )
+
+        # Continue mining hunt-alpha with same leads
+        existing_leads = [
+            {"company_name": "Acme Corp", "website": "https://acme.com", "emails": []},
+            {"company_name": "Beta Ltd", "website": "https://beta.com", "emails": []},
+        ]
+
+        # Filter against global registry
+        filtered = []
+        for lead in existing_leads:
+            keys = lead_identity_keys(lead)
+            belongs_to_other = False
+            for key in keys:
+                owner = store.get_hunt_id_for_key(key)
+                if owner and owner != "hunt-alpha":
+                    belongs_to_other = True
+                    break
+            if not belongs_to_other:
+                filtered.append(lead)
+
+        # Both should be preserved (they belong to hunt-alpha)
+        assert len(filtered) == 2
+        assert {lead["company_name"] for lead in filtered} == {"Acme Corp", "Beta Ltd"}
+
+
+class TestCandidateGlobalDedup:
+    """Test pre-scrape global deduplication using candidate_identity_keys."""
+
+    @pytest.mark.asyncio
+    async def test_same_name_different_place_not_deduped(self):
+        """同名公司但不同place_id应该不被去重"""
+        import tempfile
+        from pathlib import Path
+
+        from agents.lead_extract_agent import lead_extract_node
+        from emailing.store import EmailStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = EmailStore(str(Path(tmpdir) / "test.db"))
+            store.init_db()
+
+            # Hunt A 已经收集了德国的 Vape Store
+            hunt_a_lead = {
+                "company_name": "Vape Store",
+                "website": "https://vape-berlin.com",
+                "emails": [],
+            }
+            from agents.lead_identity import lead_identity_keys
+            store.reserve_lead_keys(
+                [hunt_a_lead],
+                hunt_id="hunt-a",
+                key_fn=lead_identity_keys,
+                now_iso="2026-01-01"
+            )
+
+            # Hunt B 搜索到波兰的 Vape Store (不同 place_id)
+            state = {
+                "hunt_id": "hunt-b",
+                "hunt_round": 1,
+                "current_stage": "lead_extract",
+                "search_results": [
+                    {
+                        "link": "https://maps.google.com/?cid=999",
+                        "title": "Vape Store",
+                        "source_keyword": "kw1",
+                        "maps_data": {
+                            "place_id": "ChIJ_poland_vape_store",
+                            "title": "Vape Store",
+                            "address": "Warsaw, Poland",
+                        },
+                    }
+                ],
+                "existing_leads": [],
+                "target_lead_count": 50,
+                "insight": {"products": ["vape"]},
+            }
+
+            react_result = json.dumps({
+                "company_name": "Vape Store Warsaw",
+                "website": "https://vape-warsaw.pl",
+                "industry": "Retail",
+                "description": "Vape retailer in Poland",
+                "emails": ["sales@vape-warsaw.pl"],
+                "phone_numbers": [],
+                "social_media": {},
+                "decision_makers": [],
+                "address": "Warsaw, Poland",
+                "match_score": 0.75,
+                "fit_reasons": ["Vape Store Warsaw is a retailer selling vape products in Poland"],
+                "disqualify_reasons": [],
+            })
+
+            # Mock scraping to return valid lead
+            with patch("agents.lead_extract_agent.JinaReaderTool") as MockJina, \
+                 patch("agents.lead_extract_agent.LLMTool") as MockLLM, \
+                 patch("agents.lead_extract_agent.GoogleSearchTool") as MockGoogle, \
+                 patch("agents.lead_extract_agent.react_loop", return_value=react_result), \
+                 patch("agents.lead_extract_agent.get_settings") as mock_settings, \
+                 patch("agents.lead_extract_agent.EmailStore", return_value=store):
+
+                mock_settings.return_value.scrape_concurrency = 5
+
+                jina_instance = AsyncMock()
+                jina_instance.close = AsyncMock()
+                MockJina.return_value = jina_instance
+
+                llm_instance = AsyncMock()
+                llm_instance.close = AsyncMock()
+                # QuickGate passes
+                llm_instance.generate = AsyncMock(return_value=json.dumps({
+                    "pass_gate": True,
+                    "entity_type": "company",
+                    "customer_role_guess": "retailer",
+                    "competitor_risk": "low",
+                    "confidence": 0.8,
+                    "reason": "Vape retailer",
+                    "risk_flags": []
+                }))
+                MockLLM.return_value = llm_instance
+
+                google_instance = AsyncMock()
+                google_instance.close = AsyncMock()
+                MockGoogle.return_value = google_instance
+
+                result = await lead_extract_node(state)
+
+                # 应该成功抓取波兰的 Vape Store（不同 place_id）
+                assert "leads" in result
+                assert len(result["leads"]) == 1
+                assert result["leads"][0]["company_name"] == "Vape Store Warsaw"
+
+    @pytest.mark.asyncio
+    async def test_same_domain_is_deduped(self):
+        """相同域名的候选应该被去重"""
+        import tempfile
+        from pathlib import Path
+
+        from agents.lead_extract_agent import lead_extract_node
+        from emailing.store import EmailStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = EmailStore(str(Path(tmpdir) / "test.db"))
+            store.init_db()
+
+            # Hunt A 已经收集了 acme.com
+            hunt_a_lead = {
+                "company_name": "Acme Corp",
+                "website": "https://acme.com",
+                "emails": [],
+            }
+            from agents.lead_identity import lead_identity_keys
+            store.reserve_lead_keys(
+                [hunt_a_lead],
+                hunt_id="hunt-a",
+                key_fn=lead_identity_keys,
+                now_iso="2026-01-01"
+            )
+
+            # Hunt B 搜索到同一个域名
+            state = {
+                "hunt_id": "hunt-b",
+                "hunt_round": 1,
+                "current_stage": "lead_extract",
+                "search_results": [
+                    {
+                        "link": "https://acme.com/contact",
+                        "title": "Acme Corporation",
+                        "source_keyword": "kw1",
+                        "maps_data": {},
+                    }
+                ],
+                "existing_leads": [],
+                "target_lead_count": 50,
+                "insight": {"products": ["widgets"]},
+            }
+
+            with patch("agents.lead_extract_agent.JinaReaderTool") as MockJina, \
+                 patch("agents.lead_extract_agent.LLMTool") as MockLLM, \
+                 patch("agents.lead_extract_agent.GoogleSearchTool") as MockGoogle, \
+                 patch("agents.lead_extract_agent.get_settings") as mock_settings, \
+                 patch("agents.lead_extract_agent.EmailStore", return_value=store):
+
+                mock_settings.return_value.scrape_concurrency = 5
+
+                jina_instance = AsyncMock()
+                jina_instance.close = AsyncMock()
+                MockJina.return_value = jina_instance
+
+                llm_instance = AsyncMock()
+                llm_instance.close = AsyncMock()
+                MockLLM.return_value = llm_instance
+
+                google_instance = AsyncMock()
+                google_instance.close = AsyncMock()
+                MockGoogle.return_value = google_instance
+
+                result = await lead_extract_node(state)
+
+                # 不应该抓取任何新线索（acme.com已被hunt-a拥有）
+                leads = result.get("leads", [])
+                assert len(leads) == 0
+                # Jina不应该被调用（候选在抓取前被过滤）
+                jina_instance.read.assert_not_called()

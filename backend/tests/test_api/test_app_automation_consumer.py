@@ -5,7 +5,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api.app import (
+    _hydrate_recovered_job_payload,
     _notify_feishu_async,
+    _release_consumer_claims_for_shutdown,
     _run_automation_consumer_once,
     _run_template_seed_prewarm_once,
 )
@@ -96,6 +98,49 @@ async def test_embedded_consumer_stops_cancelled_job(monkeypatch, tmp_path):
     assert job["status"] == "failed"
     assert job["progress_stage"] == "cancelled"
     assert requested == []
+
+
+def test_hydrate_recovered_job_payload_restores_saved_leads(monkeypatch, tmp_path):
+    queue = HuntJobQueue(str(tmp_path / "queue.db"))
+    queue.init_db()
+    job_id = queue.enqueue({"description": "Find buyers"}, now_iso="2026-04-05T00:00:00+00:00")
+    job = queue.get(job_id)
+    assert job is not None
+
+    monkeypatch.setattr(
+        "api.app.load_hunt",
+        lambda hunt_id: {"result": {"leads": [{"company_name": "Saved lead"}]}},
+    )
+    count = _hydrate_recovered_job_payload(
+        queue,
+        [{**job, "last_hunt_id": "hunt-old"}],
+        updated_at="2026-04-05T00:01:00+00:00",
+    )
+
+    assert count == 1
+    recovered = queue.get(job_id)
+    assert recovered is not None
+    assert recovered["payload"]["existing_leads"] == [{"company_name": "Saved lead"}]
+
+
+def test_release_consumer_claims_for_shutdown_requeues_active_job(monkeypatch, tmp_path):
+    queue = HuntJobQueue(str(tmp_path / "queue.db"))
+    queue.init_db()
+    job_id = queue.enqueue({"description": "Find buyers"}, now_iso="2026-04-05T00:00:00+00:00")
+    monkeypatch.setattr("api.app._automation_worker_id", lambda: "worker-a")
+    claimed = queue.claim_next(worker_id="worker-a", now_iso="2026-04-05T00:00:01+00:00")
+    assert claimed is not None
+
+    released = _release_consumer_claims_for_shutdown(
+        queue,
+        updated_at="2026-04-05T00:01:00+00:00",
+    )
+
+    assert released == 1
+    requeued = queue.get(job_id)
+    assert requeued is not None
+    assert requeued["status"] == "queued"
+    assert requeued["claim_token"] == ""
 
 
 @pytest.mark.asyncio

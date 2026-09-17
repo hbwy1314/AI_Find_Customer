@@ -21,10 +21,21 @@ import asyncio
 import json
 import logging
 import re
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from agents.lead_identity import (
+    candidate_identity_keys,
+    dedupe_leads,
+    lead_identity_keys,
+    normalize_company_name,
+    normalize_domain,
+    official_domain,
+)
 from config.settings import get_settings
+from emailing.store import EmailStore
 from graph.state import HuntState
 from tools.contact_extractor import (
     discover_contact_pages,
@@ -48,7 +59,9 @@ logger = logging.getLogger(__name__)
 # ── Progress callback registry ────────────────────────────────────────────
 # Set by _run_hunt before invoking the graph so lead_extract_node can
 # broadcast per-URL progress via SSE without changing the LangGraph signature.
-_progress_callback: Callable[[dict], None] | None = None
+_progress_callback: ContextVar[Callable[[dict], None] | None] = ContextVar(
+    "lead_extract_progress_callback", default=None
+)
 
 
 def _candidate_budget(target_lead_count: int, scrape_concurrency: int) -> int:
@@ -64,15 +77,15 @@ def _candidate_budget(target_lead_count: int, scrape_concurrency: int) -> int:
 
 
 def set_progress_callback(cb: Callable[[dict], None] | None) -> None:
-    """Set the module-level progress callback (called from routes._run_hunt)."""
-    global _progress_callback
-    _progress_callback = cb
+    """Set the callback for the current asyncio task only."""
+    _progress_callback.set(cb)
 
 
 def _emit_progress(event: str, **data: Any) -> None:
     """Emit a progress event if a callback is registered."""
-    if _progress_callback:
-        _progress_callback({"event": event, **data})
+    callback = _progress_callback.get()
+    if callback:
+        callback({"event": event, **data})
 
 
 def _derive_priority_tier(fit_score: float, contactability_score: float) -> str:
@@ -416,6 +429,16 @@ Is this company the right type of buyer/partner?
 - 0.15: Service company or installer who occasionally purchases our product type
 - 0.00: Direct competitor/manufacturer of the same products, or completely irrelevant business type
 
+### Final Score Calculation
+**match_score** = product_fit + industry_fit + business_type_fit (sum of the three dimensions above, range 0.0-1.0)
+
+**fit_score** = match_score × evidence_quality_multiplier, where:
+- evidence_quality_multiplier = 1.0 if evidence_strength is "high" (official website with clear product catalog, business registration info, or detailed company profile)
+- evidence_quality_multiplier = 0.85 if evidence_strength is "medium" (basic website or Maps listing with some detail)
+- evidence_quality_multiplier = 0.65 if evidence_strength is "low" (minimal info, only Maps title/snippet, or inference-based)
+
+CRITICAL: Always calculate and return BOTH match_score and fit_score. Never leave fit_score at 0.0 unless match_score is also 0.0.
+
 ## CRITICAL RULES FOR fit_reasons
 Each reason MUST:
 1. Reference a SPECIFIC fact from the company profile (company name, specific product they sell, their business type)
@@ -555,6 +578,35 @@ def _quick_gate_fallback(search_result: dict, insight: dict) -> tuple[bool, dict
 async def _quick_gate_candidate(search_result: dict, llm: LLMTool, insight: dict) -> tuple[bool, dict]:
     """Low-cost pre-filter before deep ReAct enrichment."""
     maps = search_result.get("maps_data", {}) or {}
+    title = str(search_result.get("title", "")).lower()
+    description = str(maps.get("description", "")).lower()
+    combined_text = f"{title} {description}"
+    
+    # STRICT PASS RULE: Strong B2B signal keywords → force pass gate.
+    # These words strongly indicate wholesale/distribution operations.
+    # Fixes false rejections of distributors/wholesalers like "Bazardo Großhandel",
+    # "E-Zigaretten Groß GmbH", "Vape B2B", "Importeur", etc.
+    b2b_keywords = [
+        "großhandel", "grosshandel", "großhändler", "b2b", "distributor",
+        "distribution", "importer", "importeur", "wholesaler", "wholesale",
+        "händlerregistrierung", "haendlerregistrierung", "händlerzugang", 
+        "wiederverk", "trade only", "fachhandel", "fachhändler",
+    ]
+    if any(kw in combined_text for kw in b2b_keywords):
+        logger.debug(
+            "[LeadExtract][QuickGate] Force PASS due to B2B keyword: title=%s",
+            search_result.get("title", "")[:80],
+        )
+        return True, {
+            "pass_gate": True,
+            "reason": "Strong B2B keyword detected (Großhandel/distributor/importer/B2B/wholesale).",
+            "risk_flags": [],
+            "confidence": 0.9,
+            "entity_type": "company",
+            "customer_role_guess": "distributor",
+            "competitor_risk": "low",
+        }
+    
     prompt = (
         "## Candidate (Google Maps / URL)\n"
         f"title: {search_result.get('title', '')}\n"
@@ -586,10 +638,13 @@ async def _quick_gate_candidate(search_result: dict, llm: LLMTool, insight: dict
         competitor_risk = str(parsed.get("competitor_risk", "")).lower().strip()
         entity_type = str(parsed.get("entity_type", "")).lower().strip()
         customer_role_guess = str(parsed.get("customer_role_guess", "")).lower().strip()
+        
+        # Only reject if LLM explicitly said pass_gate=false
+        # Do NOT add extra rejection rules that contradict "if uncertain, keep it"
         if bool(parsed.get("suspected_competitor", False)):
             passed = False
-        if competitor_risk == "high" and customer_role_guess not in {"distributor", "importer", "wholesaler", "oem", "integrator", "end_user"}:
-            passed = False
+        
+        # Reject non-company entities (directory, media, association, etc.)
         if entity_type and entity_type not in {"company", "unknown"}:
             passed = False
 
@@ -609,12 +664,7 @@ async def _quick_gate_candidate(search_result: dict, llm: LLMTool, insight: dict
 
 def _normalized_domain(url: str) -> str:
     """Normalize URL netloc for stable dedupe keys."""
-    domain = urlparse(url or "").netloc.lower().strip()
-    if domain.startswith("www."):
-        domain = domain[4:]
-    if ":" in domain:
-        domain = domain.split(":", 1)[0]
-    return domain
+    return normalize_domain(url)
 
 
 def _official_website_domain(url: str) -> str:
@@ -623,9 +673,22 @@ def _official_website_domain(url: str) -> str:
     Platform/profile/content URLs (LinkedIn, Thomasnet, etc.) are excluded
     from dedupe keys to avoid false deduplication across different companies.
     """
-    if classify_url(url or "") != "company_site":
-        return ""
-    return _normalized_domain(url)
+    return official_domain(url)
+
+
+def _global_lead_keys(lead: dict[str, Any]) -> list[str]:
+    """Cross-Hunt dedup keys using full lead identity.
+
+    Uses domain, email, phone, place_id as strong identities.
+    Company name is only used when combined with other strong signals.
+    
+    This prevents:
+    - Same website being collected twice
+    - Same email being collected twice
+    - Same company at different locations being incorrectly merged
+    """
+    from agents.lead_identity import lead_identity_keys
+    return lead_identity_keys(lead)
 
 
 # ── ReAct system prompt for per-URL lead extraction ──────────────────────
@@ -1050,6 +1113,14 @@ async def _scrape_and_extract(
         if maps_email:
             existing_emails = list(set(existing_emails + [maps_email]))
 
+        # Prefer QuickGate's customer_role_guess over LLM's customer_role if available
+        quick_gate = search_result.get("quick_gate", {})
+        gate_customer_role = str(quick_gate.get("customer_role_guess", "")).strip()
+        gate_competitor_risk = str(quick_gate.get("competitor_risk", "")).strip()
+        
+        final_customer_role = gate_customer_role if gate_customer_role and gate_customer_role != "unknown" else str(validated.get("customer_role", "unknown") or "unknown")
+        final_competitor_risk = gate_competitor_risk if gate_competitor_risk else str(validated.get("competitor_risk", "low") or "low")
+
         lead = {
             "company_name": validated.get("company_name") or domain,
             "website": validated.get("website") or url or maps_data.get("website", ""),
@@ -1066,11 +1137,12 @@ async def _scrape_and_extract(
             "contactability_score": min(max(float(validated.get("contactability_score", 0.0)), 0.0), 1.0),
             "customs_score": min(max(float(validated.get("customs_score", 0.0)), 0.0), 1.0),
             "priority_tier": str(validated.get("priority_tier", "low") or "low"),
-            "customer_role": str(validated.get("customer_role", "unknown") or "unknown"),
-            "competitor_risk": str(validated.get("competitor_risk", "low") or "low"),
+            "customer_role": final_customer_role,
+            "competitor_risk": final_competitor_risk,
             "evidence_strength": str(validated.get("evidence_strength", "low") or "low"),
             "risk_flags": validated.get("risk_flags", []) if isinstance(validated.get("risk_flags", []), list) else [],
             "source": domain,
+            "source_url": url,
             "country_code": validated.get("country_code", ""),
             "source_keyword": search_result.get("source_keyword", ""),
             "decision_makers": validated.get("decision_makers", []),
@@ -1199,11 +1271,51 @@ async def lead_extract_node(state: HuntState) -> dict:
     """
     settings = get_settings()
     search_results = state.get("search_results", [])
-    existing_leads = state.get("leads", [])
+    existing_leads = dedupe_leads(
+        [lead for lead in (state.get("leads", []) or []) if isinstance(lead, dict)]
+    )
     target_lead_count = max(0, int(state.get("target_lead_count", 0) or 0))
     insight = state.get("insight")
     insight = insight if isinstance(insight, dict) else {}
     keyword_stats = dict(state.get("keyword_search_stats", {}))
+    registry = EmailStore(settings.email_db_path)
+    registry.init_db()
+
+    # Load known company names from the global registry (cross-Hunt dedup).
+    # Only company:xxx keys are stored now — no domain/email/phone/place.
+    global_company_names: set[str] = {
+        k for k in registry.list_lead_registry_keys() if k.startswith("company:")
+    }
+    current_hunt_id = str(state.get("hunt_id", "") or "")
+
+    # Filter existing_leads: keep only those truly belonging to current Hunt.
+    # If a lead's company was first claimed by another Hunt, drop it from existing_leads.
+    if existing_leads:
+        filtered_existing = []
+        for lead in existing_leads:
+            if not isinstance(lead, dict):
+                continue
+            keys = _global_lead_keys(lead)
+            if not keys:
+                filtered_existing.append(lead)
+                continue
+            # Check if ANY key belongs to another Hunt
+            belongs_to_other_hunt = False
+            for key in keys:
+                owner_hunt = registry.get_hunt_id_for_key(key)
+                if owner_hunt and owner_hunt != current_hunt_id:
+                    belongs_to_other_hunt = True
+                    break
+            if not belongs_to_other_hunt:
+                filtered_existing.append(lead)
+                # Register this lead's company names for within-round dedup
+                global_company_names.update(keys)
+        
+        existing_leads = filtered_existing
+        logger.info(
+            "[LeadExtractAgent] Filtered existing_leads: kept %d truly belonging to current Hunt",
+            len(existing_leads),
+        )
 
     if target_lead_count and len(existing_leads) >= target_lead_count:
         logger.info(
@@ -1211,27 +1323,82 @@ async def lead_extract_node(state: HuntState) -> dict:
             len(existing_leads),
             target_lead_count,
         )
-        return {"current_stage": "lead_extract"}
+        # Return minimal filter_stats when skipping extraction
+        return {
+            "current_stage": "lead_extract",
+            "filter_stats": {
+                "total_search_results": len(search_results),
+                "no_link_or_title": 0,
+                "global_dedup_filtered": 0,
+                "within_hunt_domain_dedup": 0,
+                "irrelevant_url_filtered": 0,
+                "budget_trimmed": 0,
+                "quick_gate_filtered": 0,
+                "deep_scrape_attempted": 0,
+                "leads_extracted": 0,
+                "reason": "target_lead_count_already_satisfied"
+            }
+        }
 
-    # Determine which URLs to process (skip only by official website domain).
+    # Determine which URLs to process.
+    # Pre-scrape dedup: skip if title/company name already in global registry.
+    # Within-hunt dedup: skip if same official domain already seen this round.
     existing_domains = {
         d for d in (_official_website_domain(l.get("website", "")) for l in existing_leads)
         if d
     }
+    
+    # Track filtering stats
+    filter_stats = {
+        "total_search_results": len(search_results),
+        "no_link_or_title": 0,
+        "global_dedup_filtered": 0,
+        "within_hunt_domain_dedup": 0,
+        "irrelevant_url_filtered": 0,
+        "budget_trimmed": 0,
+        "quick_gate_filtered": 0,
+        "deep_scrape_attempted": 0,
+        "leads_extracted": 0,
+    }
+    
     to_process = []
-    seen_candidate_domains: set[str] = set(existing_domains)
+    seen_domains: set[str] = set(existing_domains)
     for r in search_results:
         link = r.get("link", "")
-        maps_title = (r.get("title") or (r.get("maps_data") or {}).get("title") or "").strip()
-        if not link and not maps_title:
+        maps_data = r.get("maps_data") or {}
+        title = (r.get("title") or maps_data.get("title") or "").strip()
+        if not link and not title:
+            filter_stats["no_link_or_title"] += 1
             continue
-        link_official_domain = _official_website_domain(link)
-        if link_official_domain and link_official_domain in existing_domains:
+
+        # Pre-scrape global dedup: skip if strong identity (domain/email/phone/place_id)
+        # already exists in global registry. Company name alone is NOT checked here
+        # to avoid rejecting same-name companies in different regions.
+        candidate_keys = candidate_identity_keys(r)
+        skip_candidate = False
+        for key in candidate_keys:
+            owner_hunt = registry.get_hunt_id_for_key(key)
+            if owner_hunt and owner_hunt != current_hunt_id:
+                logger.info(
+                    "[LeadExtractAgent] Pre-scrape global dedup dropped candidate: %s (key=%s claimed by hunt=%s)",
+                    title or link,
+                    key,
+                    owner_hunt,
+                )
+                skip_candidate = True
+                break
+        if skip_candidate:
+            filter_stats["global_dedup_filtered"] += 1
             continue
-        if link_official_domain and link_official_domain in seen_candidate_domains:
+
+        # Within-hunt domain dedup: avoid scraping the same company site twice.
+        link_domain = _official_website_domain(link)
+        if link_domain and link_domain in seen_domains:
+            filter_stats["within_hunt_domain_dedup"] += 1
             continue
-        if link_official_domain:
-            seen_candidate_domains.add(link_official_domain)
+        if link_domain:
+            seen_domains.add(link_domain)
+
         to_process.append(r)
 
     # Filter out truly irrelevant URLs (search engines, entertainment)
@@ -1239,21 +1406,34 @@ async def lead_extract_node(state: HuntState) -> dict:
         r for r in to_process
         if (not r.get("link")) or classify_url(r.get("link", "")) != "irrelevant"
     ]
+    filter_stats["irrelevant_url_filtered"] = len(to_process) - len(processable)
 
     logger.info(
-        "[LeadExtractAgent] %d URLs to process (%d irrelevant filtered out)",
-        len(processable), len(to_process) - len(processable),
+        "[LeadExtractAgent] Filtering pipeline: %d search results → %d after dedup → %d processable (global_dedup=%d, within_hunt_dedup=%d, irrelevant=%d)",
+        filter_stats["total_search_results"],
+        len(to_process),
+        len(processable),
+        filter_stats["global_dedup_filtered"],
+        filter_stats["within_hunt_domain_dedup"],
+        filter_stats["irrelevant_url_filtered"],
     )
 
     if not processable:
-        logger.info("[LeadExtractAgent] No processable URLs, skipping")
-        return {"current_stage": "lead_extract"}
+        logger.warning(
+            "[LeadExtractAgent] No processable URLs after filtering (stats=%s)",
+            filter_stats,
+        )
+        return {
+            "current_stage": "lead_extract",
+            "filter_stats": filter_stats,
+        }
 
     candidate_budget = _candidate_budget(
         state.get("target_lead_count", 0),
         settings.scrape_concurrency,
     )
     if len(processable) > candidate_budget:
+        filter_stats["budget_trimmed"] = len(processable) - candidate_budget
         logger.info(
             "[LeadExtractAgent] Trimming candidates from %d to %d based on target_lead_count=%s",
             len(processable),
@@ -1289,19 +1469,33 @@ async def lead_extract_node(state: HuntState) -> dict:
         gate_tasks = [_run_gate(r) for r in processable]
         for future in asyncio.as_completed(gate_tasks):
             row, passed, gate = await future
+            candidate_title = row.get("title", "unknown")
+            candidate_link = row.get("link", "")
             if passed:
                 row["quick_gate"] = gate
                 gated_candidates.append(row)
+                logger.info(
+                    "[LeadExtract][QuickGate] PASS title=%s link=%s reason=%s confidence=%.2f",
+                    candidate_title, candidate_link, gate.get("reason", ""), gate.get("confidence", 0.0),
+                )
             else:
                 filtered_count += 1
+                logger.info(
+                    "[LeadExtract][QuickGate] REJECT title=%s link=%s reason=%s risk_flags=%s confidence=%.2f",
+                    candidate_title, candidate_link,
+                    gate.get("reason", ""), gate.get("risk_flags", []), gate.get("confidence", 0.0),
+                )
                 _emit_progress(
                     "gate_filtered",
-                    domain=(urlparse(row.get("link", "")).netloc or row.get("title", "unknown")),
+                    domain=(urlparse(candidate_link).netloc or candidate_title),
                     reason=gate.get("reason", ""),
                     risk_flags=gate.get("risk_flags", []),
                     confidence=gate.get("confidence", 0.0),
                 )
 
+        filter_stats["quick_gate_filtered"] = filtered_count
+        filter_stats["deep_scrape_attempted"] = len(gated_candidates)
+        
         logger.info(
             "[LeadExtractAgent] QuickGate kept %d / %d candidates (filtered=%d)",
             len(gated_candidates), len(processable), filtered_count,
@@ -1309,8 +1503,14 @@ async def lead_extract_node(state: HuntState) -> dict:
         _emit_progress("deep_scrape_start", total_urls=len(gated_candidates), filtered_by_gate=filtered_count)
 
         if not gated_candidates:
-            logger.info("[LeadExtractAgent] All candidates filtered by quick gate, skipping ReAct extraction")
-            return {"current_stage": "lead_extract"}
+            logger.warning(
+                "[LeadExtractAgent] All candidates filtered by QuickGate (stats=%s)",
+                filter_stats,
+            )
+            return {
+                "current_stage": "lead_extract",
+                "filter_stats": filter_stats,
+            }
 
         scrape_tasks = [
             asyncio.create_task(_scrape_and_extract(
@@ -1371,12 +1571,29 @@ async def lead_extract_node(state: HuntState) -> dict:
     for lead in results:
         if lead is None:
             continue
-        official_domain = _official_website_domain(lead.get("website", ""))
-        if official_domain and official_domain in seen_domains:
+        # Post-scrape company name dedup against global registry
+        lead_keys = _global_lead_keys(lead)
+        if any(key in global_company_names for key in lead_keys):
+            logger.info(
+                "[LeadExtractAgent] Global dedup dropped lead company=%s (already collected)",
+                lead.get("company_name"),
+            )
             continue
-        if official_domain:
-            seen_domains.add(official_domain)
+        official_dom = _official_website_domain(lead.get("website", ""))
+        if official_dom and official_dom in seen_domains:
+            continue
+        if official_dom:
+            seen_domains.add(official_dom)
         new_leads.append(lead)
+
+    # Save company names to global registry so future Hunts skip them.
+    globally_new = registry.reserve_lead_keys(
+        new_leads,
+        hunt_id=current_hunt_id,
+        key_fn=_global_lead_keys,
+        now_iso=datetime.now(timezone.utc).isoformat(),
+    )
+    new_leads = globally_new
 
     # ── Verify emails via MX record check (concurrent) ───────────────────
     # Remove emails whose domains have no MX records, indicating the domain
@@ -1395,53 +1612,29 @@ async def lead_extract_node(state: HuntState) -> dict:
         if kw and kw in keyword_stats:
             keyword_stats[kw]["leads_found"] = keyword_stats[kw].get("leads_found", 0) + 1
 
-    # ── Final dedup safety net ──────────────────────────────────────────
-    # Even with the per-round `seen_domains` check above, in rare cases
-    # (e.g. same lead produced by different rounds with the same website
-    # but different `seen_urls` state, or LangGraph reducer re-injecting
-    # state on a requeue) we can end up with duplicates in the merged
-    # `existing_leads + new_leads`. Dedupe by normalized website domain
-    # (and fall back to normalized company_name for leads with no website)
-    # so the downstream email_craft stage never sees the same lead twice.
-    merged = existing_leads + new_leads
-    deduped: list[dict] = []
-    final_seen_domains: set[str] = set()
-    final_seen_names: set[str] = set()
-    for lead in merged:
-        if not isinstance(lead, dict):
-            continue
-        domain = _official_website_domain(lead.get("website", ""))
-        if domain:
-            if domain in final_seen_domains:
-                logger.info(
-                    "[LeadExtractAgent] Final dedup dropped duplicate lead company=%s website=%s",
-                    lead.get("company_name"), lead.get("website"),
-                )
-                continue
-            final_seen_domains.add(domain)
-        else:
-            # No website → use normalized company_name as a secondary key
-            name_key = (lead.get("company_name") or "").strip().lower()
-            if not name_key:
-                # No website AND no name → still dedup by source+country to be safe
-                name_key = f"unknown::{lead.get('source', '')}::{lead.get('country_code', '')}"
-            if name_key in final_seen_names:
-                logger.info(
-                    "[LeadExtractAgent] Final dedup dropped nameless duplicate website=%s",
-                    lead.get("website"),
-                )
-                continue
-            final_seen_names.add(name_key)
-        deduped.append(lead)
+    # Final safety net uses the same aliases as the cross-Hunt registry. This
+    # also cleans duplicates already present in a resumed/interrupted state.
+    merged_before_dedup = existing_leads + new_leads
+    deduped = dedupe_leads(merged_before_dedup)
 
-    if len(deduped) != len(merged):
+    if len(deduped) != len(merged_before_dedup):
         logger.warning(
             "[LeadExtractAgent] Final dedup removed %d duplicate(s) (had %d, kept %d)",
-            len(merged) - len(deduped), len(merged), len(deduped),
+            len(merged_before_dedup) - len(deduped),
+            len(merged_before_dedup),
+            len(deduped),
         )
+
+    filter_stats["leads_extracted"] = len(new_leads)
+    
+    logger.info(
+        "[LeadExtractAgent] ✅ Extraction complete - Filter stats: %s",
+        filter_stats,
+    )
 
     return {
         "leads": deduped,
         "keyword_search_stats": keyword_stats,
+        "filter_stats": filter_stats,
         "current_stage": "lead_extract",
     }

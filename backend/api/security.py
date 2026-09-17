@@ -13,12 +13,14 @@ from auth.security import (  # noqa: F401
     optional_user,
     require_admin,
     require_api_access,
+    require_resource_access,
     require_user,
 )
 
 __all__ = [
     "UserCtx",
     "require_api_access",
+    "require_resource_access",
     "optional_user",
     "require_user",
     "require_admin",

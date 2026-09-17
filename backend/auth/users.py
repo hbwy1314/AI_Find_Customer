@@ -124,6 +124,7 @@ def change_password(
             "UPDATE users SET password_hash = ? WHERE id = ?",
             (new_hash, int(user_id)),
         )
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (int(user_id),))
 
 
 # ---------------------------------------------------------------------------

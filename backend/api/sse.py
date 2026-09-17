@@ -22,12 +22,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from api.automation_routes import _serialize_job
 from api.routes import _hunts, _sse_queues
-from api.security import require_api_access
+from api.security import require_api_access, require_resource_access
 from automation.job_queue import HuntJobQueue
 from config.settings import get_settings
 
@@ -64,6 +64,7 @@ def _now_iso() -> str:
 
 _REPLY_QUEUE_MAX = 200
 _reply_subscribers: list[asyncio.Queue] = []
+_reply_subscriber_users: dict[asyncio.Queue, int] = {}
 
 
 def _broadcast_reply(data: dict[str, Any]) -> None:
@@ -79,6 +80,10 @@ def _broadcast_reply(data: dict[str, Any]) -> None:
     stale: list[asyncio.Queue] = []
     for q in _reply_subscribers:
         try:
+            owner_user_id = _reply_subscriber_users.get(q, 0)
+            event_owner_id = int(data.get("owner_user_id", 0) or 0)
+            if owner_user_id and event_owner_id and owner_user_id != event_owner_id:
+                continue
             q.put_nowait(data)
         except asyncio.QueueFull:
             # Drop the oldest to make room. If even that fails (e.g.
@@ -96,10 +101,12 @@ def _broadcast_reply(data: dict[str, Any]) -> None:
             pass
 
 
-async def _reply_event_generator() -> AsyncGenerator[str, None]:
+async def _reply_event_generator(owner_user_id: int = 0) -> AsyncGenerator[str, None]:
     """Per-subscriber SSE stream for reply events."""
     queue: asyncio.Queue = asyncio.Queue(maxsize=_REPLY_QUEUE_MAX)
     _reply_subscribers.append(queue)
+    if owner_user_id:
+        _reply_subscriber_users[queue] = owner_user_id
     logger.info("[SSE] reply stream subscribed (total=%d)", len(_reply_subscribers))
     try:
         # Initial frame so the browser's EventSource flips to OPEN and
@@ -119,6 +126,7 @@ async def _reply_event_generator() -> AsyncGenerator[str, None]:
             _reply_subscribers.remove(queue)
         except ValueError:
             pass
+        _reply_subscriber_users.pop(queue, None)
         logger.info("[SSE] reply stream unsubscribed (total=%d)", len(_reply_subscribers))
 
 
@@ -142,6 +150,23 @@ async def _event_generator(hunt_id: str, queue: asyncio.Queue) -> AsyncGenerator
         # Replay all completed stage snapshots so late-joining clients get history
         for snapshot in hunt.get("stage_snapshots", {}).values():
             yield _sse_event("stage_data", snapshot)
+
+        # If the hunt is mid email_craft (email-only regen), replay every
+        # sequence already saved so the browser can rebuild its live list
+        # after a page refresh without waiting for new email_progress events.
+        if hunt.get("current_stage") == "email_craft" and hunt.get("status") == "running":
+            result = hunt.get("result") or {}
+            existing_seqs = result.get("email_sequences") if isinstance(result, dict) else []
+            total_leads = len(result.get("leads", [])) if isinstance(result, dict) else 0
+            if isinstance(existing_seqs, list):
+                for idx, seq in enumerate(existing_seqs, start=1):
+                    if isinstance(seq, dict):
+                        yield _sse_event("email_progress", {
+                            "sequence": seq,
+                            "completed": idx,
+                            "total": total_leads,
+                            "generated": 1,
+                        })
 
         # If already completed/failed, send final event and close
         if hunt["status"] == "completed":
@@ -215,7 +240,7 @@ async def _automation_job_event_generator(job_id: str) -> AsyncGenerator[str, No
 
 
 @sse_router.get("/hunts/{hunt_id}/stream", dependencies=[Depends(require_api_access)])
-async def stream_hunt(hunt_id: str):
+async def stream_hunt(hunt_id: str, request: Request):
     """Stream real-time hunt progress via SSE.
 
     Event types:
@@ -229,6 +254,7 @@ async def stream_hunt(hunt_id: str):
     """
     if hunt_id not in _hunts:
         raise HTTPException(status_code=404, detail="Hunt not found")
+    require_resource_access(request, _hunts[hunt_id].get("owner_user_id"))
 
     # Create a per-subscriber queue
     queue: asyncio.Queue = asyncio.Queue()
@@ -248,10 +274,13 @@ async def stream_hunt(hunt_id: str):
 
 
 @sse_router.get("/automation/jobs/{job_id}/stream", dependencies=[Depends(require_api_access)])
-async def stream_automation_job(job_id: str):
+async def stream_automation_job(job_id: str, request: Request):
     queue = _automation_job_queue()
-    if not queue.get(job_id):
+    job = queue.get(job_id)
+    if not job:
         raise HTTPException(status_code=404, detail="Automation job not found")
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    require_resource_access(request, payload.get("owner_user_id", 0))
 
     return StreamingResponse(
         _automation_job_event_generator(job_id),
@@ -265,7 +294,7 @@ async def stream_automation_job(job_id: str):
 
 
 @sse_router.get("/replies/stream", dependencies=[Depends(require_api_access)])
-async def stream_replies():
+async def stream_replies(request: Request):
     """Push a `reply` event to the browser for every newly matched reply.
 
     Authenticated via the existing session cookie + CSRF double-submit
@@ -277,8 +306,19 @@ async def stream_replies():
     - `reply`:     new reply matched; `data` is a NotificationItem
     - `heartbeat`: keep-alive every 30s
     """
+    owner_user_id = (
+        int(getattr(request.state.user_ctx, "user_id", 0) or 0)
+        if getattr(request.state.user_ctx, "via", "") == "session"
+        and getattr(request.state.user_ctx, "role", "") not in {"admin", "dev"}
+        else 0
+    )
+    generator = (
+        _reply_event_generator(owner_user_id=owner_user_id)
+        if owner_user_id
+        else _reply_event_generator()
+    )
     return StreamingResponse(
-        _reply_event_generator(),
+        generator,
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

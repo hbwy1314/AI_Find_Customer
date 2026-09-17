@@ -132,3 +132,29 @@ def test_claim_next_skips_seed_jobs_while_preparing(tmp_path):
     claimed = queue.claim_next(worker_id="worker-a", now_iso="2026-04-04T00:00:03+00:00")
     assert claimed is not None
     assert claimed["id"] == fast_job
+
+
+def test_stale_worker_cannot_finish_reclaimed_job(tmp_path):
+    queue = HuntJobQueue(str(tmp_path / "queue.db"))
+    queue.init_db()
+    job_id = queue.enqueue({"description": "Find buyers"}, now_iso="2026-04-04T00:00:00+00:00")
+
+    first = queue.claim_next(worker_id="worker-a", now_iso="2026-04-04T00:00:01+00:00")
+    assert first is not None
+    first_token = str(first["claim_token"])
+    queue.recover_interrupted_running_jobs(updated_at="2026-04-04T00:02:00+00:00")
+    second = queue.claim_next(worker_id="worker-b", now_iso="2026-04-04T00:02:01+00:00")
+    assert second is not None
+    assert second["id"] == job_id
+
+    queue.mark_completed(
+        job_id,
+        hunt_id="stale-hunt",
+        finished_at="2026-04-04T00:03:00+00:00",
+        claim_token=first_token,
+        worker_id="worker-a",
+    )
+    current = queue.get(job_id)
+    assert current is not None
+    assert current["status"] == "running"
+    assert current["last_hunt_id"] == ""

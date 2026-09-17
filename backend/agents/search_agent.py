@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import Any
 
+from agents.lead_identity import normalize_url
 from config.settings import get_settings
 from graph.state import HuntState
 from tools.google_maps_search import GoogleMapsSearchTool
@@ -179,7 +180,7 @@ def _build_maps_snippet(place: dict) -> str:
 
 def _result_identity_key(item: dict) -> str:
     """Stable dedupe key for a search result, including Maps-only rows without website."""
-    link = (item.get("link") or "").strip().lower()
+    link = normalize_url(str(item.get("link") or ""))
     if link:
         return f"url:{link}"
 

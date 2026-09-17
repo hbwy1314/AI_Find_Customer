@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any, Awaitable, Callable
 
 import litellm
@@ -23,6 +22,7 @@ import litellm
 from config.settings import Settings, get_settings
 from tools.llm_client import _inject_api_keys, normalize_model_name
 from tools.llm_errors import format_llm_error
+from tools.llm_output import parse_json
 from tools.llm_rate_limiter import get_llm_rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -74,31 +74,7 @@ def _try_parse_json(text: str) -> dict | list | None:
     if not text or not text.strip():
         return None
 
-    cleaned = _clean_markdown_fences(text)
-
-    # Strategy 1: direct parse
-    try:
-        return json.loads(cleaned)
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    # Strategy 2: extract outermost JSON object {...}
-    m = re.search(r'\{.*\}', cleaned, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group())
-        except json.JSONDecodeError:
-            pass
-
-    # Strategy 3: extract outermost JSON array [...]
-    m = re.search(r'\[.*\]', cleaned, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group())
-        except json.JSONDecodeError:
-            pass
-
-    return None
+    return parse_json(_clean_markdown_fences(text), context="react_runner")
 
 
 def _has_required_fields(parsed: dict | list | None, required_fields: list[str]) -> bool:

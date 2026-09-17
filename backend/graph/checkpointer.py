@@ -1,13 +1,15 @@
 """Checkpointer factory — provides persistence for LangGraph state."""
 
+from contextlib import AbstractAsyncContextManager
+from typing import Any
+
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.sqlite import SqliteSaver
 
 from config.settings import get_settings
 
 
-def get_checkpointer(*, in_memory: bool = False) -> MemorySaver | SqliteSaver:
-    """Return a checkpointer instance.
+def get_checkpointer(*, in_memory: bool = False) -> Any:
+    """Return a checkpointer or async context manager.
 
     Args:
         in_memory: If True, use MemorySaver (for tests). Otherwise use SqliteSaver.
@@ -16,4 +18,11 @@ def get_checkpointer(*, in_memory: bool = False) -> MemorySaver | SqliteSaver:
         return MemorySaver()
 
     settings = get_settings()
-    return SqliteSaver.from_conn_string(settings.checkpoint_db_path)
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    return AsyncSqliteSaver.from_conn_string(settings.checkpoint_db_path)
+
+
+def get_async_checkpointer() -> AbstractAsyncContextManager:
+    """Open the production SQLite checkpointer for one graph execution."""
+    return get_checkpointer()

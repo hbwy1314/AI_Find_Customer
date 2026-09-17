@@ -5,6 +5,7 @@ import { api, EmailDraft, EmailSequence, HunterContact } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Sheet, SheetHeader, SheetBody } from "@/components/ui/sheet";
 import { EmptyState, ErrorState, LoadingState } from "@/components/data-states";
 import {
@@ -165,7 +166,7 @@ function ContinueJobDialog({
           <Button variant="outline" className="flex-1" onClick={onClose} disabled={isLoading}>
             取消
           </Button>
-          <Button
+                 <Button
             className="flex-1"
             onClick={() => onConfirm(
               targetLeadCount,
@@ -449,6 +450,15 @@ function isSequenceReadyForSend(sequence: EmailSequence): boolean {
     return false;
   }
   return Boolean(sequence.auto_send_eligible);
+}
+
+function emailSequenceKey(sequence: EmailSequence): string {
+  const lead = asRecord(sequence.lead);
+  const target = asRecord(sequence.target);
+  return [
+    String(lead.website || lead.company_name || ""),
+    String(target.target_email || ""),
+  ].join("|").toLowerCase();
 }
 
 function formatEmailType(emailType: string): string {
@@ -1043,9 +1053,11 @@ function EmailSequencePreviewSheet({
   onReject,
   onSendDraft,
   onDetectReplies,
+  onEditDraft,
   isUpdating,
   isSending,
   isCheckingReplies,
+  isEditing,
 }: {
   sequence: EmailSequence | null;
   open: boolean;
@@ -1054,10 +1066,29 @@ function EmailSequencePreviewSheet({
   onReject: () => void;
   onSendDraft: (sequenceNumber: number) => void;
   onDetectReplies: () => void;
+  onEditDraft: (sequenceNumber: number, subject: string, bodyText: string) => void;
   isUpdating: boolean;
   isSending: boolean;
   isCheckingReplies: boolean;
+  isEditing: boolean;
 }) {
+  const [editingDraft, setEditingDraft] = useState<EmailDraft | null>(null);
+  const [editSubject, setEditSubject] = useState("");
+  const [editBody, setEditBody] = useState("");
+
+  useEffect(() => {
+    if (!open || !sequence) {
+      setEditingDraft(null);
+      return;
+    }
+    setEditingDraft(null);
+  }, [open, sequence]);
+
+  useEffect(() => {
+    if (!isEditing) return;
+    // Keep the editor open while the request is in flight.
+  }, [isEditing]);
+
   if (!sequence) return null;
 
   const lead = asRecord(sequence.lead);
@@ -1221,6 +1252,58 @@ function EmailSequencePreviewSheet({
           )}
         </div>
 
+        {editingDraft && (
+          <div className="rounded-lg border border-primary/40 bg-primary/5 p-4 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="font-semibold">编辑第 {editingDraft.sequence_number} 封邮件</p>
+                <p className="mt-1 text-xs text-muted-foreground">保存后需要重新审核，已发送或已入队邮件不能修改。</p>
+              </div>
+              <Button type="button" size="sm" variant="ghost" onClick={() => setEditingDraft(null)} disabled={isEditing}>
+                取消
+              </Button>
+            </div>
+            <div className="mt-4 space-y-3">
+              <div className="space-y-1.5">
+                <label htmlFor="email-draft-subject" className="text-sm font-medium">邮件主题</label>
+                <Input
+                  id="email-draft-subject"
+                  value={editSubject}
+                  onChange={(event) => setEditSubject(event.target.value)}
+                  disabled={isEditing}
+                  maxLength={500}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label htmlFor="email-draft-body" className="text-sm font-medium">邮件正文</label>
+                <textarea
+                  id="email-draft-body"
+                  value={editBody}
+                  onChange={(event) => setEditBody(event.target.value)}
+                  disabled={isEditing}
+                  maxLength={20000}
+                  className="min-h-[360px] w-full resize-y rounded-md border border-input bg-background px-3 py-3 text-sm leading-6 shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+                <p className="text-right text-xs text-muted-foreground">{editBody.length} / 20000</p>
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button type="button" variant="outline" onClick={() => setEditingDraft(null)} disabled={isEditing}>取消</Button>
+                <Button
+                  type="button"
+                  onClick={() => {
+                    if (!editSubject.trim() || !editBody.trim()) return;
+                    onEditDraft(editingDraft.sequence_number, editSubject.trim(), editBody.trim());
+                  }}
+                  disabled={isEditing || !editSubject.trim() || !editBody.trim()}
+                >
+                  {isEditing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  保存修改
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="space-y-4">
           {sequence.emails.map((email: EmailDraft) => (
             <div key={`${email.sequence_number}-${email.subject}`} className="rounded-lg border p-4 space-y-3">
@@ -1249,11 +1332,25 @@ function EmailSequencePreviewSheet({
                   type="button"
                   size="sm"
                   variant="outline"
-                  onClick={() => onSendDraft(email.sequence_number)}
-                  disabled={isSending || !sequence.auto_send_eligible}
+                   onClick={() => onSendDraft(email.sequence_number)}
+                   disabled={isSending || !sequence.auto_send_eligible || ["sent", "sending", "queued"].includes(String(email.send_status || ""))}
+                 >
+                   {isSending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                   {email.send_status === "sent" ? "已发送" : email.send_status === "queued" ? "已进入队列" : "发送这封"}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setEditingDraft(email);
+                    setEditSubject(email.subject);
+                    setEditBody(email.body_text);
+                  }}
+                  disabled={isEditing || ["sent", "sending", "queued"].includes(String(email.send_status || ""))}
                 >
-                  {isSending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                  发送这封
+                  {isEditing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  编辑
                 </Button>
                 {email.sent_to && (
                   <p className="text-xs text-muted-foreground">
@@ -1305,7 +1402,8 @@ interface SSEState {
   stage: string | null;
   huntRound: number;
   leadsCount: number;
-  status: "connecting" | "running" | "completed" | "failed";
+  emailSequencesCount: number;
+  status: "connecting" | "running" | "disconnected" | "completed" | "failed";
   error: string | null;
 }
 
@@ -1550,7 +1648,7 @@ export function HuntDetailPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [sse, setSSE] = useState<SSEState>({
-    stage: null, huntRound: 0, leadsCount: 0, status: "connecting", error: null,
+    stage: null, huntRound: 0, leadsCount: 0, emailSequencesCount: 0, status: "connecting", error: null,
   });
   const [showResult, setShowResult] = useState(false);
   const [initialLoaded, setInitialLoaded] = useState(false);
@@ -1558,11 +1656,13 @@ export function HuntDetailPage() {
   const [activityLog, setActivityLog] = useState<ActivityEntry[]>([]);
   const activityIdRef = useRef(0);
   const logEndRef = useRef<HTMLDivElement>(null);
+  const sseTerminalRef = useRef(false);
   const [stageData, setStageData] = useState<StageDataMap>({});
   const [selectedStage, setSelectedStage] = useState<string | null>(null);
   const [showContinueJobDialog, setShowContinueJobDialog] = useState(false);
   const [activeTab, setActiveTab] = useState<"overview" | "leads" | "emails" | "email-log">("overview");
   const [realtimeLeads, setRealtimeLeads] = useState<Lead[]>([]);
+  const [realtimeEmailSequences, setRealtimeEmailSequences] = useState<EmailSequence[]>([]);
   const [emailFilter, setEmailFilter] = useState<"all" | "approved" | "needs_review">("all");
   // Render caps: large hunts produce hundreds of sequences/log rows; render
   // them in batches instead of one giant DOM tree (page-freeze fix).
@@ -1574,6 +1674,7 @@ export function HuntDetailPage() {
   // "邮件" tab: view the original template samples / notes the task was
   // created with (null = closed).
   const [templateInfoView, setTemplateInfoView] = useState<"examples" | "notes" | null>(null);
+  const [emailOnlyStreamNonce, setEmailOnlyStreamNonce] = useState(0);
 
   const continueJobMutation = useMutation({
     mutationFn: ({ targetLeadCount, maxRounds, minNewLeadsThreshold, enableEmailCraft, emailTemplateExamples, emailTemplateNotes }: {
@@ -1597,6 +1698,30 @@ export function HuntDetailPage() {
       navigate({ to: "/automation/$jobId", params: { jobId: job.job_id } });
     },
   });
+  const retryHuntMutation = useMutation({
+    mutationFn: () => {
+      if (!automationJob?.job_id) throw new Error("当前 Hunt 没有可重试的队列任务");
+      return api.retryAutomationJob(automationJob.job_id);
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["automation-job-by-hunt", huntId] });
+      await queryClient.invalidateQueries({ queryKey: ["hunt-status", huntId] });
+      setSSE((prev) => ({ ...prev, status: "connecting", error: null }));
+    },
+  });
+  const emailOnlyMutation = useMutation({
+    mutationFn: () => api.runHuntEmailSequences(huntId),
+    onMutate: () => {
+      setSSE((prev) => ({ ...prev, status: "running", stage: "email_craft", error: null }));
+      setEmailOnlyStreamNonce((value) => value + 1);
+      setRealtimeEmailSequences([]);
+    },
+    onSuccess: async () => {
+      setShowResult(true);
+      await queryClient.invalidateQueries({ queryKey: ["hunt-status", huntId] });
+      await queryClient.invalidateQueries({ queryKey: ["hunt-result", huntId] });
+    },
+  });
   const emailDecisionMutation = useMutation({
     mutationFn: ({ sequenceIndex, decision }: { sequenceIndex: number; decision: "approved" | "rejected" }) =>
       api.decideEmailSequence(huntId, sequenceIndex, { decision }),
@@ -1607,7 +1732,23 @@ export function HuntDetailPage() {
   const sendDraftMutation = useMutation({
     mutationFn: ({ sequenceIndex, sequenceNumber }: { sequenceIndex: number; sequenceNumber: number }) =>
       api.sendEmailDraft(huntId, sequenceIndex, { sequence_number: sequenceNumber }),
-    onSuccess: async () => {
+    onSuccess: async (updated) => {
+      setPreviewSequence((current) => {
+        if (!current) return current;
+        return {
+          ...current,
+          emails: current.emails.map((email) =>
+            email.sequence_number === updated.sequence_number
+              ? {
+                  ...email,
+                  send_status: updated.send_status || "sent",
+                  sent_at: updated.sent_at || new Date().toISOString(),
+                  sent_to: updated.sent_to,
+                }
+              : email,
+          ),
+        };
+      });
       await queryClient.invalidateQueries({ queryKey: ["hunt-result", huntId] });
     },
   });
@@ -1615,6 +1756,34 @@ export function HuntDetailPage() {
     mutationFn: ({ sequenceIndex }: { sequenceIndex: number }) =>
       api.detectReplies(huntId, sequenceIndex),
     onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["hunt-result", huntId] });
+    },
+  });
+  const editDraftMutation = useMutation({
+    mutationFn: ({ sequenceIndex, sequenceNumber, subject, bodyText }: {
+      sequenceIndex: number;
+      sequenceNumber: number;
+      subject: string;
+      bodyText: string;
+    }) => api.updateEmailDraft(huntId, sequenceIndex, sequenceNumber, { subject, body_text: bodyText }),
+    onSuccess: async (updated) => {
+      setPreviewSequence((current) => {
+        if (!current) return current;
+        return {
+          ...current,
+          auto_send_eligible: updated.auto_send_eligible,
+          manual_review: {
+            decision: "pending",
+            notes: "邮件内容已人工修改，需要重新审核",
+            updated_at: new Date().toISOString(),
+          },
+          emails: current.emails.map((email) =>
+            email.sequence_number === updated.sequence_number
+              ? { ...email, subject: updated.subject, body_text: updated.body_text, body_html: updated.body_html }
+              : email,
+          ),
+        };
+      });
       await queryClient.invalidateQueries({ queryKey: ["hunt-result", huntId] });
     },
   });
@@ -1666,8 +1835,17 @@ export function HuntDetailPage() {
   const keywordCount = result?.used_keywords?.length ?? 0;
   const roundCount = result?.hunt_round ?? sse.huntRound;
   const emailSequences = useMemo(
-    () => result?.email_sequences || [],
-    [result?.email_sequences],
+    () => {
+      const merged = new Map<string, EmailSequence>();
+      for (const sequence of result?.email_sequences || []) {
+        merged.set(emailSequenceKey(sequence), sequence);
+      }
+      for (const sequence of realtimeEmailSequences) {
+        merged.set(emailSequenceKey(sequence), sequence);
+      }
+      return Array.from(merged.values());
+    },
+    [result?.email_sequences, realtimeEmailSequences],
   );
   const emailCount = emailSequences.length;
   const templateExamples = useMemo(
@@ -1730,10 +1908,40 @@ export function HuntDetailPage() {
   const { data: costData } = useQuery({
     queryKey: ["hunt-cost", huntId],
     queryFn: () => api.getHuntCost(huntId),
-    enabled: showResult || sse.status === "failed" || sse.status === "running",
-    refetchInterval: sse.status === "running" ? 10000 : false,
+    enabled: showResult || sse.status === "failed" || sse.status === "running" || sse.status === "disconnected",
+    refetchInterval: sse.status === "running" || sse.status === "disconnected" ? 10000 : false,
     retry: false,
   });
+
+  const { data: liveStatus } = useQuery({
+    queryKey: ["hunt-status", huntId],
+    queryFn: () => api.getHuntStatus(huntId),
+    enabled: initialLoaded && sse.status !== "completed" && sse.status !== "failed",
+    refetchInterval: 3000,
+    retry: false,
+  });
+
+  useEffect(() => {
+    if (!liveStatus) return;
+    if (liveStatus.status === "completed") {
+      setSSE((prev) => ({
+        ...prev,
+        status: "completed",
+        stage: "evaluate",
+        huntRound: liveStatus.hunt_round,
+        leadsCount: liveStatus.leads_count,
+        emailSequencesCount: liveStatus.email_sequences_count,
+        error: null,
+      }));
+      setShowResult(true);
+    } else if (liveStatus.status === "failed") {
+      setSSE((prev) => ({
+        ...prev,
+        status: "failed",
+        error: liveStatus.error || "任务执行失败",
+      }));
+    }
+  }, [liveStatus]);
 
   // Step 1: Fetch hunt status first to decide whether to use SSE
   useEffect(() => {
@@ -1745,6 +1953,7 @@ export function HuntDetailPage() {
           stage: "evaluate",
           huntRound: status.hunt_round,
           leadsCount: status.leads_count,
+          emailSequencesCount: status.email_sequences_count,
           status: "completed",
           error: null,
         });
@@ -1755,6 +1964,7 @@ export function HuntDetailPage() {
           stage: status.current_stage,
           huntRound: status.hunt_round,
           leadsCount: status.leads_count,
+          emailSequencesCount: status.email_sequences_count,
           status: "failed",
           error: status.error,
         });
@@ -1775,39 +1985,82 @@ export function HuntDetailPage() {
     if (!initialLoaded) return;
     if (sse.status === "completed" || sse.status === "failed") return;
 
-    const es = api.streamHunt(huntId);
+    let disposed = false;
+    let retryTimer: number | null = null;
+    let retryDelay = 1000;
+    let es: EventSource | null = null;
+    let connectionGeneration = 0;
+    sseTerminalRef.current = false;
 
-    es.addEventListener("stage_change", (e) => {
+    const connect = () => {
+      if (disposed) return;
+      const generation = ++connectionGeneration;
+      const connection = api.streamHunt(huntId);
+      es = connection;
+
+      connection.addEventListener("open", () => {
+        retryDelay = 1000;
+        setSSE((prev) => ({ ...prev, status: "running", error: null }));
+      });
+
+      connection.addEventListener("stage_change", (e) => {
       const d = JSON.parse(e.data);
       setSSE((prev) => ({ ...prev, stage: d.stage, huntRound: d.hunt_round, status: "running" }));
-    });
+      });
 
-    es.addEventListener("progress", (e) => {
+      connection.addEventListener("progress", (e) => {
       const d = JSON.parse(e.data);
-      setSSE((prev) => ({ ...prev, leadsCount: d.leads_count }));
-    });
+       setSSE((prev) => ({
+         ...prev,
+         leadsCount: d.leads_count,
+         emailSequencesCount: d.email_sequences_count ?? prev.emailSequencesCount,
+       }));
+       });
 
-    es.addEventListener("round_change", (e) => {
+       connection.addEventListener("email_progress", (e) => {
+         const d = JSON.parse(e.data) as { sequence?: EmailSequence; completed?: number; total?: number };
+         if (d.sequence) {
+           setRealtimeEmailSequences((prev) => {
+             const next = new Map(prev.map((item) => [emailSequenceKey(item), item]));
+             next.set(emailSequenceKey(d.sequence as EmailSequence), d.sequence as EmailSequence);
+             return Array.from(next.values());
+           });
+         }
+         setSSE((prev) => ({
+           ...prev,
+           status: "running",
+           stage: "email_craft",
+           emailSequencesCount: Number(d.completed ?? prev.emailSequencesCount),
+         }));
+       });
+
+      connection.addEventListener("round_change", (e) => {
       const d = JSON.parse(e.data);
       setSSE((prev) => ({ ...prev, huntRound: d.hunt_round }));
-    });
+      });
 
-    es.addEventListener("completed", (e) => {
+      connection.addEventListener("completed", (e) => {
+      sseTerminalRef.current = true;
       const d = JSON.parse(e.data);
-      setSSE((prev) => ({
-        ...prev, status: "completed", leadsCount: d.leads_count, stage: "evaluate",
-      }));
+       setSSE((prev) => ({
+         ...prev,
+         status: "completed",
+         leadsCount: d.leads_count,
+         emailSequencesCount: d.email_sequences_count ?? prev.emailSequencesCount,
+         stage: d.stage || prev.stage || "evaluate",
+       }));
       setShowResult(true);
-      es.close();
-    });
+      connection.close();
+      });
 
-    es.addEventListener("failed", (e) => {
+      connection.addEventListener("failed", (e) => {
+      sseTerminalRef.current = true;
       const d = JSON.parse(e.data);
       setSSE((prev) => ({ ...prev, status: "failed", error: d.error }));
-      es.close();
-    });
+      connection.close();
+      });
 
-    es.addEventListener("stage_data", (e) => {
+      connection.addEventListener("stage_data", (e) => {
       const d = JSON.parse(e.data);
       const stage = d.stage as string;
       setStageData((prev) => {
@@ -1825,9 +2078,9 @@ export function HuntDetailPage() {
         }
         return next;
       });
-    });
+      });
 
-    es.addEventListener("lead_progress", (e) => {
+      connection.addEventListener("lead_progress", (e) => {
       const d = JSON.parse(e.data);
       const now = new Date().toLocaleTimeString();
       let msg = "";
@@ -1858,32 +2111,56 @@ export function HuntDetailPage() {
         activityIdRef.current += 1;
         setActivityLog((prev) => [...prev.slice(-99), { id: activityIdRef.current, time: now, message: msg, type }]);
       }
-    });
+      });
 
-    es.addEventListener("heartbeat", (e) => {
+      connection.addEventListener("heartbeat", (e) => {
       const d = JSON.parse(e.data);
       if (d.status === "completed") {
-        setSSE((prev) => ({ ...prev, status: "completed", leadsCount: d.leads_count ?? prev.leadsCount, stage: "evaluate" }));
+        sseTerminalRef.current = true;
+         setSSE((prev) => ({
+           ...prev,
+           status: "completed",
+           leadsCount: d.leads_count ?? prev.leadsCount,
+           emailSequencesCount: d.email_sequences_count ?? prev.emailSequencesCount,
+           stage: d.stage || prev.stage || "evaluate",
+         }));
         setShowResult(true);
-        es.close();
+        connection.close();
         return;
       }
       if (d.status === "failed") {
+        sseTerminalRef.current = true;
         setSSE((prev) => ({ ...prev, status: "failed", error: "任务执行失败" }));
-        es.close();
+        connection.close();
         return;
       }
       setSSE((prev) => ({ ...prev, status: prev.status === "connecting" ? "running" : prev.status }));
-    });
+      });
 
-    es.onerror = () => {
-      setSSE((prev) => ({ ...prev, status: prev.status === "completed" ? "completed" : "failed", error: "连接已断开" }));
-      setShowResult(true);
-      es.close();
+      connection.onerror = () => {
+        if (disposed || sseTerminalRef.current || generation !== connectionGeneration) return;
+        connection.close();
+        setSSE((prev) => ({
+          ...prev,
+          status: "disconnected",
+          error: "实时连接已断开，正在重连",
+        }));
+        retryTimer = window.setTimeout(() => {
+          retryTimer = null;
+          retryDelay = Math.min(retryDelay * 2, 15000);
+          connect();
+        }, retryDelay);
+      };
     };
 
-    return () => es.close();
-  }, [huntId, initialLoaded, sse.status]);
+    connect();
+
+    return () => {
+      disposed = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      es?.close();
+    };
+   }, [huntId, initialLoaded, emailOnlyStreamNonce]);
 
   const exportReport = useCallback(() => {
     const ins = stageData.insight;
@@ -2070,15 +2347,27 @@ export function HuntDetailPage() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Hunt {huntId.slice(0, 8)}...</h1>
           <p className="text-muted-foreground text-sm">
-            {sse.status === "completed" ? "已完成" : sse.status === "failed" ? "失败" : "运行中"}
+            {sse.status === "completed"
+              ? "已完成"
+              : sse.status === "failed"
+                ? "失败"
+                : sse.status === "disconnected"
+                  ? "正在重连"
+                  : "运行中"}
           </p>
         </div>
         <div className="ml-auto flex items-center gap-3">
           <Badge variant={sse.status === "completed" ? "success" : sse.status === "failed" ? "destructive" : "warning"}>
             {sse.status}
           </Badge>
-          {(sse.status === "completed" || sse.status === "failed") && (
-            <Button
+          {sse.status === "running" && sse.stage === "email_craft" && (
+            <span className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              邮件生成进度：{sse.emailSequencesCount}/{displayLeads.length || sse.leadsCount}
+            </span>
+          )}
+           {(sse.status === "completed" || sse.status === "failed") && (
+             <Button
               size="sm"
               variant="outline"
               onClick={() => setShowContinueJobDialog(true)}
@@ -2086,10 +2375,49 @@ export function HuntDetailPage() {
             >
               <RefreshCw className="h-4 w-4" />
               继续挖掘
+             </Button>
+           )}
+          {(sse.status === "completed" || sse.status === "failed") && (sse.leadsCount > 0 || displayLeads.length > 0) && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => emailOnlyMutation.mutate()}
+              disabled={emailOnlyMutation.isPending}
+              className="gap-2"
+              title="只根据已有线索重新生成邮件，不重新搜索"
+            >
+              {emailOnlyMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Mail className="h-4 w-4" />}
+              {emailOnlyMutation.isPending ? "邮件生成中..." : "重新生成邮件"}
+            </Button>
+          )}
+          {sse.status === "failed" && automationJob?.status === "failed" && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => retryHuntMutation.mutate()}
+              disabled={retryHuntMutation.isPending}
+              className="gap-2"
+            >
+              {retryHuntMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              失败重试
             </Button>
           )}
         </div>
       </div>
+
+      {!initialLoaded ? (
+        <Card>
+          <CardContent className="py-5">
+            <LoadingState message="正在读取 Hunt 状态和结果，请稍候…" variant="skeleton" skeletonCount={2} />
+          </CardContent>
+        </Card>
+      ) : resultIsLoading && !result ? (
+        <Card>
+          <CardContent className="py-5">
+            <LoadingState message="正在加载 Hunt 详细数据…" variant="skeleton" skeletonCount={2} />
+          </CardContent>
+        </Card>
+      ) : null}
 
       <ContinueJobDialog
         open={showContinueJobDialog}
@@ -2194,6 +2522,14 @@ export function HuntDetailPage() {
         <Card className="border-amber-300">
           <CardContent className="py-4 text-sm text-amber-700 dark:text-amber-300">
             队列任务最近错误：{automationJob.last_error}
+          </CardContent>
+        </Card>
+      )}
+
+      {emailOnlyMutation.isError && (
+        <Card className="border-red-300">
+          <CardContent className="py-4 text-sm text-red-700 dark:text-red-300">
+            邮件单独生成失败：{emailOnlyMutation.error instanceof Error ? emailOnlyMutation.error.message : "请稍后重试"}
           </CardContent>
         </Card>
       )}
@@ -2490,9 +2826,19 @@ export function HuntDetailPage() {
           if (previewSequenceIndex === null) return;
           detectRepliesMutation.mutate({ sequenceIndex: previewSequenceIndex });
         }}
+        onEditDraft={(sequenceNumber, subject, bodyText) => {
+          if (previewSequenceIndex === null) return;
+          editDraftMutation.mutate({
+            sequenceIndex: previewSequenceIndex,
+            sequenceNumber,
+            subject,
+            bodyText,
+          });
+        }}
         isUpdating={emailDecisionMutation.isPending}
         isSending={sendDraftMutation.isPending}
         isCheckingReplies={detectRepliesMutation.isPending}
+        isEditing={editDraftMutation.isPending}
       />
 
       {activeTab === "leads" && (
@@ -2718,7 +3064,9 @@ export function HuntDetailPage() {
                 <CardDescription>
                   {emailCount > 0
                     ? `已生成 ${emailCount} 组个性化邮件序列，可在这里预览、审核并进入发送流程。`
-                    : "当前任务还没有可预览的 AI 邮件。请先在创建任务或继续挖掘时开启 AI 邮件生成。"}
+                    : sse.status === "running" && sse.stage === "email_craft"
+                      ? `正在生成邮件，已完成 ${emailCount}/${displayLeads.length || sse.leadsCount} 组。生成完成后会自动显示。`
+                      : "当前任务还没有可预览的 AI 邮件。请先在创建任务或继续挖掘时开启 AI 邮件生成。"}
                 </CardDescription>
               </div>
               {(templateExamples.length > 0 || templateNotes) && (
@@ -2968,6 +3316,14 @@ export function HuntDetailPage() {
                   </div>
                 )}
               </>
+            ) : sse.status === "running" && sse.stage === "email_craft" ? (
+              <div className="rounded-md border border-primary/30 bg-primary/5 p-6 text-center">
+                <Loader2 className="mx-auto mb-3 h-6 w-6 animate-spin text-primary" />
+                <p className="font-medium">正在逐条生成邮件</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  已完成 {emailCount}/{displayLeads.length || sse.leadsCount} 组，邮件会在生成后立即显示。
+                </p>
+              </div>
             ) : (
               <EmptyState
                 title="还没有 AI 邮件"

@@ -1891,7 +1891,7 @@ class TestLanguageSelectorDropsSellerDescription:
         """The prompt fed to LANGUAGE_SELECTOR must not contain the
         seller's `description` of the lead — that field is in the
         seller's voice, not the lead's."""
-        from agents.email_craft_agent import _select_email_language, _build_react_system
+        from agents.email_craft_agent import _build_react_system, _select_email_language
         captured = {}
 
         class _Spy:

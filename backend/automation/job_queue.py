@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS hunt_jobs (
   started_at TEXT DEFAULT '',
   finished_at TEXT DEFAULT '',
   claimed_by TEXT DEFAULT '',
+  claim_token TEXT DEFAULT '',
+  heartbeat_at TEXT DEFAULT '',
   attempt_count INTEGER NOT NULL DEFAULT 0,
   last_error TEXT DEFAULT '',
   last_hunt_id TEXT DEFAULT '',
@@ -49,6 +51,8 @@ class HuntJobQueue:
             self._ensure_column(conn, "hunt_jobs", "progress_message", "TEXT DEFAULT ''")
             self._ensure_column(conn, "hunt_jobs", "template_seed_status", "TEXT DEFAULT ''")
             self._ensure_column(conn, "hunt_jobs", "template_seed_source", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "hunt_jobs", "heartbeat_at", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "hunt_jobs", "claim_token", "TEXT DEFAULT ''")
 
     def _ensure_column(self, conn: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
         columns = {
@@ -139,6 +143,7 @@ class HuntJobQueue:
         return results
 
     def claim_next(self, *, worker_id: str, now_iso: str) -> dict[str, Any] | None:
+        claim_token = uuid.uuid4().hex
         with self._connect() as conn:
             conn.isolation_level = None
             conn.execute("BEGIN IMMEDIATE")
@@ -161,12 +166,14 @@ class HuntJobQueue:
                 UPDATE hunt_jobs
                 SET status = 'running',
                     claimed_by = ?,
+                    claim_token = ?,
                     started_at = ?,
+                    heartbeat_at = ?,
                     updated_at = ?,
                     attempt_count = attempt_count + 1
                 WHERE id = ?
                 """,
-                (worker_id, now_iso, now_iso, row["id"]),
+                (worker_id, claim_token, now_iso, now_iso, now_iso, row["id"]),
             )
             conn.execute("COMMIT")
         return self.get(str(row["id"]))
@@ -182,6 +189,13 @@ class HuntJobQueue:
         except json.JSONDecodeError:
             data["payload"] = {}
         return data
+
+    def update_payload(self, job_id: str, payload: dict[str, Any], *, updated_at: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE hunt_jobs SET payload_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(payload, ensure_ascii=False), updated_at, job_id),
+            )
 
     def is_cancellation_requested(self, job_id: str) -> bool:
         with self._connect() as conn:
@@ -244,50 +258,107 @@ class HuntJobQueue:
             results.append(data)
         return results
 
-    def mark_completed(self, job_id: str, *, hunt_id: str, finished_at: str) -> None:
+    def mark_completed(
+        self,
+        job_id: str,
+        *,
+        hunt_id: str,
+        finished_at: str,
+        claim_token: str = "",
+        worker_id: str = "",
+    ) -> None:
         with self._connect() as conn:
+            predicate = "id = ?"
+            values: list[Any] = [finished_at, finished_at, hunt_id, job_id]
+            if claim_token:
+                predicate += " AND status = 'running' AND claim_token = ?"
+                values.append(claim_token)
+                if worker_id:
+                    predicate += " AND claimed_by = ?"
+                    values.append(worker_id)
             conn.execute(
-                """
+                f"""
                 UPDATE hunt_jobs
                 SET status = 'completed',
-                    finished_at = ?,
-                    updated_at = ?,
+                     finished_at = ?,
+                     updated_at = ?,
+                     heartbeat_at = '',
+                     claim_token = '',
                     last_hunt_id = ?,
                     last_error = '',
                     progress_stage = 'completed',
                     progress_message = 'Queue job completed successfully'
-                WHERE id = ?
+                 WHERE {predicate}
                 """,
-                (finished_at, finished_at, hunt_id, job_id),
+                values,
             )
 
-    def mark_failed(self, job_id: str, *, error_message: str, finished_at: str) -> None:
+    def mark_failed(
+        self,
+        job_id: str,
+        *,
+        error_message: str,
+        finished_at: str,
+        claim_token: str = "",
+        worker_id: str = "",
+    ) -> None:
         with self._connect() as conn:
+            predicate = "id = ?"
+            values: list[Any] = [finished_at, finished_at, error_message[:2000], job_id]
+            if claim_token:
+                predicate += " AND status = 'running' AND claim_token = ?"
+                values.append(claim_token)
+                if worker_id:
+                    predicate += " AND claimed_by = ?"
+                    values.append(worker_id)
             conn.execute(
-                """
+                f"""
                 UPDATE hunt_jobs
                 SET status = 'failed',
-                    finished_at = ?,
-                    updated_at = ?,
+                     finished_at = ?,
+                     updated_at = ?,
+                     heartbeat_at = '',
+                     claim_token = '',
                     last_error = ?
-                WHERE id = ?
+                 WHERE {predicate}
                 """,
-                (finished_at, finished_at, error_message[:2000], job_id),
+                values,
             )
 
-    def requeue(self, job_id: str, *, available_at: str, error_message: str, updated_at: str, hunt_id: str = "") -> None:
+    def requeue(
+        self,
+        job_id: str,
+        *,
+        available_at: str,
+        error_message: str,
+        updated_at: str,
+        hunt_id: str = "",
+        claim_token: str = "",
+        worker_id: str = "",
+    ) -> None:
         with self._connect() as conn:
+            predicate = "id = ?"
+            values: list[Any] = [available_at, updated_at, error_message[:2000], hunt_id, hunt_id, job_id]
+            if claim_token:
+                predicate += " AND status = 'running' AND claim_token = ?"
+                values.append(claim_token)
+                if worker_id:
+                    predicate += " AND claimed_by = ?"
+                    values.append(worker_id)
             conn.execute(
-                """
+                f"""
                 UPDATE hunt_jobs
                 SET status = 'queued',
                     available_at = ?,
-                    updated_at = ?,
+                     updated_at = ?,
+                     heartbeat_at = '',
+                     claim_token = '',
+                    claim_token = '',
                     last_error = ?,
                     last_hunt_id = CASE WHEN ? != '' THEN ? ELSE last_hunt_id END
-                WHERE id = ?
+                 WHERE {predicate}
                 """,
-                (available_at, updated_at, error_message[:2000], hunt_id, hunt_id, job_id),
+                values,
             )
 
     def cancel(self, job_id: str, *, updated_at: str) -> None:
@@ -298,6 +369,7 @@ class HuntJobQueue:
                 SET status = 'failed',
                     finished_at = ?,
                     updated_at = ?,
+                    heartbeat_at = '',
                     progress_stage = 'cancelled',
                     progress_message = 'Cancelled by user',
                     last_error = CASE WHEN last_error = '' THEN 'Cancelled by user' ELSE last_error END
@@ -318,6 +390,8 @@ class HuntJobQueue:
                     finished_at = '',
                     started_at = '',
                     claimed_by = '',
+                    claim_token = '',
+                    heartbeat_at = '',
                     progress_stage = 'queued',
                     progress_message = 'Waiting for consumer to claim',
                     last_error = ''
@@ -352,9 +426,11 @@ class HuntJobQueue:
         hunt_id: str = "",
         template_seed_status: str | None = None,
         template_seed_source: str | None = None,
+        claim_token: str = "",
+        worker_id: str = "",
     ) -> None:
-        fields = ["updated_at = ?", "progress_stage = ?", "progress_message = ?"]
-        values: list[Any] = [updated_at, progress_stage, progress_message[:2000]]
+        fields = ["updated_at = ?", "heartbeat_at = ?", "progress_stage = ?", "progress_message = ?"]
+        values: list[Any] = [updated_at, updated_at, progress_stage, progress_message[:2000]]
         if hunt_id:
             fields.append("last_hunt_id = ?")
             values.append(hunt_id)
@@ -365,11 +441,39 @@ class HuntJobQueue:
             fields.append("template_seed_source = ?")
             values.append(template_seed_source)
         values.append(job_id)
+        predicate = "id = ?"
+        if claim_token:
+            predicate += " AND status = 'running' AND claim_token = ?"
+            values.append(claim_token)
+            if worker_id:
+                predicate += " AND claimed_by = ?"
+                values.append(worker_id)
         with self._connect() as conn:
             conn.execute(
-                f"UPDATE hunt_jobs SET {', '.join(fields)} WHERE id = ?",
+                f"UPDATE hunt_jobs SET {', '.join(fields)} WHERE {predicate}",
                 values,
             )
+
+    def start_email_only(self, job_id: str, *, hunt_id: str, updated_at: str) -> bool:
+        """Reopen a finished queue job while its Hunt regenerates emails."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE hunt_jobs
+                SET status = 'running',
+                    updated_at = ?,
+                    finished_at = '',
+                    heartbeat_at = ?,
+                    last_hunt_id = ?,
+                    last_error = '',
+                    progress_stage = 'email_craft',
+                    progress_message = 'Regenerating email sequences from saved leads'
+                WHERE id = ?
+                  AND status IN ('completed', 'failed')
+                """,
+                (updated_at, updated_at, hunt_id, job_id),
+            )
+        return int(cur.rowcount or 0) > 0
 
     def mark_template_seed_preparing(self, job_id: str, *, updated_at: str) -> bool:
         with self._connect() as conn:
@@ -377,6 +481,7 @@ class HuntJobQueue:
                 """
                 UPDATE hunt_jobs
                 SET updated_at = ?,
+                    heartbeat_at = ?,
                     template_seed_status = 'preparing',
                     progress_stage = CASE
                       WHEN progress_stage IN ('', 'queued') THEN 'template_seed'
@@ -390,7 +495,7 @@ class HuntJobQueue:
                   AND status = 'queued'
                   AND COALESCE(template_seed_status, '') IN ('', 'pending', 'failed')
                 """,
-                (updated_at, job_id),
+                (updated_at, updated_at, job_id),
             )
             return int(cur.rowcount or 0) > 0
 
@@ -448,24 +553,60 @@ class HuntJobQueue:
             )
 
     def recover_interrupted_running_jobs(self, *, updated_at: str) -> int:
+        """Backward-compatible recovery used by tests and one-shot tools."""
+        return self.recover_stale_running_jobs(updated_at=updated_at)
+
+    def recover_stale_running_jobs(
+        self, *, updated_at: str, stale_before_iso: str | None = None
+    ) -> int:
         with self._connect() as conn:
+            predicate = "status = 'running'"
+            params: list[Any] = []
+            if stale_before_iso:
+                predicate += " AND (heartbeat_at = '' OR heartbeat_at < ?)"
+                params.append(stale_before_iso)
             cur = conn.execute(
-                """
+                f"""
                 UPDATE hunt_jobs
                 SET status = 'queued',
                     available_at = ?,
                     updated_at = ?,
                     claimed_by = '',
+                    claim_token = '',
                     started_at = '',
+                    heartbeat_at = '',
                     progress_stage = 'queued',
                     progress_message = 'Recovered after API restart; waiting for consumer to reclaim',
                     last_error = CASE
                       WHEN last_error = '' THEN 'Recovered after API restart'
                       ELSE last_error
                     END
-                WHERE status = 'running'
+                WHERE {predicate}
+                """,
+                (updated_at, updated_at, *params),
+            )
+            return int(cur.rowcount or 0)
+
+    def recover_stale_template_seed_jobs(
+        self,
+        *,
+        updated_at: str,
+        stale_before_iso: str | None = None,
+    ) -> int:
+        predicate = "status = 'queued' AND template_seed_status = 'preparing'"
+        params: list[Any] = []
+        if stale_before_iso:
+            predicate += " AND updated_at < ?"
+            params.append(stale_before_iso)
+        with self._connect() as conn:
+            cur = conn.execute(
                 """
-                ,
-                (updated_at, updated_at),
+                UPDATE hunt_jobs
+                SET template_seed_status = 'pending',
+                    updated_at = ?,
+                    progress_stage = 'queued',
+                    progress_message = 'Recovered template seed preparation after worker timeout'
+                 WHERE """ + predicate,
+                (updated_at, *params),
             )
             return int(cur.rowcount or 0)

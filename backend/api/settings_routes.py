@@ -10,7 +10,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from auth.security import require_api_access
+from auth.security import require_admin, require_api_access
 from automation.notifier import send_feishu_text
 from config.settings import get_settings
 from config.settings_store import is_configured, read_settings, update_settings
@@ -87,7 +87,15 @@ class SettingsPayload(BaseModel):
     email_template_max_send_count: str = ""
     email_template_underperforming_min_assigned: str = ""
     email_template_underperforming_min_reply_rate: str = ""
+    hunter_monthly_quota: str = ""
+    hunter_requests_per_second: str = ""
+    email_recipient_waterfall_days: str = ""
+    email_recipient_max_per_lead: str = ""
+    email_template_min_token_match_ratio: str = ""
+    email_template_fallback_enabled: str = ""
+    email_template_required_tokens_override: str = ""
     automation_feishu_webhook_url: str = ""
+    automation_reply_notifications_enabled: str = ""
     automation_summary_enabled: str = ""
     automation_summary_interval_seconds: str = ""
     automation_alerts_enabled: str = ""
@@ -109,6 +117,7 @@ class SettingsPayload(BaseModel):
     graph_client_secret: str = ""
     graph_mailbox_upn: str = ""
     graph_default_scopes: str = ""
+    graph_last_test_at: str = ""
 
 
 class SettingsResponse(BaseModel):
@@ -159,7 +168,7 @@ def _now_iso() -> str:
 
 
 # ── Settings routes ───────────────────────────────────────────────────────────
-@router.get("", response_model=SettingsResponse, dependencies=[Depends(require_api_access)])
+@router.get("", response_model=SettingsResponse, dependencies=[Depends(require_api_access), Depends(require_admin)])
 async def get_settings_api():
     """Return current settings with sensitive values partially masked."""
     _ensure_settings_api_enabled()
@@ -176,7 +185,7 @@ async def get_settings_api():
     )
 
 
-@router.post("", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_api_access)])
+@router.post("", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_api_access), Depends(require_admin)])
 async def save_settings(payload: SettingsPayload):
     """Save settings to the user's .env file. Empty strings are skipped."""
     _ensure_settings_api_enabled()
@@ -242,7 +251,15 @@ async def save_settings(payload: SettingsPayload):
         "email_template_max_send_count": "EMAIL_TEMPLATE_MAX_SEND_COUNT",
         "email_template_underperforming_min_assigned": "EMAIL_TEMPLATE_UNDERPERFORMING_MIN_ASSIGNED",
         "email_template_underperforming_min_reply_rate": "EMAIL_TEMPLATE_UNDERPERFORMING_MIN_REPLY_RATE",
+        "hunter_monthly_quota": "HUNTER_MONTHLY_QUOTA",
+        "hunter_requests_per_second": "HUNTER_REQUESTS_PER_SECOND",
+        "email_recipient_waterfall_days": "EMAIL_RECIPIENT_WATERFALL_DAYS",
+        "email_recipient_max_per_lead": "EMAIL_RECIPIENT_MAX_PER_LEAD",
+        "email_template_min_token_match_ratio": "EMAIL_TEMPLATE_MIN_TOKEN_MATCH_RATIO",
+        "email_template_fallback_enabled": "EMAIL_TEMPLATE_FALLBACK_ENABLED",
+        "email_template_required_tokens_override": "EMAIL_TEMPLATE_REQUIRED_TOKENS_OVERRIDE",
         "automation_feishu_webhook_url": "AUTOMATION_FEISHU_WEBHOOK_URL",
+        "automation_reply_notifications_enabled": "AUTOMATION_REPLY_NOTIFICATIONS_ENABLED",
         "automation_summary_enabled": "AUTOMATION_SUMMARY_ENABLED",
         "automation_summary_interval_seconds": "AUTOMATION_SUMMARY_INTERVAL_SECONDS",
         "automation_alerts_enabled": "AUTOMATION_ALERTS_ENABLED",
@@ -298,7 +315,7 @@ async def save_settings(payload: SettingsPayload):
     get_settings.cache_clear()
 
 
-@router.post("/email/graph-test", response_model=GraphTestResponse, dependencies=[Depends(require_api_access)])
+@router.post("/email/graph-test", response_model=GraphTestResponse, dependencies=[Depends(require_api_access), Depends(require_admin)])
 async def test_graph_settings():
     """Test Microsoft Graph connectivity using the current saved settings.
 
@@ -343,7 +360,7 @@ async def test_graph_settings():
     )
 
 
-@router.post("/automation/feishu-test", response_model=FeishuTestResponse, dependencies=[Depends(require_api_access)])
+@router.post("/automation/feishu-test", response_model=FeishuTestResponse, dependencies=[Depends(require_api_access), Depends(require_admin)])
 async def test_automation_feishu_webhook():
     """Send a test message to the configured Feishu webhook."""
     get_settings.cache_clear()
@@ -368,7 +385,7 @@ async def test_automation_feishu_webhook():
     return FeishuTestResponse(
         status="ok",
         message="Feishu webhook test sent",
-        webhook_url=webhook_url,
+        webhook_url=_mask(webhook_url),
     )
 
 
@@ -384,25 +401,25 @@ def _license_removed_response() -> LicenseStatusResponse:
     )
 
 
-@router.get("/license/status", response_model=LicenseStatusResponse, dependencies=[Depends(require_api_access)])
+@router.get("/license/status", response_model=LicenseStatusResponse, dependencies=[Depends(require_api_access), Depends(require_admin)])
 async def license_status():
     """Return a compatibility response after license verification removal."""
     return _license_removed_response()
 
 
-@router.post("/license/activate", response_model=LicenseStatusResponse, dependencies=[Depends(require_api_access)])
+@router.post("/license/activate", response_model=LicenseStatusResponse, dependencies=[Depends(require_api_access), Depends(require_admin)])
 async def activate_license(req: ActivateRequest):
     """Keep the old activation endpoint stable after license removal."""
     return _license_removed_response()
 
 
-@router.post("/license/deactivate", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_api_access)])
+@router.post("/license/deactivate", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_api_access), Depends(require_admin)])
 async def deactivate_license():
     """Keep the old deactivation endpoint stable after license removal."""
     return None
 
 
-@router.post("/license/save-token", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_api_access)])
+@router.post("/license/save-token", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_api_access), Depends(require_admin)])
 async def save_license_token(req: SaveTokenRequest):
     """Accept legacy save-token calls as a no-op after license removal."""
     return None
@@ -420,13 +437,16 @@ _SECRET_KEYS = {
     "AMAP_API_KEY", "BAIDU_API_KEY", "HUNTER_API_KEY",
     "SESSION_SECRET", "SECRETS_ENCRYPTION_KEY",
     "GRAPH_CLIENT_SECRET",
+    "AUTOMATION_FEISHU_WEBHOOK_URL",
 }
 
 
 def _mask(value: str) -> str:
     """Partially mask a secret value for display."""
-    if not value or len(value) < 8:
-        return value
+    if not value:
+        return ""
+    if len(value) < 8:
+        return "*" * len(value)
     return value[:4] + "****" + value[-4:]
 
 

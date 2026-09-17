@@ -43,6 +43,7 @@ class HuntState(TypedDict):
 
     # ── Stage 4: Leads (accumulated across rounds) ──────────────────────
     leads: list[dict]
+    filter_stats: Optional[dict]            # filtering/dedup statistics from lead extraction
 
     # ── Stage 5: Email sequences ────────────────────────────────────────
     email_sequences: list[dict]

@@ -242,6 +242,11 @@ export function LLMProviderPanel({
   );
   const provider = PROVIDERS.find((p) => p.id === providerId) ?? PROVIDERS[0];
 
+  useEffect(() => {
+    const detected = detectProvider(currentDefaultModel || currentReasoningModel);
+    setProviderId((current) => (current === detected ? current : detected));
+  }, [currentDefaultModel, currentReasoningModel]);
+
   const handleProviderChange = (newId: string) => {
     setProviderId(newId);
     const p = PROVIDERS.find((pr) => pr.id === newId)!;

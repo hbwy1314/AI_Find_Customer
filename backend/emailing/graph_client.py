@@ -18,6 +18,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from msal import ConfidentialClientApplication
@@ -550,47 +551,50 @@ async def fetch_graph_replies(
             f"&$top={limit}"
             f"&$select={select_fields}"
         )
-        status_code, body = await _graph_request("GET", url, timeout=30.0)
-        if status_code != 200 or not isinstance(body, dict):
-            logger.warning("Graph fetch_replies status=%s body=%s", status_code, body)
-            return []
         results: list[dict[str, Any]] = []
-        for item in body.get("value", []) or []:
-            internet_message_id = str(item.get("internetMessageId") or "")
-            conversation_id = str(item.get("conversationId") or "")
-            sender = (item.get("from") or {}).get("emailAddress") or {}
-            from_email = str(sender.get("address") or "")
-            from_name = str(sender.get("name") or "")
-            subject = str(item.get("subject") or "")
-            received_at = str(item.get("receivedDateTime") or "")
-            body_preview = str(item.get("bodyPreview") or "")
-            # `in_reply_to` is intentionally empty here. To resolve it for
-            # stronger matching, callers can hit
-            # `/users/{upn}/messages/{id}?$expand=internetMessageHeaders`
-            # but that's a per-message round trip — not worth doing in
-            # the bulk poll loop. conversationId + subject matching is
-            # good enough for the scheduler's "did the lead reply?" check.
-            in_reply_to = ""
-
-            raw_ref = f"graph:{conversation_id or internet_message_id or uuid.uuid4()}"
-            results.append({
-                "raw_ref": raw_ref,
-                "message_id": internet_message_id,
-                "conversation_id": conversation_id,
-                "in_reply_to": in_reply_to,
-                "references": [],  # Graph doesn't expose this in the basic select
-                "from_email": from_email,
-                "from_name": from_name,
-                "subject": subject,
-                "received_at": received_at,
-                "snippet": body_preview[:500],
-                "headers": {
-                    "From": f"{from_name} <{from_email}>" if from_name else from_email,
-                    "Subject": subject,
-                    "Message-ID": internet_message_id,
-                    "In-Reply-To": in_reply_to,
-                },
-            })
+        next_url = url
+        while next_url and len(results) < limit:
+            status_code, body = await _graph_request("GET", next_url, timeout=30.0)
+            if status_code != 200 or not isinstance(body, dict):
+                logger.warning("Graph fetch_replies status=%s body=%s", status_code, body)
+                break
+            for item in body.get("value", []) or []:
+                if len(results) >= limit:
+                    break
+                internet_message_id = str(item.get("internetMessageId") or "")
+                conversation_id = str(item.get("conversationId") or "")
+                sender = (item.get("from") or {}).get("emailAddress") or {}
+                from_email = str(sender.get("address") or "")
+                from_name = str(sender.get("name") or "")
+                subject = str(item.get("subject") or "")
+                received_at = str(item.get("receivedDateTime") or "")
+                body_preview = str(item.get("bodyPreview") or "")
+                in_reply_to = ""
+                raw_ref = f"graph:{internet_message_id or conversation_id or uuid.uuid4()}"
+                results.append({
+                    "raw_ref": raw_ref,
+                    "message_id": internet_message_id,
+                    "conversation_id": conversation_id,
+                    "in_reply_to": in_reply_to,
+                    "references": [],
+                    "from_email": from_email,
+                    "from_name": from_name,
+                    "subject": subject,
+                    "received_at": received_at,
+                    "snippet": body_preview[:500],
+                    "headers": {
+                        "From": f"{from_name} <{from_email}>" if from_name else from_email,
+                        "Subject": subject,
+                        "Message-ID": internet_message_id,
+                        "In-Reply-To": in_reply_to,
+                    },
+                })
+            raw_next = str(body.get("@odata.nextLink") or "")
+            if raw_next:
+                parsed = urlsplit(raw_next)
+                next_url = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+            else:
+                next_url = ""
         return results
     except (httpx.HTTPError, TimeoutError) as exc:
         logger.warning("Graph fetch_replies network error: %s", exc)

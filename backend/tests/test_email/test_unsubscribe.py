@@ -189,7 +189,8 @@ async def test_scheduler_skips_unsubscribed_recipient(store: EmailStore) -> None
     camp_id = "camp-unsub-test"
     hunt_id = "hunt-unsub-test"
     acc_id = "acc-unsub-test"
-    now = datetime.now(timezone.utc).isoformat()
+    # Monday inside the default 09:00-18:00 Asia/Shanghai window.
+    now = "2026-04-06T02:00:00+00:00"
 
     try:
         with store._connect() as conn:

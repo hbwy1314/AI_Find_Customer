@@ -3,6 +3,74 @@ from pathlib import Path
 from emailing.store import EmailStore
 
 
+def test_global_lead_registry_reserves_aliases_once(tmp_path: Path):
+    store = EmailStore(str(tmp_path / "email.db"))
+    store.init_db()
+    lead = {"company_name": "Acme Ltd", "website": "https://www.acme.com/about", "emails": ["sales@acme.com"]}
+    assert store.reserve_lead_keys(
+        [lead], hunt_id="hunt-1", key_fn=lambda item: ["domain:acme.com", "email:sales@acme.com"], now_iso="2026-01-01"
+    ) == [lead]
+    assert store.reserve_lead_keys(
+        [{"company_name": "Acme", "website": "https://acme.com"}],
+        hunt_id="hunt-2",
+        key_fn=lambda item: ["domain:acme.com"],
+        now_iso="2026-01-02",
+    ) == []
+
+
+def test_global_lead_registry_backfills_missing_aliases(tmp_path: Path):
+    store = EmailStore(str(tmp_path / "email.db"))
+    store.init_db()
+    lead = {"company_name": "Acme GmbH", "website": "https://acme.com"}
+    assert store.reserve_lead_keys(
+        [lead],
+        hunt_id="hunt-1",
+        key_fn=lambda item: ["legacy:acme"],
+        now_iso="2026-01-01",
+    ) == [lead]
+
+    inserted = store.ensure_lead_keys(
+        [lead],
+        hunt_id="hunt-1",
+        key_fn=lambda item: ["legacy:acme", "domain:acme.com"],
+        now_iso="2026-01-01",
+    )
+
+    assert inserted == 1
+    assert {"legacy:acme", "domain:acme.com"} <= store.list_lead_registry_keys()
+
+
+def test_get_hunt_id_for_key(tmp_path: Path):
+    """Test retrieving the hunt_id that originally registered a key."""
+    store = EmailStore(str(tmp_path / "email.db"))
+    store.init_db()
+    
+    # Register keys for different hunts
+    lead1 = {"company_name": "Acme", "website": "https://acme.com"}
+    lead2 = {"company_name": "Beta Corp", "emails": ["info@beta.com"]}
+    
+    store.reserve_lead_keys(
+        [lead1],
+        hunt_id="hunt-alpha",
+        key_fn=lambda item: ["domain:acme.com", "company:acme"],
+        now_iso="2026-01-01",
+    )
+    
+    store.reserve_lead_keys(
+        [lead2],
+        hunt_id="hunt-beta",
+        key_fn=lambda item: ["email:info@beta.com", "company:beta corp"],
+        now_iso="2026-01-02",
+    )
+    
+    # Check hunt_id retrieval
+    assert store.get_hunt_id_for_key("domain:acme.com") == "hunt-alpha"
+    assert store.get_hunt_id_for_key("company:acme") == "hunt-alpha"
+    assert store.get_hunt_id_for_key("email:info@beta.com") == "hunt-beta"
+    assert store.get_hunt_id_for_key("company:beta corp") == "hunt-beta"
+    assert store.get_hunt_id_for_key("nonexistent:key") is None
+
+
 def test_email_store_init_and_account_roundtrip(tmp_path: Path):
     db_path = tmp_path / "email.db"
     store = EmailStore(str(db_path))

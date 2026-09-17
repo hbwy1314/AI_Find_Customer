@@ -12,20 +12,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from agents.email_craft_agent import email_craft_node
 from agents.insight_agent import insight_node
 from agents.keyword_gen_agent import keyword_gen_node
 from agents.lead_extract_agent import lead_extract_node, set_progress_callback
+from agents.lead_identity import dedupe_leads, lead_identity_keys
 from agents.parse_description_agent import parse_description_node
 from agents.search_agent import search_node
 from api.hunt_store import load_all_hunts, now_iso, save_hunt
-from api.security import require_api_access
+from api.security import require_api_access, require_resource_access, require_user
+from automation.job_queue import HuntJobQueue
 from config.settings import get_settings
+from emailing.store import EmailStore
 from emailing.template_pipeline import compose_template_plan, extract_template_profile
 from graph.builder import build_graph
+from graph.checkpointer import get_async_checkpointer
 from graph.evaluate import _build_keyword_performance, evaluate_progress, should_continue_hunting
 from observability.cost_tracker import get_tracker, remove_tracker
 from tools.llm_client import LLMTool
@@ -38,6 +42,14 @@ _hunts: dict[str, dict] = load_all_hunts(mark_interrupted=True)
 # SSE event queues per hunt — subscribers listen here
 _sse_queues: dict[str, list[asyncio.Queue]] = {}
 _reply_detection_task: asyncio.Task[Any] | None = None
+_email_only_hunts: set[str] = set()
+_email_only_jobs: dict[str, str] = {}
+
+
+def _email_only_queue() -> HuntJobQueue:
+    queue = HuntJobQueue(get_settings().automation_queue_db_path)
+    queue.init_db()
+    return queue
 
 
 class HuntCancelledError(RuntimeError):
@@ -62,24 +74,11 @@ def _raise_if_hunt_cancelled(hunt_id: str) -> None:
 
 
 def _lead_key(lead: dict[str, Any]) -> str:
-    website = str(lead.get("website", "") or "").strip().lower()
-    if website:
-        return f"w:{website}"
-    company_name = str(lead.get("company_name", "") or "").strip().lower()
-    if company_name:
-        return f"c:{company_name}"
-    emails = lead.get("emails") or []
-    if isinstance(emails, list) and emails:
-        return f"e:{str(emails[0]).strip().lower()}"
-    return "raw:" + json.dumps(lead, sort_keys=True, ensure_ascii=False)
+    return lead_identity_keys(lead)[0]
 
 
 def _dedupe_leads(leads: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: dict[str, dict[str, Any]] = {}
-    for lead in leads:
-        if isinstance(lead, dict):
-            merged[_lead_key(lead)] = lead
-    return list(merged.values())
+    return dedupe_leads(leads)
 
 
 def _unique_leads_count(leads: list[dict[str, Any]]) -> int:
@@ -198,6 +197,11 @@ class EmailSequenceDecisionResponse(BaseModel):
     manual_review: dict[str, Any]
 
 
+class EmailDraftUpdateRequest(BaseModel):
+    subject: str = Field(..., min_length=1, max_length=500)
+    body_text: str = Field(..., min_length=1, max_length=20000)
+
+
 class SendEmailDraftRequest(BaseModel):
     sequence_number: int = Field(default=1, ge=1, le=3)
 
@@ -209,6 +213,9 @@ class SendEmailDraftResponse(BaseModel):
     sent_to: str
     subject: str
     status: str
+    send_status: str = "sent"
+    sent_at: str = ""
+    provider_message_id: str = ""
 
 
 class DetectReplyResponse(BaseModel):
@@ -594,6 +601,15 @@ def _broadcast_stage_data(hunt_id: str, completed_stage: str, state: dict) -> No
     _broadcast(hunt_id, "stage_data", payload)
 
 
+def _graph_run_config(thread_id: str, max_rounds: int) -> dict[str, Any]:
+    """Allow the graph to reach Hunt-level stop conditions."""
+    safe_rounds = max(1, int(max_rounds or 1))
+    return {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": max(50, safe_rounds * 5 + 10),
+    }
+
+
 # ── Background task runner ──────────────────────────────────────────────
 
 async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
@@ -638,6 +654,7 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
         # sensible and prevents the operator from having to re-collect
         # leads they already have.
         "leads": list(request.existing_leads),
+        "filter_stats": None,
         "email_sequences": [],
         "hunt_round": 1,
         # prev_round_lead_count must be seeded too, otherwise the
@@ -659,14 +676,18 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
             if hunt is not None:
                 result = hunt.setdefault("result", {})
                 leads = result.setdefault("leads", [])
-                leads.append(data["lead"])
+                result["leads"] = _dedupe_leads(leads + [data["lead"]])
+                leads = result["leads"]
                 hunt["leads_count"] = _unique_leads_count(leads)
                 save_hunt(hunt_id, hunt)
 
     set_progress_callback(_on_lead_progress)
 
+    checkpointer_cm = None
     try:
         _raise_if_hunt_cancelled(hunt_id)
+        checkpointer_cm = get_async_checkpointer()
+        checkpointer = await checkpointer_cm.__aenter__()
         graph = build_graph(
             parse_description_node=parse_description_node,
             insight_node=insight_node,
@@ -676,14 +697,22 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
             evaluate_node=evaluate_progress,
             should_continue_fn=should_continue_hunting,
             email_craft_node=email_craft_node,
+            checkpointer=checkpointer,
         )
 
         # Use astream to get intermediate state updates and accumulate final result
         prev_stage = "start"
         prev_round = 1
         accumulated: dict[str, Any] = dict(initial_state)
+        _hunts[hunt_id]["status"] = "running"
+        _hunts[hunt_id]["result"] = dict(accumulated)
+        _hunts[hunt_id]["last_checkpoint_at"] = now_iso()
+        save_hunt(hunt_id, _hunts[hunt_id])
 
-        async for chunk in graph.astream(initial_state):
+        async for chunk in graph.astream(
+            initial_state,
+            config=_graph_run_config(hunt_id, request.max_rounds),
+        ):
             _raise_if_hunt_cancelled(hunt_id)
             # chunk is {node_name: node_output_dict}
             for node_name, node_output in chunk.items():
@@ -692,6 +721,9 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
 
                 # Merge node output into accumulated state
                 accumulated.update(node_output)
+                _hunts[hunt_id]["result"] = dict(accumulated)
+                _hunts[hunt_id]["last_checkpoint_at"] = now_iso()
+                save_hunt(hunt_id, _hunts[hunt_id])
 
                 stage = node_output.get("current_stage", prev_stage)
                 hunt_round = accumulated.get("hunt_round", prev_round)
@@ -804,6 +836,8 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
         _broadcast(hunt_id, "failed", {"error": str(e)})
     finally:
         set_progress_callback(None)
+        if checkpointer_cm is not None:
+            await checkpointer_cm.__aexit__(None, None, None)
 
 
 # ── State compression for resume ────────────────────────────────────────
@@ -882,6 +916,7 @@ def _slim_state(prior_result: dict, request: ResumeRequest) -> dict:
         "keyword_search_stats": keyword_search_stats,
         "matched_platforms": prior_result.get("matched_platforms", []),
         "leads": leads,
+        "filter_stats": None,                             # reset for new session
         "seen_urls": seen_urls,                           # full URL dedup set
         "search_results": trimmed_results,               # trimmed, not full history
         # ── New session controls ───────────────────────────────────────
@@ -903,6 +938,8 @@ def _slim_state(prior_result: dict, request: ResumeRequest) -> dict:
 async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: dict) -> None:
     """Resume a completed hunt from its prior state."""
     _hunts[hunt_id]["status"] = "running"
+    _hunts[hunt_id]["last_checkpoint_at"] = now_iso()
+    save_hunt(hunt_id, _hunts[hunt_id])
     logger.info(
         "[Hunt %s] Resuming — prior_leads=%d, new_target=%d, max_rounds=%d",
         hunt_id[:8],
@@ -927,8 +964,11 @@ async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: d
 
     set_progress_callback(_on_lead_progress)
 
+    checkpointer_cm = None
     try:
         _raise_if_hunt_cancelled(hunt_id)
+        checkpointer_cm = get_async_checkpointer()
+        checkpointer = await checkpointer_cm.__aenter__()
         graph = build_graph(
             parse_description_node=parse_description_node,
             insight_node=insight_node,
@@ -938,19 +978,29 @@ async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: d
             evaluate_node=evaluate_progress,
             should_continue_fn=should_continue_hunting,
             email_craft_node=email_craft_node,
+            checkpointer=checkpointer,
         )
 
         prev_stage = "start"
         prev_round = 1
         accumulated: dict[str, Any] = dict(initial_state)
 
-        async for chunk in graph.astream(initial_state):
+        async for chunk in graph.astream(
+            initial_state,
+            config=_graph_run_config(
+                f"{hunt_id}:resume:{uuid.uuid4()}",
+                request.max_rounds,
+            ),
+        ):
             _raise_if_hunt_cancelled(hunt_id)
             for node_name, node_output in chunk.items():
                 if node_name == "__end__":
                     continue
 
                 accumulated.update(node_output)
+                _hunts[hunt_id]["result"] = dict(accumulated)
+                _hunts[hunt_id]["last_checkpoint_at"] = now_iso()
+                save_hunt(hunt_id, _hunts[hunt_id])
 
                 stage = node_output.get("current_stage", prev_stage)
                 hunt_round = accumulated.get("hunt_round", prev_round)
@@ -1051,6 +1101,129 @@ async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: d
         _broadcast(hunt_id, "failed", {"error": str(e)})
     finally:
         set_progress_callback(None)
+        if checkpointer_cm is not None:
+            await checkpointer_cm.__aexit__(None, None, None)
+
+
+async def _run_email_only(hunt_id: str) -> None:
+    """Regenerate email sequences from a saved Hunt without rerunning search."""
+    hunt = _hunts.get(hunt_id)
+    if not hunt:
+        return
+    result = hunt.get("result") or {}
+    leads = result.get("leads") or []
+    if not isinstance(leads, list) or not leads:
+        hunt.update({"status": "failed", "error": "Hunt has no leads to generate emails for"})
+        save_hunt(hunt_id, hunt)
+        _broadcast(hunt_id, "failed", {"error": hunt["error"]})
+        return
+
+    try:
+        result["email_sequences"] = []
+        hunt.update({
+            "status": "running",
+            "current_stage": "email_craft",
+            "error": None,
+            "email_sequences_count": 0,
+            "result": result,
+        })
+        save_hunt(hunt_id, hunt)
+        _broadcast(hunt_id, "stage_change", {
+            "stage": "email_craft",
+            "hunt_round": result.get("hunt_round", hunt.get("hunt_round", 0)),
+            "leads_count": _unique_leads_count(leads),
+        })
+
+        def _on_email_progress(*, completed: int, total: int, generated: int, sequence: dict[str, Any] | None = None) -> None:
+            current_result = hunt.setdefault("result", {})
+            sequences = current_result.setdefault("email_sequences", [])
+            if isinstance(sequence, dict):
+                sequences.append(sequence)
+            hunt["email_sequences_count"] = int(completed)
+            save_hunt(hunt_id, hunt)
+            _broadcast(hunt_id, "progress", {
+                "leads_count": _unique_leads_count(leads),
+                "email_sequences_count": len(sequences),
+                "email_total_count": int(total),
+                "email_generated_count": int(generated),
+                "hunt_round": result.get("hunt_round", 0),
+                "stage": "email_craft",
+            })
+            if isinstance(sequence, dict):
+                _broadcast(hunt_id, "email_progress", {
+                    "sequence": sequence,
+                    "completed": int(completed),
+                    "total": int(total),
+                    "generated": int(generated),
+                })
+            job_id = _email_only_jobs.get(hunt_id)
+            if job_id:
+                _email_only_queue().update_progress(
+                    job_id,
+                    updated_at=now_iso(),
+                    progress_stage="email_craft",
+                    progress_message=f"Generating email sequences: {completed}/{total} leads processed",
+                    hunt_id=hunt_id,
+                )
+
+        email_state = {
+            "website_url": result.get("website_url", hunt.get("website_url", "")),
+            "description": result.get("description", ""),
+            "product_keywords": result.get("product_keywords", hunt.get("product_keywords", [])),
+            "target_customer_profile": result.get("target_customer_profile", ""),
+            "target_regions": result.get("target_regions", hunt.get("target_regions", [])),
+            "uploaded_files": result.get("uploaded_files", []),
+            "target_lead_count": result.get("target_lead_count", hunt.get("target_lead_count", len(leads))),
+            "max_rounds": result.get("max_rounds", hunt.get("max_rounds", 1)),
+            "min_new_leads_threshold": result.get("min_new_leads_threshold", hunt.get("min_new_leads_threshold", 1)),
+            "enable_email_craft": True,
+            "email_template_examples": result.get("email_template_examples", hunt.get("email_template_examples", [])),
+            "email_template_notes": result.get("email_template_notes", hunt.get("email_template_notes", "")),
+            "template_seed": result.get("template_seed"),
+            "insight": result.get("insight") if isinstance(result.get("insight"), dict) else {},
+            "leads": leads,
+            "email_sequences": [],
+            "hunt_round": result.get("hunt_round", hunt.get("hunt_round", 0)),
+            "hunt_id": hunt_id,
+            "current_stage": "email_craft",
+            "messages": [],
+            "email_progress_callback": _on_email_progress,
+        }
+        email_output = await email_craft_node(email_state)
+        result.update(email_output)
+        result["email_sequences"] = email_output.get("email_sequences", [])
+        hunt.update({
+            "status": "completed",
+            "result": result,
+            "current_stage": "email_craft",
+            "email_sequences_count": len(result["email_sequences"]),
+            "completed_at": now_iso(),
+        })
+        save_hunt(hunt_id, hunt)
+        _broadcast_stage_data(hunt_id, "email_craft", result)
+        _broadcast(hunt_id, "progress", {
+            "leads_count": _unique_leads_count(leads),
+            "email_sequences_count": len(result["email_sequences"]),
+            "hunt_round": result.get("hunt_round", 0),
+            "stage": "email_craft",
+        })
+        _broadcast(hunt_id, "completed", {
+            "leads_count": _unique_leads_count(leads),
+            "email_sequences_count": len(result["email_sequences"]),
+            "hunt_round": result.get("hunt_round", 0),
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[Hunt %s] Email-only generation failed", hunt_id[:8])
+        hunt.update({"status": "failed", "error": str(exc), "current_stage": "email_craft"})
+        save_hunt(hunt_id, hunt)
+        _broadcast(hunt_id, "failed", {"error": str(exc)})
+    finally:
+        job_id = _email_only_jobs.pop(hunt_id, "")
+        if job_id:
+            queue = _email_only_queue()
+            if (_hunts.get(hunt_id) or {}).get("status") == "completed":
+                queue.mark_completed(job_id, hunt_id=hunt_id, finished_at=now_iso())
+        _email_only_hunts.discard(hunt_id)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────────
@@ -1113,14 +1286,20 @@ async def prepare_email_template_seed(request: TemplateSeedRequest):
     return TemplateSeedResponse(template_seed=await _prepare_template_seed(request))
 
 
-def _initialize_hunt(request: HuntRequest) -> tuple[str, HuntRequest]:
+def _initialize_hunt(request: HuntRequest, *, owner_user_id: int = 0) -> tuple[str, HuntRequest]:
     uploaded_file_ids = _validate_uploaded_file_ids(request.uploaded_file_ids)
+    existing_leads = _dedupe_leads(request.existing_leads)
+    request = request.model_copy(update={"existing_leads": existing_leads})
     hunt_id = str(uuid.uuid4())
     _hunts[hunt_id] = {
         "status": "pending",
+        "owner_user_id": int(owner_user_id or 0),
         "result": None,
         "current_stage": None,
         "hunt_round": 0,
+        "target_lead_count": request.target_lead_count,
+        "max_rounds": request.max_rounds,
+        "min_new_leads_threshold": request.min_new_leads_threshold,
         "leads_count": len(request.existing_leads),
         "email_sequences_count": 0,
         "error": None,
@@ -1149,31 +1328,33 @@ def _initialize_hunt(request: HuntRequest) -> tuple[str, HuntRequest]:
     return hunt_id, prepared_request
 
 
-async def create_hunt_internal(request: HuntRequest) -> HuntResponse:
-    hunt_id, prepared_request = _initialize_hunt(request)
+async def create_hunt_internal(request: HuntRequest, *, owner_user_id: int = 0) -> HuntResponse:
+    hunt_id, prepared_request = _initialize_hunt(request, owner_user_id=owner_user_id)
     asyncio.create_task(_run_hunt(hunt_id, prepared_request))
     return HuntResponse(hunt_id=hunt_id, status="pending")
 
 
 @router.post("/hunts", response_model=HuntResponse, dependencies=[Depends(require_api_access)])
-async def create_hunt(request: HuntRequest, background_tasks: BackgroundTasks):
+async def create_hunt(request: HuntRequest, background_tasks: BackgroundTasks, http_request: Request):
     """Start a new hunt pipeline in the background.
 
     Returns a hunt_id to track progress.
     """
-    hunt_id, prepared_request = _initialize_hunt(request)
+    owner_user_id = require_user(http_request).user_id
+    hunt_id, prepared_request = _initialize_hunt(request, owner_user_id=owner_user_id)
     background_tasks.add_task(_run_hunt, hunt_id, prepared_request)
 
     return HuntResponse(hunt_id=hunt_id, status="pending")
 
 
 @router.get("/hunts/{hunt_id}/status", response_model=HuntStatus, dependencies=[Depends(require_api_access)])
-async def get_hunt_status(hunt_id: str):
+async def get_hunt_status(hunt_id: str, request: Request):
     """Get the current status of a hunt."""
     if hunt_id not in _hunts:
         raise HTTPException(status_code=404, detail="Hunt not found")
 
     hunt = _hunts[hunt_id]
+    require_resource_access(request, hunt.get("owner_user_id"))
     result = hunt.get("result") or {}
     return HuntStatus(
         hunt_id=hunt_id,
@@ -1187,12 +1368,13 @@ async def get_hunt_status(hunt_id: str):
 
 
 @router.get("/hunts/{hunt_id}/result", response_model=HuntResult, dependencies=[Depends(require_api_access)])
-async def get_hunt_result(hunt_id: str):
+async def get_hunt_result(hunt_id: str, request: Request):
     """Get the full result of a hunt (partial data returned for running/pending hunts)."""
     if hunt_id not in _hunts:
         raise HTTPException(status_code=404, detail="Hunt not found")
 
     hunt = _hunts[hunt_id]
+    require_resource_access(request, hunt.get("owner_user_id"))
     result = hunt.get("result") or {}
     deduped_leads = _dedupe_leads(result.get("leads", []))
     return HuntResult(
@@ -1208,6 +1390,32 @@ async def get_hunt_result(hunt_id: str):
         search_result_count=len(result.get("search_results", [])),
     )
 
+
+@router.post("/hunts/{hunt_id}/email-sequences/run", response_model=HuntResponse, dependencies=[Depends(require_api_access)])
+async def run_hunt_email_sequences(hunt_id: str, request: Request, background_tasks: BackgroundTasks):
+    """Regenerate emails from saved leads without rerunning the Hunt pipeline."""
+    if hunt_id not in _hunts:
+        raise HTTPException(status_code=404, detail="Hunt not found")
+    hunt = _hunts[hunt_id]
+    require_resource_access(request, hunt.get("owner_user_id"))
+    if hunt.get("status") in {"pending", "running"} or hunt_id in _email_only_hunts:
+        raise HTTPException(status_code=409, detail="Hunt is still running")
+    result = hunt.get("result") or {}
+    if not isinstance(result.get("leads"), list) or not result.get("leads"):
+        raise HTTPException(status_code=400, detail="Hunt has no leads to generate emails for")
+    _email_only_hunts.add(hunt_id)
+    queue = _email_only_queue()
+    existing_job = queue.get_by_hunt_id(hunt_id)
+    if existing_job and queue.start_email_only(
+        str(existing_job["id"]), hunt_id=hunt_id, updated_at=now_iso()
+    ):
+        _email_only_jobs[hunt_id] = str(existing_job["id"])
+    hunt.update({"status": "running", "current_stage": "email_craft", "error": None})
+    save_hunt(hunt_id, hunt)
+    background_tasks.add_task(_run_email_only, hunt_id)
+    return HuntResponse(hunt_id=hunt_id, status="running")
+
+
 @router.post(
     "/hunts/{hunt_id}/email-sequences/{sequence_index}/decision",
     response_model=EmailSequenceDecisionResponse,
@@ -1217,12 +1425,14 @@ async def decide_email_sequence(
     hunt_id: str,
     sequence_index: int,
     request: EmailSequenceDecisionRequest,
+    http_request: Request,
 ):
     """Persist a manual approval or rejection for a generated email sequence."""
     if hunt_id not in _hunts:
         raise HTTPException(status_code=404, detail="Hunt not found")
 
     hunt = _hunts[hunt_id]
+    require_resource_access(http_request, hunt.get("owner_user_id"))
     result = hunt.get("result") or {}
     sequences = result.get("email_sequences", [])
     if not isinstance(sequences, list):
@@ -1255,6 +1465,85 @@ async def decide_email_sequence(
     )
 
 
+@router.patch(
+    "/hunts/{hunt_id}/email-sequences/{sequence_index}/emails/{sequence_number}",
+    dependencies=[Depends(require_api_access)],
+)
+async def update_email_sequence_draft(
+    hunt_id: str,
+    sequence_index: int,
+    sequence_number: int,
+    request: EmailDraftUpdateRequest,
+    http_request: Request,
+):
+    """Persist operator edits to one unsent email draft."""
+    if hunt_id not in _hunts:
+        raise HTTPException(status_code=404, detail="Hunt not found")
+    hunt = _hunts[hunt_id]
+    require_resource_access(http_request, hunt.get("owner_user_id"))
+    result = hunt.get("result") or {}
+    sequences = result.get("email_sequences", [])
+    if not isinstance(sequences, list) or sequence_index < 0 or sequence_index >= len(sequences):
+        raise HTTPException(status_code=404, detail="Email sequence not found")
+    sequence = sequences[sequence_index]
+    emails = sequence.get("emails", []) if isinstance(sequence, dict) else []
+    draft = next(
+        (item for item in emails if isinstance(item, dict) and int(item.get("sequence_number", 0) or 0) == sequence_number),
+        None,
+    )
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Email draft not found")
+    if str(draft.get("send_status", "") or "") in {"sent", "sending", "queued"}:
+        raise HTTPException(status_code=409, detail="Sent or queued email drafts cannot be edited")
+    draft["subject"] = request.subject.strip()
+    draft["body_text"] = request.body_text.strip()
+    from emailing.html_format import render_preview_html
+    draft["body_html"] = render_preview_html(
+        draft["body_text"], locale=str(sequence.get("locale", "") or "") or None
+    )
+    sequence["manual_review"] = {
+        "decision": "pending",
+        "notes": "邮件内容已人工修改，需要重新审核",
+        "updated_at": now_iso(),
+    }
+    sequence["auto_send_eligible"] = False
+    hunt["result"] = result
+    save_hunt(hunt_id, hunt)
+    # Keep unsent Campaign snapshots aligned with the edited Hunt draft.
+    lead = sequence.get("lead") or {}
+    lead_identity = str(lead.get("website") or lead.get("company_name") or "").strip().lower()
+    if not lead_identity:
+        lead_identity = hashlib.sha256(
+            json.dumps(lead, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest()
+    lead_key = f"lead:{lead_identity}"
+    store = EmailStore(get_settings().email_db_path)
+    store.init_db()
+    for campaign in store.list_campaigns_for_hunt(hunt_id):
+        for db_sequence in store.list_sequences_for_campaign(str(campaign["id"])):
+            if str(db_sequence.get("lead_key", "")) != lead_key:
+                continue
+            store.update_pending_messages_for_sequence(
+                str(db_sequence["id"]),
+                sequence_number=sequence_number,
+                subject=draft["subject"],
+                body_text=draft["body_text"],
+                body_html=draft["body_html"],
+                updated_at=now_iso(),
+            )
+            if str(campaign.get("status", "")) == "active":
+                store.update_campaign_status(str(campaign["id"]), "paused", updated_at=now_iso())
+    return {
+        "hunt_id": hunt_id,
+        "sequence_index": sequence_index,
+        "sequence_number": sequence_number,
+        "subject": draft["subject"],
+        "body_text": draft["body_text"],
+        "body_html": draft["body_html"],
+        "auto_send_eligible": False,
+    }
+
+
 @router.post(
     "/hunts/{hunt_id}/email-sequences/{sequence_index}/send",
     response_model=SendEmailDraftResponse,
@@ -1264,12 +1553,14 @@ async def send_email_sequence_draft(
     hunt_id: str,
     sequence_index: int,
     request: SendEmailDraftRequest,
+    http_request: Request,
 ):
     """Send a specific draft from an approved email sequence via Microsoft Graph."""
     if hunt_id not in _hunts:
         raise HTTPException(status_code=404, detail="Hunt not found")
 
     hunt = _hunts[hunt_id]
+    require_resource_access(http_request, hunt.get("owner_user_id"))
     result = hunt.get("result") or {}
     sequences = result.get("email_sequences", [])
     if not isinstance(sequences, list):
@@ -1294,6 +1585,8 @@ async def send_email_sequence_draft(
             break
     if not draft:
         raise HTTPException(status_code=404, detail="Requested draft not found")
+    if str(draft.get("send_status", "") or "") == "sent":
+        raise HTTPException(status_code=409, detail="This email has already been sent")
 
     settings = get_settings()
     from emailing.readiness import ensure_outbound_ready
@@ -1356,14 +1649,165 @@ async def send_email_sequence_draft(
             ),
         )
 
+    now = now_iso()
+    daily_limit = int(account.get("daily_send_limit", 0) or 0)
+    hourly_limit = int(account.get("hourly_send_limit", 0) or 0)
+    used_today = store.count_sent_today_for_account(str(account["id"]), now_iso=now)
+    used_last_hour = store.count_sent_last_hour_for_account(str(account["id"]), now_iso=now)
+
+    # 如果当前账号达到限额，尝试切换到同 provider 的其他可用账号
+    original_account = account
+    if daily_limit > 0 and used_today >= daily_limit:
+        from emailing.scheduler import _pick_fallback_account
+        sent_today_cache = {str(account["id"]): used_today}
+        fallback = _pick_fallback_account(store, account, sent_today_cache, now)
+        if fallback is not None:
+            account = fallback
+            daily_limit = int(account.get("daily_send_limit", 0) or 0)
+            hourly_limit = int(account.get("hourly_send_limit", 0) or 0)
+            used_today = store.count_sent_today_for_account(str(account["id"]), now_iso=now)
+            used_last_hour = store.count_sent_last_hour_for_account(str(account["id"]), now_iso=now)
+        else:
+            # 所有同 provider 账号都达到限额
+            raise HTTPException(status_code=429, detail={
+                "error": "daily_limit_reached",
+                "message": f"所有 {original_account.get('provider_type', '')} 邮箱今日已达上限。原账号已发送 {used_today} 封，上限 {daily_limit}。",
+                "daily_send_limit": daily_limit,
+                "sent_today": used_today,
+            })
+
+    if hourly_limit > 0 and used_last_hour >= hourly_limit:
+        raise HTTPException(status_code=429, detail={
+            "error": "hourly_limit_reached",
+            "message": f"最近一小时已发送 {used_last_hour} 封，已达上限 {hourly_limit}。",
+            "hourly_send_limit": hourly_limit,
+            "sent_last_hour": used_last_hour,
+        })
+
+    claim_id = uuid.uuid4().hex
+    claimed, existing_claim = store.claim_manual_send(
+        hunt_id,
+        sequence_index,
+        request.sequence_number,
+        claim_id=claim_id,
+        now_iso=now,
+    )
+    if not claimed:
+        existing_status = str((existing_claim or {}).get("status", "sending") or "sending")
+        detail = "This email has already been sent" if existing_status == "sent" else "This email is already being sent"
+        raise HTTPException(status_code=409, detail=detail)
+    if not store.reserve_send_quota(
+        str(account["id"]),
+        claim_id,
+        daily_limit=daily_limit,
+        hourly_limit=hourly_limit,
+        now_iso=now,
+    ):
+        store.update_manual_send_claim(claim_id, status="failed", updated_at=now)
+        raise HTTPException(status_code=429, detail="Email send quota reached")
+
+    # Preview sends use the same durable message tables as Campaign sends.
+    # This keeps quota, history, and reply matching on one source of truth.
+    manual_campaign_id = f"manual-{hunt_id}"
+    manual_sequence_id = f"manual-{hunt_id}-{sequence_index}"
+    message_id = f"manual-{hunt_id}-{sequence_index}-{request.sequence_number}"
+    # Tests and legacy callers may provide an account object without a
+    # corresponding row. Production accounts already exist; this only fills
+    # the minimal FK row when the database is missing it.
+    with store._connect() as conn:
+        account_row_exists = conn.execute(
+            "SELECT 1 FROM email_accounts WHERE id = ?", (str(account["id"]),)
+        ).fetchone()
+    if not account_row_exists:
+        store.upsert_account({
+            "id": str(account["id"]),
+            "provider_type": str(account.get("provider_type") or "graph"),
+            "from_name": str(account.get("from_name") or ""),
+            "from_email": str(account.get("from_email") or ""),
+            "reply_to": str(account.get("reply_to") or ""),
+            "status": "active",
+            "daily_send_limit": daily_limit,
+            "hourly_send_limit": hourly_limit,
+            "graph_user_principal_name": str(account.get("graph_user_principal_name") or ""),
+            "created_at": now,
+            "updated_at": now,
+        })
+    if not store.get_campaign(manual_campaign_id):
+        store.create_campaign({
+            "id": manual_campaign_id,
+            "owner_user_id": int(hunt.get("owner_user_id", 0) or 0),
+            "hunt_id": hunt_id,
+            "email_account_id": str(account["id"]),
+            "name": "Preview manual sends",
+            "status": "active",
+            "language_mode": "auto_by_region",
+            "default_language": "en",
+            "fallback_language": "en",
+            "tone": "professional",
+            "step1_delay_days": 0,
+            "step2_delay_days": 3,
+            "step3_delay_days": 3,
+            "min_fit_score": 0.0,
+            "min_contactability_score": 0.0,
+            "created_at": now,
+            "updated_at": now,
+        })
+    if not store.get_sequence(manual_sequence_id):
+        store.create_sequence({
+            "id": manual_sequence_id,
+            "campaign_id": manual_campaign_id,
+            "hunt_id": hunt_id,
+            "lead_key": f"manual:{hunt_id}:{sequence_index}",
+            "lead_email": recipient,
+            "lead_name": str((sequence.get("lead") or {}).get("company_name", "") or ""),
+            "locale": str(sequence.get("locale") or "en_US"),
+            "status": "running",
+            "current_step": request.sequence_number,
+            "created_at": now,
+            "updated_at": now,
+            "email_account_id": str(account["id"]),
+        })
+    from emailing.html_format import render_preview_html
+    message_html = render_preview_html(
+        str(draft.get("body_text", "") or ""),
+        locale=str(sequence.get("locale", "") or "") or None,
+    )
+    store.create_message({
+        "id": message_id,
+        "sequence_id": manual_sequence_id,
+        "step_number": request.sequence_number,
+        "goal": str(draft.get("email_type", "") or "manual_preview"),
+        "locale": str(sequence.get("locale") or "en_US"),
+        "subject": str(draft.get("subject", "") or ""),
+        "body_text": str(draft.get("body_text", "") or ""),
+        "body_html": message_html,
+        "status": "sending",
+        "scheduled_at": now,
+        "sent_at": "",
+        "provider_message_id": "",
+        "thread_key": "",
+        "failure_reason": "",
+        "claim_token": claim_id,
+        "claimed_at": now,
+        "attempt_count": 1,
+        "created_at": now,
+        "updated_at": now,
+    })
+    store.update_manual_send_claim(claim_id, status="sending", message_id=message_id, updated_at=now)
+
     from emailing import email_sender
     send_result = await email_sender.send_email(
         account,
         to_email=recipient,
         subject=str(draft.get("subject", "") or ""),
         body_text=str(draft.get("body_text", "") or ""),
+        thread_key=message_id,
+        body_html=message_html,
     )
     if not send_result.get("ok"):
+        store.mark_message_failed(message_id, failure_reason=str(send_result.get("error") or "send_failed"), updated_at=now, claim_token=claim_id)
+        store.finalize_send_quota(claim_id, sent=False, updated_at=now)
+        store.update_manual_send_claim(claim_id, status="failed", message_id=message_id, updated_at=now)
         raise HTTPException(
             status_code=502,
             detail=send_result.get("error") or "Graph send failed",
@@ -1373,6 +1817,17 @@ async def send_email_sequence_draft(
     draft["sent_at"] = send_result.get("sent_at") or now_iso()
     draft["sent_to"] = recipient
     draft["provider_message_id"] = send_result.get("provider_message_id", "")
+    sent_at = str(draft["sent_at"])
+    store.mark_message_sent(
+        message_id,
+        provider_message_id=str(draft["provider_message_id"]),
+        thread_key=str(send_result.get("thread_key") or ""),
+        sent_at=sent_at,
+        claim_token=claim_id,
+    )
+    store.finalize_send_quota(claim_id, sent=True, updated_at=sent_at)
+    store.update_sequence_status(manual_sequence_id, status="completed", updated_at=sent_at, current_step=request.sequence_number, last_sent_at=sent_at)
+    store.update_manual_send_claim(claim_id, status="sent", message_id=message_id, updated_at=sent_at)
     hunt["result"] = result
     save_hunt(hunt_id, hunt)
 
@@ -1383,6 +1838,9 @@ async def send_email_sequence_draft(
         sent_to=recipient,
         subject=str(draft.get("subject", "") or ""),
         status=send_result.get("status") or "ok",
+        send_status="sent",
+        sent_at=sent_at,
+        provider_message_id=str(draft["provider_message_id"]),
     )
 
 
@@ -1394,12 +1852,14 @@ async def send_email_sequence_draft(
 async def detect_email_sequence_replies(
     hunt_id: str,
     sequence_index: int,
+    request: Request,
 ):
     """Check the Graph inbox for replies from the lead's email address."""
     if hunt_id not in _hunts:
         raise HTTPException(status_code=404, detail="Hunt not found")
 
     hunt = _hunts[hunt_id]
+    require_resource_access(request, hunt.get("owner_user_id"))
     result = hunt.get("result") or {}
     sequences = result.get("email_sequences", [])
     if not isinstance(sequences, list) or sequence_index < 0 or sequence_index >= len(sequences):
@@ -1458,10 +1918,14 @@ async def detect_email_sequence_replies(
 
 
 @router.get("/hunts", dependencies=[Depends(require_api_access)])
-async def list_hunts():
+async def list_hunts(request: Request):
     """List all hunts with their status."""
     items = []
     for hid, h in _hunts.items():
+        try:
+            require_resource_access(request, h.get("owner_user_id"))
+        except HTTPException:
+            continue
         result = h.get("result") or {}
         items.append({
             "hunt_id": hid,
@@ -1481,7 +1945,7 @@ async def list_hunts():
 
 
 @router.get("/hunts/{hunt_id}/cost", dependencies=[Depends(require_api_access)])
-async def get_hunt_cost(hunt_id: str):
+async def get_hunt_cost(hunt_id: str, request: Request):
     """Get cost and token usage summary for a hunt.
 
     Returns live stats for running hunts (from in-memory tracker)
@@ -1491,6 +1955,7 @@ async def get_hunt_cost(hunt_id: str):
         raise HTTPException(status_code=404, detail="Hunt not found")
 
     hunt = _hunts[hunt_id]
+    require_resource_access(request, hunt.get("owner_user_id"))
     status = hunt["status"]
 
     # For running hunts: read live from tracker
@@ -1507,7 +1972,7 @@ async def get_hunt_cost(hunt_id: str):
 
 
 @router.post("/hunts/{hunt_id}/resume", response_model=HuntResponse, dependencies=[Depends(require_api_access)])
-async def resume_hunt(hunt_id: str, request: ResumeRequest, background_tasks: BackgroundTasks):
+async def resume_hunt(hunt_id: str, request: ResumeRequest, background_tasks: BackgroundTasks, http_request: Request):
     """Resume a completed hunt, continuing from where it left off.
 
     Preserves: insight, leads, used_keywords, keyword_search_stats, seen_urls.
@@ -1521,6 +1986,7 @@ async def resume_hunt(hunt_id: str, request: ResumeRequest, background_tasks: Ba
         raise HTTPException(status_code=404, detail="Hunt not found")
 
     hunt = _hunts[hunt_id]
+    require_resource_access(http_request, hunt.get("owner_user_id"))
     if hunt["status"] == "running":
         raise HTTPException(status_code=409, detail="Hunt is already running")
     if hunt["status"] == "pending":

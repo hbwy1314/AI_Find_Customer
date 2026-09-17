@@ -1,5 +1,6 @@
 """Tests for api/routes.py — FastAPI endpoints with httpx TestClient."""
 
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -441,6 +442,36 @@ class TestEmailSequenceDecision:
         )
         assert resp.status_code == 200
         assert _hunts["decision-4"]["result"]["email_sequences"][0]["manual_review"]["decision"] == "approved"
+
+
+class TestEmailOnlyGeneration:
+    @pytest.mark.asyncio
+    @patch("api.routes._run_email_only", new_callable=AsyncMock)
+    async def test_starts_from_saved_leads_without_restarting_hunt(self, mock_run, client):
+        _hunts["email-only-1"] = {
+            "status": "failed",
+            "owner_user_id": 0,
+            "result": {"leads": [{"company_name": "Acme"}], "email_sequences": []},
+        }
+
+        resp = await client.post("/api/v1/hunts/email-only-1/email-sequences/run")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"hunt_id": "email-only-1", "status": "running"}
+        mock_run.assert_awaited_once_with("email-only-1")
+
+    @pytest.mark.asyncio
+    async def test_rejects_hunt_without_saved_leads(self, client):
+        _hunts["email-only-empty"] = {
+            "status": "failed",
+            "owner_user_id": 0,
+            "result": {"leads": [], "email_sequences": []},
+        }
+
+        resp = await client.post("/api/v1/hunts/email-only-empty/email-sequences/run")
+
+        assert resp.status_code == 400
+        assert "no leads" in resp.json()["detail"].lower()
 
 
 class TestSendEmailDraft:
@@ -1113,3 +1144,208 @@ class TestResumeHunt:
         resume_req = mock_resume.call_args[0][1]
         assert resume_req.target_lead_count == 200
         assert resume_req.max_rounds == 10
+
+
+class TestMultiAccountFallback:
+    """Test automatic account fallback when daily limit is reached."""
+
+    @pytest.mark.asyncio
+    @patch("api.routes.get_settings")
+    @patch("emailing.email_sender.send_email", new_callable=AsyncMock)
+    async def test_fallback_to_second_account_when_first_at_limit(self, mock_send, mock_settings, client, tmp_path):
+        """When account A hits limit, system switches to account B automatically."""
+        import uuid
+
+        from emailing.store import EmailStore
+
+        # Mock settings to point to test database
+        settings = MagicMock()
+        settings.email_db_path = str(tmp_path / "email.db")
+        settings.graph_client_id = "test-client"
+        settings.graph_client_secret = "test-secret"  # noqa: S105
+        settings.graph_tenant_id = "test-tenant"
+        mock_settings.return_value = settings
+
+        # Setup两个 Graph 账号
+        store = EmailStore(settings.email_db_path)
+        store.init_db()
+
+        account1_id = str(uuid.uuid4())
+        store.upsert_account({
+            "id": account1_id,
+            "provider_type": "graph",
+            "from_email": "sender1@example.com",
+            "status": "active",
+            "daily_send_limit": 2,
+            "hourly_send_limit": 0,
+            "sort_order": 1,
+        })
+        account2_id = str(uuid.uuid4())
+        store.upsert_account({
+            "id": account2_id,
+            "provider_type": "graph",
+            "from_email": "sender2@example.com",
+            "status": "active",
+            "daily_send_limit": 5,
+            "hourly_send_limit": 0,
+            "sort_order": 2,
+        })
+
+        # Account1 已发送 2 封（达到限额）
+        now = datetime.now(timezone.utc).isoformat()
+        for _ in range(2):
+            store.record_test_send(
+                account_id=account1_id,
+                to_email="audit@example.com",
+                subject="Test",
+                body_text="Test",
+                provider="graph",
+                provider_message_id="test-message",
+                thread_key="test-thread",
+                ok=True,
+                failure_reason="",
+                sent_at=now,
+            )
+
+        # 创建 Hunt + Campaign
+        campaign_id = str(uuid.uuid4())
+        store.create_campaign({
+            "id": campaign_id,
+            "hunt_id": "hunt-fallback",
+            "name": "Test Campaign",
+            "email_account_id": account1_id,  # 绑定到 account1
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+        })
+
+        # 准备 hunt 数据
+        _hunts["hunt-fallback"] = {
+            "id": "hunt-fallback",
+            "status": "completed",
+            "result": {
+                "leads": [{"email": "lead@example.com", "name": "Test Lead"}],
+                "email_sequences": [
+                    {
+                        "lead": {"company_name": "Test Lead", "emails": ["lead@example.com"]},
+                        "target": {"target_email": "lead@example.com"},
+                        "campaign_id": campaign_id,
+                        "emails": [
+                            {"sequence_number": 1, "subject": "Test", "body_text": "Content"}
+                        ],
+                        "review_summary": {"status": "approved", "score": 91},
+                        "auto_send_eligible": True,
+                    }
+                ],
+            },
+        }
+
+        mock_send.return_value = {"ok": True, "provider_message_id": "msg-123", "thread_key": "thread-1"}
+
+        # 尝试发送邮件 - 应该自动切换到 account2
+        resp = await client.post(
+            "/api/v1/hunts/hunt-fallback/email-sequences/0/send",
+            json={"sequence_number": 1, "force_send": True},
+        )
+
+        assert resp.status_code == 200
+        # 验证使用了 account2
+        call_args = mock_send.call_args
+        account_used = call_args[0][0]
+        assert account_used["id"] == account2_id
+        assert account_used["from_email"] == "sender2@example.com"
+
+    @pytest.mark.asyncio
+    @patch("api.routes.get_settings")
+    async def test_all_accounts_at_limit_returns_429(self, mock_settings, client, tmp_path):
+        """When all accounts hit limit, system returns 429."""
+        import uuid
+
+        from emailing.store import EmailStore
+
+        settings = MagicMock()
+        settings.email_db_path = str(tmp_path / "email.db")
+        settings.graph_client_id = "test-client"
+        settings.graph_client_secret = "test-secret"  # noqa: S105
+        settings.graph_tenant_id = "test-tenant"
+        mock_settings.return_value = settings
+
+        store = EmailStore(settings.email_db_path)
+        store.init_db()
+
+        # 两个账号都达到限额
+        account1_id = str(uuid.uuid4())
+        store.upsert_account({
+            "id": account1_id,
+            "provider_type": "graph",
+            "from_email": "sender1@example.com",
+            "status": "active",
+            "daily_send_limit": 1,
+            "hourly_send_limit": 0,
+            "sort_order": 1,
+        })
+        account2_id = str(uuid.uuid4())
+        store.upsert_account({
+            "id": account2_id,
+            "provider_type": "graph",
+            "from_email": "sender2@example.com",
+            "status": "active",
+            "daily_send_limit": 1,
+            "hourly_send_limit": 0,
+            "sort_order": 2,
+        })
+
+        now = datetime.now(timezone.utc).isoformat()
+        # Account1 已达限
+        for account_id in (account1_id, account2_id):
+            store.record_test_send(
+                account_id=account_id,
+                to_email="audit@example.com",
+                subject="Test",
+                body_text="Test",
+                provider="graph",
+                provider_message_id="test-message",
+                thread_key="test-thread",
+                ok=True,
+                failure_reason="",
+                sent_at=now,
+            )
+
+        campaign_id = str(uuid.uuid4())
+        store.create_campaign({
+            "id": campaign_id,
+            "hunt_id": "hunt-all-limit",
+            "name": "Test",
+            "email_account_id": account1_id,
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+        })
+
+        _hunts["hunt-all-limit"] = {
+            "id": "hunt-all-limit",
+            "status": "completed",
+            "result": {
+                "leads": [{"email": "lead@example.com"}],
+                "email_sequences": [
+                    {
+                        "lead": {"company_name": "Test Lead", "emails": ["lead@example.com"]},
+                        "target": {"target_email": "lead@example.com"},
+                        "campaign_id": campaign_id,
+                        "emails": [{"sequence_number": 1, "subject": "Test", "body_text": "Body"}],
+                        "review_summary": {"status": "approved", "score": 91},
+                        "auto_send_eligible": True,
+                    }
+                ],
+            },
+        }
+
+        resp = await client.post(
+            "/api/v1/hunts/hunt-all-limit/email-sequences/0/send",
+            json={"sequence_number": 1, "force_send": True},
+        )
+
+        assert resp.status_code == 429
+        data = resp.json()
+        assert data["detail"]["error"] == "daily_limit_reached"
+        assert "所有" in data["detail"]["message"]

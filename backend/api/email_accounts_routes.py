@@ -20,11 +20,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, HTTPException, Request, status
+from fastapi import APIRouter, Body, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from auth import secrets as secret_cipher
-from auth.security import require_api_access, require_user
+from auth.security import require_admin, require_api_access, require_resource_access, require_user
 from config.settings import get_settings
 from emailing.store import get_email_store
 
@@ -46,8 +46,8 @@ class AccountCreate(BaseModel):
     graph_client_id: str = ""
     graph_client_secret: str = ""  # write-only; never returned
     graph_user_principal_name: str = ""
-    daily_send_limit: int = 20
-    hourly_send_limit: int = 10
+    daily_send_limit: int = Field(20, ge=0, le=100000)
+    hourly_send_limit: int = Field(10, ge=0, le=100000)
     status: str = "active"
 
 
@@ -59,8 +59,8 @@ class AccountUpdate(BaseModel):
     graph_client_id: Optional[str] = None
     graph_client_secret: Optional[str] = None
     graph_user_principal_name: Optional[str] = None
-    daily_send_limit: Optional[int] = None
-    hourly_send_limit: Optional[int] = None
+    daily_send_limit: Optional[int] = Field(default=None, ge=0, le=100000)
+    hourly_send_limit: Optional[int] = Field(default=None, ge=0, le=100000)
     status: Optional[str] = None
 
 
@@ -165,6 +165,13 @@ def _with_sent_today(accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return enriched
 
 
+def _visible_accounts(request: Request, accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    user = require_user(request)
+    if user.via != "session" or user.role in {"admin", "dev"}:
+        return accounts
+    return [a for a in accounts if int(a.get("owner_user_id", 0) or 0) == user.user_id]
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -174,7 +181,7 @@ def list_accounts(request: Request) -> dict:
     require_api_access(request)
     require_user(request)
     store = get_email_store()
-    raw = store.list_accounts()
+    raw = _visible_accounts(request, store.list_accounts())
     accounts = _with_sent_today(raw)
     return {"accounts": accounts, "count": len(accounts)}
 
@@ -185,7 +192,7 @@ def create_account(
     payload: AccountCreate = Body(...),
 ) -> dict:
     require_api_access(request)
-    require_user(request)
+    user = require_user(request)
     store = get_email_store()
     account_id = f"acct_{uuid.uuid4().hex[:16]}"
     now = _now_iso()
@@ -195,6 +202,7 @@ def create_account(
     graph_secret = payload.graph_client_secret.strip() if payload.graph_client_secret else ""
     row = {
         "id": account_id,
+        "owner_user_id": user.user_id if user.via == "session" else 0,
         "provider_type": "graph",
         "from_name": payload.from_name or "",
         "from_email": payload.from_email or "",
@@ -240,7 +248,8 @@ def reorder_accounts(
     require_api_access(request)
     require_user(request)
     store = get_email_store()
-    existing_ids = {str(a.get("id", "")) for a in store.list_accounts()}
+    visible = _visible_accounts(request, store.list_accounts())
+    existing_ids = {str(a.get("id", "")) for a in visible}
     requested: list[str] = []
     seen: set[str] = set()
     for raw in payload.account_ids:
@@ -257,10 +266,10 @@ def reorder_accounts(
         # Nothing to do, but it's not an error — just a no-op success.
         # (Returning 4xx here would make the UI throw "保存顺序失败" on
         # every harmless race.)
-        raw = store.list_accounts()
+        raw = visible
         return {"ok": True, "count": len(raw), "accounts": _with_sent_today(raw), "ignored_unknown": requested}
     store.reorder_accounts(known)
-    raw = store.list_accounts()
+    raw = _visible_accounts(request, store.list_accounts())
     accounts = _with_sent_today(raw)
     return {"ok": True, "count": len(accounts), "accounts": accounts}
 
@@ -277,6 +286,7 @@ def update_account(
     existing = store.get_account(account_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Email account not found")
+    require_resource_access(request, existing.get("owner_user_id"))
     updates: dict[str, Any] = {}
     for field in (
         "from_name",
@@ -313,6 +323,7 @@ def delete_account(account_id: str, request: Request) -> dict:
     existing = store.get_account(account_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Email account not found")
+    require_resource_access(request, existing.get("owner_user_id"))
     # Cascade policy: if every campaign referencing this account is empty
     # (no sequences and no messages), they are orphaned test data and can
     # be deleted along with the account. Non-empty campaigns still block
@@ -327,13 +338,29 @@ def delete_account(account_id: str, request: Request) -> dict:
             """,
             (account_id,),
         ).fetchall()
+        test_send_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM email_test_send_log WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            or 0
+        )
+        quota_reservation_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM email_quota_reservations WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            or 0
+        )
     non_empty = [cid for (cid, seq_count) in rows if int(seq_count or 0) > 0]
-    if non_empty:
+    if non_empty or test_send_count or quota_reservation_count:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Account is used by {len(non_empty)} non-empty campaign(s); "
-                "delete or reassign them first."
+                f"Account has {len(non_empty)} non-empty campaign(s), "
+                f"{test_send_count} test-send log(s), and "
+                f"{quota_reservation_count} quota reservation(s); "
+                "disable the account instead of deleting it."
             ),
         )
     orphaned_campaigns = [cid for (cid, _) in rows]
@@ -361,6 +388,7 @@ async def test_account(
     account = store.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Email account not found")
+    require_resource_access(request, account.get("owner_user_id"))
     # The legacy ``smtp`` / ``imap`` test kinds are no longer accepted —
     # the TestRequest schema already restricts ``kind`` to ``"graph"``,
     # so anything else is a 422 from pydantic before we get here.
@@ -406,6 +434,7 @@ async def test_send_email(
     account = store.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Email account not found")
+    require_resource_access(request, account.get("owner_user_id"))
     from emailing import email_sender
 
     # Pre-send quota guard. We deliberately don't enforce `hourly_send_limit`
@@ -501,8 +530,8 @@ async def test_send_email(
 async def test_inbox(
     account_id: str,
     request: Request,
-    recent_minutes: int = 10,
-    limit: int = 10,
+    recent_minutes: int = Query(default=10, ge=1, le=1440),
+    limit: int = Query(default=10, ge=1, le=100),
 ) -> dict:
     """Fetch the most recent messages from this account's inbox via Microsoft Graph.
 
@@ -514,6 +543,7 @@ async def test_inbox(
     account = store.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Email account not found")
+    require_resource_access(request, account.get("owner_user_id"))
     from datetime import datetime, timedelta, timezone
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, min(recent_minutes, 1440)))
     since_iso = cutoff.isoformat()
@@ -561,6 +591,7 @@ async def list_graph_users(request: Request) -> dict:
     to the Azure AD App.
     """
     require_api_access(request)
+    require_admin(request)
     from emailing import graph_client
     result = await graph_client.list_tenant_users(limit=200)
     if not result.get("ok"):
@@ -581,6 +612,7 @@ def bulk_add_graph_accounts(
     Existing rows with the same `from_email` are left untouched (status=exists).
     """
     require_api_access(request)
+    user = require_admin(request)
     store = get_email_store()
     settings = get_settings()
     tenant = settings.graph_tenant_id.strip()
@@ -605,6 +637,7 @@ def bulk_add_graph_accounts(
         from_name = payload.default_name.strip() if payload.default_name else email.split("@", 1)[0]
         row = {
             "id": account_id,
+            "owner_user_id": user.user_id if user and user.via == "session" else 0,
             "provider_type": "graph",
             "from_name": from_name,
             "from_email": email,

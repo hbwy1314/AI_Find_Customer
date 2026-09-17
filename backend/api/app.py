@@ -22,13 +22,13 @@ from api.automation_routes import router as automation_router
 from api.email_accounts_routes import router as email_accounts_router
 from api.email_routes import (
     CreateCampaignRequest,
-    create_email_campaign,
-    start_email_campaign,
+    _create_email_campaign_internal,
+    _start_email_campaign_internal,
 )
 from api.email_routes import (
     router as email_router,
 )
-from api.hunt_store import load_all_hunts
+from api.hunt_store import load_all_hunts, load_hunt
 from api.notifications_routes import router as notifications_router
 from api.routes import (
     HuntRequest,
@@ -91,6 +91,52 @@ def _now_iso() -> str:
 
 def _automation_worker_id() -> str:
     return f"{socket.gethostname()}:embedded-consumer"
+
+
+def _hydrate_recovered_job_payload(
+    queue: HuntJobQueue,
+    jobs: list[dict[str, Any]],
+    *,
+    updated_at: str,
+) -> int:
+    """Carry saved leads into queue jobs interrupted during a restart."""
+    hydrated = 0
+    for job in jobs:
+        hunt_id = str(job.get("last_hunt_id", "") or "")
+        if not hunt_id:
+            continue
+        hunt = load_hunt(hunt_id)
+        result = hunt.get("result") if isinstance(hunt, dict) else None
+        leads = result.get("leads") if isinstance(result, dict) else None
+        if not isinstance(leads, list) or not leads:
+            continue
+        payload = dict(job.get("payload") or {})
+        payload["existing_leads"] = [lead for lead in leads if isinstance(lead, dict)]
+        queue.update_payload(str(job["id"]), payload, updated_at=updated_at)
+        hydrated += 1
+    return hydrated
+
+
+def _release_consumer_claims_for_shutdown(queue: HuntJobQueue, *, updated_at: str) -> int:
+    """Requeue this process's active job before its tasks are cancelled."""
+    worker_id = _automation_worker_id()
+    released = 0
+    for job in queue.list_jobs(limit=1000):
+        if str(job.get("status", "") or "") != "running":
+            continue
+        if str(job.get("claimed_by", "") or "") != worker_id:
+            continue
+        queue.requeue(
+            str(job["id"]),
+            available_at=updated_at,
+            error_message="Recovered after API restart",
+            updated_at=updated_at,
+            hunt_id=str(job.get("last_hunt_id", "") or ""),
+            claim_token=str(job.get("claim_token", "") or ""),
+            worker_id=worker_id,
+        )
+        released += 1
+    return released
 
 
 def _notify_feishu(text: str) -> None:
@@ -339,7 +385,10 @@ async def _run_embedded_consumer_job(args: Namespace, payload: dict[str, object]
 
     ensure_not_cancelled()
     report("create_hunt", "Creating hunt from queue job")
-    created = await create_hunt_internal(HuntRequest(**payload))
+    created = await create_hunt_internal(
+        HuntRequest(**payload),
+        owner_user_id=int(payload.get("owner_user_id", 0) or 0),
+    )
     hunt_id = str(created.hunt_id)
     report("hunt_created", "Hunt created, waiting for execution", hunt_id=hunt_id)
     try:
@@ -401,19 +450,20 @@ async def _run_embedded_consumer_job(args: Namespace, payload: dict[str, object]
                 pinned_account_id = payload.get("email_account_id")
                 if isinstance(pinned_account_id, str):
                     pinned_account_id = pinned_account_id.strip() or None
-                created_campaign = await create_email_campaign(
+                created_campaign = await _create_email_campaign_internal(
                     hunt_id,
                     CreateCampaignRequest(
                         name=_campaign_name(args.campaign_name_prefix, hunt_id),
                         email_account_id=pinned_account_id,
                     ),
+                    owner_user_id=int(payload.get("owner_user_id", 0) or 0),
                 )
                 campaign_id = str(created_campaign.campaign_id)
                 sequence_count = int(created_campaign.sequence_count or 0)
                 if sequence_count > 0:
                     ensure_not_cancelled()
                     report("start_campaign", "Starting campaign and handing off to scheduler", hunt_id=hunt_id)
-                    campaign_summary = await start_email_campaign(campaign_id)
+                    campaign_summary = await _start_email_campaign_internal(campaign_id)
                 else:
                     report("campaign_draft", "Campaign created but no send-ready sequences were available", hunt_id=hunt_id)
                     campaign_summary = {"campaign_id": campaign_id, "status": "draft", "sequence_count": 0}
@@ -461,6 +511,8 @@ async def _run_automation_consumer_once() -> bool:
         return False
 
     job_id = str(job["id"])
+    claim_token = str(job.get("claim_token", "") or "")
+    worker_id = _automation_worker_id()
     update_worker_state(
         "consumer",
         active_job_id=job_id,
@@ -474,6 +526,8 @@ async def _run_automation_consumer_once() -> bool:
         updated_at=_now_iso(),
         progress_stage="claimed",
         progress_message="Embedded consumer claimed this queue job",
+        claim_token=claim_token,
+        worker_id=worker_id,
     )
 
     consumer_args = Namespace(
@@ -489,12 +543,20 @@ async def _run_automation_consumer_once() -> bool:
         hunt_id=str(extra.get("hunt_id", "") or ""),
         template_seed_status=extra.get("template_seed_status"),
         template_seed_source=extra.get("template_seed_source"),
+        claim_token=claim_token,
+        worker_id=worker_id,
     )
     consumer_args.cancel_check = lambda: queue.is_cancellation_requested(job_id)
 
     try:
         result = await _run_embedded_consumer_job(consumer_args, job.get("payload") or {})
-        queue.mark_completed(job_id, hunt_id=str(result["hunt_id"]), finished_at=_now_iso())
+        queue.mark_completed(
+            job_id,
+            hunt_id=str(result["hunt_id"]),
+            finished_at=_now_iso(),
+            claim_token=claim_token,
+            worker_id=worker_id,
+        )
         update_worker_state(
             "consumer",
             active_job_id="",
@@ -529,6 +591,8 @@ async def _run_automation_consumer_once() -> bool:
                 job_id,
                 error_message=f"non-retryable: {exc}",
                 finished_at=_now_iso(),
+                claim_token=claim_token,
+                worker_id=worker_id,
             )
             update_worker_state(
                 "consumer",
@@ -546,6 +610,8 @@ async def _run_automation_consumer_once() -> bool:
                 job_id,
                 error_message=f"stopped after {attempts_used} attempts: {exc}",
                 finished_at=_now_iso(),
+                claim_token=claim_token,
+                worker_id=worker_id,
             )
             update_worker_state(
                 "consumer",
@@ -568,6 +634,8 @@ async def _run_automation_consumer_once() -> bool:
                 error_message=str(exc),
                 updated_at=_now_iso(),
                 hunt_id=_extract_hunt_id_from_error(str(exc)),
+                claim_token=claim_token,
+                worker_id=worker_id,
             )
             update_worker_state(
                 "consumer",
@@ -607,9 +675,11 @@ async def _automation_consumer_loop() -> None:
 
 async def _email_scheduler_loop() -> None:
     """Poll pending email jobs and dispatch due messages."""
+    sleep_seconds = 60
     while True:
         try:
             settings = get_settings()
+            sleep_seconds = 60
             if not bool(settings.email_auto_send_enabled):
                 await asyncio.sleep(60)
                 continue
@@ -626,7 +696,7 @@ async def _email_scheduler_loop() -> None:
             raise
         except Exception:
             logger.exception("[EmailScheduler] polling iteration failed")
-        await asyncio.sleep(60)
+        await asyncio.sleep(sleep_seconds)
 
 
 async def _email_reply_loop() -> None:
@@ -636,9 +706,11 @@ async def _email_reply_loop() -> None:
     send from its own UPN, so replies land there; the loop also polls
     the global shared mailbox (Graph ``MAILBOX_UPN``) as a fallback.
     """
+    sleep_seconds = 60
     while True:
         try:
             settings = get_settings()
+            sleep_seconds = max(30, int(settings.email_reply_check_interval_seconds))
             if not bool(settings.email_reply_detection_enabled):
                 await asyncio.sleep(max(30, int(settings.email_reply_check_interval_seconds)))
                 continue
@@ -682,7 +754,7 @@ async def _email_reply_loop() -> None:
             raise
         except Exception:
             logger.exception("[EmailReply] polling iteration failed")
-        await asyncio.sleep(max(30, int(settings.email_reply_check_interval_seconds)))
+        await asyncio.sleep(sleep_seconds)
 
 
 async def _maybe_notify_reply_matches(matches: list[dict[str, str]]) -> None:
@@ -857,9 +929,27 @@ async def lifespan(app: FastAPI):
     app.state.email_store = email_store
     queue = HuntJobQueue(settings.automation_queue_db_path)
     queue.init_db()
-    recovered_jobs = queue.recover_interrupted_running_jobs(updated_at=_now_iso())
+    recovery_now = datetime.now(timezone.utc)
+    recovery_now_iso = recovery_now.isoformat()
+    interrupted_jobs = [
+        job for job in queue.list_jobs(limit=1000)
+        if str(job.get("status", "") or "") == "running"
+    ]
+    recovered_jobs = queue.recover_stale_running_jobs(updated_at=recovery_now_iso)
+    hydrated_jobs = _hydrate_recovered_job_payload(
+        queue,
+        interrupted_jobs,
+        updated_at=recovery_now_iso,
+    )
+    recovered_seed_jobs = queue.recover_stale_template_seed_jobs(
+        updated_at=recovery_now_iso,
+    )
     if recovered_jobs:
         logger.warning("[AutomationConsumer] recovered %s interrupted running job(s) after startup", recovered_jobs)
+    if hydrated_jobs:
+        logger.warning("[AutomationConsumer] restored saved leads for %s recovered job(s)", hydrated_jobs)
+    if recovered_seed_jobs:
+        logger.warning("[TemplateSeedWorker] recovered %s stale template seed job(s)", recovered_seed_jobs)
 
     # Enable Langfuse tracing if configured
     from observability.setup import setup_observability
@@ -877,11 +967,25 @@ async def lifespan(app: FastAPI):
     logger.info("[AutomationConsumer] background loop started")
     update_worker_state("consumer", enabled=_embedded_consumer_enabled(settings), running=True, worker_id=_automation_worker_id())
 
-    start_background_workers()
+    # `_email_reply_loop` above is the single canonical Graph reply scanner.
+    # Do not start the legacy per-hunt scanner as well; it repeats the same
+    # mailbox queries once per sequence and can duplicate notifications.
 
     try:
         yield
     finally:
+        try:
+            released_jobs = _release_consumer_claims_for_shutdown(
+                queue,
+                updated_at=_now_iso(),
+            )
+            if released_jobs:
+                logger.warning(
+                    "[AutomationConsumer] requeued %s active job(s) before shutdown",
+                    released_jobs,
+                )
+        except Exception:
+            logger.exception("[AutomationConsumer] failed to requeue active jobs during shutdown")
         task = getattr(app.state, "email_scheduler_task", None)
         if task:
             task.cancel()

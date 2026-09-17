@@ -38,6 +38,7 @@ export function SettingsSubPage({
     values: Record<string, string>;
     handleChange: (key: string, value: string) => void;
     isLoading: boolean;
+    saveValues: (values: Record<string, string>) => Promise<void>;
   }) => ReactNode;
   extraActions?: ReactNode;
   /**
@@ -49,15 +50,19 @@ export function SettingsSubPage({
 }) {
   const form = useSettingsForm();
   const onSave = () => {
-    const payload = stripUnchangedSecrets(form.values, SECRET_KEYS);
+    void saveValues(form.values);
+  };
+
+  const saveValues = async (values: Record<string, string>) => {
+    const payload = stripUnchangedSecrets(values, SECRET_KEYS);
     if (saveKeys && saveKeys.length) {
       const filtered: Record<string, string> = {};
       for (const k of saveKeys) {
         if (k in payload) filtered[k] = payload[k];
       }
-      form.save(filtered);
+      await form.saveAsync(filtered);
     } else {
-      form.save(payload);
+      await form.saveAsync(payload);
     }
   };
 
@@ -78,10 +83,16 @@ export function SettingsSubPage({
         </div>
       ) : (
         <>
+          {form.error || form.saveError ? (
+            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+              {form.error || form.saveError}
+            </div>
+          ) : null}
           {children({
             values: form.values,
             handleChange: form.handleChange,
             isLoading: form.isLoading,
+            saveValues,
           })}
           <div className="flex items-center justify-between gap-3 pb-8">
             <div>{extraActions}</div>

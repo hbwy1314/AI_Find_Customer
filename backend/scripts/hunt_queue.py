@@ -113,12 +113,15 @@ def run_consumer(args: argparse.Namespace) -> int:
             continue
 
         logger.info("claimed job=%s", str(job['id'])[:8])
+        claim_token = str(job.get("claim_token", "") or "")
         try:
             queue.update_progress(
                 str(job["id"]),
                 updated_at=_now_iso(),
                 progress_stage="claimed",
                 progress_message="Consumer claimed this queue job",
+                claim_token=claim_token,
+                worker_id=worker_id,
             )
             progress_args = argparse.Namespace(**vars(consumer_args))
             progress_args.progress_callback = lambda stage, message, **extra: queue.update_progress(
@@ -129,9 +132,17 @@ def run_consumer(args: argparse.Namespace) -> int:
                 hunt_id=str(extra.get("hunt_id", "") or ""),
                 template_seed_status=extra.get("template_seed_status"),
                 template_seed_source=extra.get("template_seed_source"),
+                claim_token=claim_token,
+                worker_id=worker_id,
             )
             result = run_hunt_payload(progress_args, job.get("payload") or {})
-            queue.mark_completed(str(job["id"]), hunt_id=str(result["hunt_id"]), finished_at=_now_iso())
+            queue.mark_completed(
+                str(job["id"]),
+                hunt_id=str(result["hunt_id"]),
+                finished_at=_now_iso(),
+                claim_token=claim_token,
+                worker_id=worker_id,
+            )
             logger.info("completed job=%s hunt=%s", str(job["id"])[:8], str(result["hunt_id"])[:8])
         except KeyboardInterrupt:
             raise
@@ -143,6 +154,8 @@ def run_consumer(args: argparse.Namespace) -> int:
                 error_message=str(exc),
                 updated_at=_now_iso(),
                 hunt_id=_extract_hunt_id_from_error(str(exc)),
+                claim_token=claim_token,
+                worker_id=worker_id,
             )
             logger.exception("job=%s failed and was requeued: %s", str(job["id"])[:8], exc)
             if not args.continuous:

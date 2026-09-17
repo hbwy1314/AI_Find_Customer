@@ -6,7 +6,7 @@
  * `masked` flag handling are identical — they live here.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 
@@ -50,6 +50,16 @@ export const SETTINGS_KEY_MAP: Record<string, string> = {
   EMAIL_AUTO_SEND_ENABLED: "email_auto_send_enabled",
   EMAIL_REPLY_DETECTION_ENABLED: "email_reply_detection_enabled",
   EMAIL_REPLY_CHECK_INTERVAL_SECONDS: "email_reply_check_interval_seconds",
+  EMAIL_SEQUENCE_ENABLED: "email_sequence_enabled",
+  EMAIL_STEP1_DELAY_DAYS: "email_step1_delay_days",
+  EMAIL_STEP2_DELAY_DAYS: "email_step2_delay_days",
+  EMAIL_STEP3_DELAY_DAYS: "email_step3_delay_days",
+  EMAIL_BUSINESS_HOURS_START: "email_business_hours_start",
+  EMAIL_BUSINESS_HOURS_END: "email_business_hours_end",
+  EMAIL_WEEKDAYS_ONLY: "email_weekdays_only",
+  EMAIL_TIMEZONE: "email_timezone",
+  EMAIL_DAILY_SEND_LIMIT: "email_daily_send_limit",
+  EMAIL_HOURLY_SEND_LIMIT: "email_hourly_send_limit",
   EMAIL_LLM_REQUESTS_PER_MINUTE: "email_llm_requests_per_minute",
   EMAIL_REASONING_REQUESTS_PER_MINUTE: "email_reasoning_requests_per_minute",
   EMAIL_REQUIRE_APPROVAL_BEFORE_SEND: "email_require_approval_before_send",
@@ -83,6 +93,7 @@ export const SETTINGS_KEY_MAP: Record<string, string> = {
   EMAIL_TEMPLATE_MIN_TOKEN_MATCH_RATIO: "email_template_min_token_match_ratio",
   EMAIL_TEMPLATE_FALLBACK_ENABLED: "email_template_fallback_enabled",
   EMAIL_TEMPLATE_REQUIRED_TOKENS_OVERRIDE: "email_template_required_tokens_override",
+  AUTOMATION_REPLY_NOTIFICATIONS_ENABLED: "automation_reply_notifications_enabled",
 };
 
 /** Build a `Record<frontendKey, rawValue>` from the backend masked payload. */
@@ -122,6 +133,8 @@ export function useSettingsForm() {
   const queryClient = useQueryClient();
   const [values, setValues] = useState<Record<string, string>>({});
   const [saved, setSaved] = useState(false);
+  const initializedRef = useRef(false);
+  const dirtyRef = useRef(false);
 
   const query = useQuery({
     queryKey: ["app-settings"],
@@ -129,14 +142,17 @@ export function useSettingsForm() {
   });
 
   useEffect(() => {
-    if (query.data?.settings) {
+    if (query.data?.settings && (!initializedRef.current || !dirtyRef.current)) {
       setValues(valuesFromSettings(query.data.settings));
+      initializedRef.current = true;
+      dirtyRef.current = false;
     }
   }, [query.data]);
 
   const saveMutation = useMutation({
     mutationFn: api.saveSettings,
     onSuccess: () => {
+      dirtyRef.current = false;
       setSaved(true);
       void queryClient.invalidateQueries({ queryKey: ["app-settings"] });
       setTimeout(() => setSaved(false), 3000);
@@ -144,6 +160,7 @@ export function useSettingsForm() {
   });
 
   const handleChange = (key: string, value: string) => {
+    dirtyRef.current = true;
     setValues((prev) => {
       const next = { ...prev, [key]: value };
       // Clearing the Graph "last tested at" stamp when relevant fields
@@ -163,7 +180,10 @@ export function useSettingsForm() {
     handleChange,
     isLoading: query.isLoading,
     save: saveMutation.mutate,
+    saveAsync: saveMutation.mutateAsync,
     isSaving: saveMutation.isPending,
     saved,
+    error: query.error instanceof Error ? query.error.message : "",
+    saveError: saveMutation.error instanceof Error ? saveMutation.error.message : "",
   };
 }

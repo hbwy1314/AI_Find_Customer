@@ -1,5 +1,7 @@
 """Application settings managed via pydantic-settings."""
 
+from __future__ import annotations
+
 import os
 import platform
 import sys
@@ -298,6 +300,7 @@ class Settings(BaseSettings):
     automation_consumer_max_attempts: int = 5
     automation_consumer_status_poll_seconds: int = 15
     automation_consumer_request_timeout_seconds: int = 60
+    automation_consumer_lease_seconds: int = 900
     automation_consumer_auto_start_campaign: bool = True
 
     # --- Hunt persistence ---
@@ -370,6 +373,32 @@ class Settings(BaseSettings):
                     host = urlparse(self.public_base_url).hostname or ""
                     if host:
                         self.trusted_hosts = [host]
+        return self
+
+    @model_validator(mode="after")
+    def _normalize_runtime_paths(self) -> "Settings":
+        """Keep operator-provided relative paths anchored to the backend.
+
+        A value such as ``UPLOAD_DIR=uploads`` is convenient in a .env file,
+        but using it as-is makes the process depend on its current directory.
+        Normalize it to the same location used by the built-in defaults.
+        """
+        for field in (
+            "upload_dir",
+            "hunts_dir",
+            "checkpoint_db_path",
+            "email_db_path",
+            "automation_queue_db_path",
+            "template_seed_cache_path",
+        ):
+            value = str(getattr(self, field, "") or "")
+            if value and not Path(value).is_absolute():
+                resolved = _BACKEND_ROOT / value
+                if field.endswith("_dir"):
+                    resolved.mkdir(parents=True, exist_ok=True)
+                else:
+                    resolved.parent.mkdir(parents=True, exist_ok=True)
+                setattr(self, field, str(resolved))
         return self
 
 

@@ -19,6 +19,9 @@ from config.settings import get_settings
 from emailing.scheduler import run_scheduler_once
 from emailing.store import EmailStore
 
+SCHEDULER_NOW = "2026-09-07T02:00:00+00:00"
+SCHEDULER_NOW_DT = datetime.fromisoformat(SCHEDULER_NOW)
+
 
 @pytest.fixture
 def store(tmp_path) -> EmailStore:
@@ -44,7 +47,10 @@ def _seed_full_setup(
     """Insert a minimal campaign+sequence+account and return the
     primary ``lead_email`` to use (so legacy single-recipient
     sequences still work in tests)."""
-    now = datetime.now(timezone.utc).isoformat()
+    # Keep seed messages aligned with the fixed scheduler clock used below.
+    # Using datetime.now() here makes the tests silently skip every message
+    # once the fixed execution timestamp is in the past.
+    now = SCHEDULER_NOW
     with store._connect() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO email_accounts
@@ -191,7 +197,7 @@ def test_scheduler_uses_pooled_recipient(store: EmailStore) -> None:
                 "error_type": "",
             }
 
-        result = asyncio.run(run_scheduler_once(store, sender=fake_send))
+        result = asyncio.run(run_scheduler_once(store, now_iso=SCHEDULER_NOW, sender=fake_send))
         assert result["sent"] == 1
         assert sent_to == ["pool-a@test.com"]
 
@@ -231,14 +237,12 @@ def test_scheduler_advances_after_waterfall_window(store: EmailStore) -> None:
                 }
 
             # Pass 1: send to first@test.com
-            asyncio.run(run_scheduler_once(store, sender=fake_send))
+            asyncio.run(run_scheduler_once(store, now_iso=SCHEDULER_NOW, sender=fake_send))
             assert sent_to == ["first@test.com"]
 
             # Manually rewind the recipient's sent_at so it counts as
             # past the 1-day waterfall window.
-            past = (
-                datetime.now(timezone.utc) - timedelta(days=2)
-            ).isoformat()
+            past = (SCHEDULER_NOW_DT - timedelta(days=2)).isoformat()
             with store._connect() as conn:
                 conn.execute(
                     "UPDATE lead_email_recipients SET sent_at = ? WHERE sequence_id = ?",
@@ -248,7 +252,7 @@ def test_scheduler_advances_after_waterfall_window(store: EmailStore) -> None:
             # Pass 2: scheduler should advance first → skipped, then
             # send to second@test.com.
             sent_to.clear()
-            asyncio.run(run_scheduler_once(store, sender=fake_send))
+            asyncio.run(run_scheduler_once(store, now_iso=SCHEDULER_NOW, sender=fake_send))
             assert sent_to == ["second@test.com"], f"expected second, got {sent_to}"
 
             rows = {r["email"]: r for r in store.list_recipients(seq_id)}
@@ -289,7 +293,7 @@ def test_scheduler_marks_sequence_exhausted_when_pool_empty(store: EmailStore) -
 
             # Pass 1: send. After this, the recipient is `waiting_reply`
             # and the sequence is `running` (we still hope for a reply).
-            asyncio.run(run_scheduler_once(store, sender=fake_send))
+            asyncio.run(run_scheduler_once(store, now_iso=SCHEDULER_NOW, sender=fake_send))
             assert sent_to == ["only@test.com"]
             seq = store.get_sequence(seq_id)
             assert seq["status"] == "running"
@@ -297,9 +301,7 @@ def test_scheduler_marks_sequence_exhausted_when_pool_empty(store: EmailStore) -
 
             # Rewind the recipient's sent_at past the 1-day window so
             # the next scheduler pass triggers advance + exhaustion.
-            past = (
-                datetime.now(timezone.utc) - timedelta(days=2)
-            ).isoformat()
+            past = (SCHEDULER_NOW_DT - timedelta(days=2)).isoformat()
             with store._connect() as conn:
                 conn.execute(
                     "UPDATE lead_email_recipients SET sent_at = ? WHERE sequence_id = ?",
@@ -308,7 +310,7 @@ def test_scheduler_marks_sequence_exhausted_when_pool_empty(store: EmailStore) -
 
             # Pass 2: advance flips only→skipped, finds no next
             # pending, marks the sequence exhausted.
-            asyncio.run(run_scheduler_once(store, sender=fake_send))
+            asyncio.run(run_scheduler_once(store, now_iso=SCHEDULER_NOW, sender=fake_send))
             seq = store.get_sequence(seq_id)
             assert seq["status"] == "exhausted", f"expected exhausted, got {seq['status']}"
             assert seq["stop_reason"] == "all_recipients_tried"
@@ -354,7 +356,7 @@ def test_scheduler_retires_failed_recipient_not_sequence(store: EmailStore) -> N
                 "error_type": "",
             }
 
-        result = asyncio.run(run_scheduler_once(store, sender=fake_send))
+        result = asyncio.run(run_scheduler_once(store, now_iso=SCHEDULER_NOW, sender=fake_send))
         # First call: bad → failed, good → waiting_reply (no exhaustion)
         # Both attempted in a single pass.
         assert sent_to == ["bad@test.com", "good@test.com"]
@@ -394,7 +396,7 @@ def test_waterfall_disabled_when_days_is_zero(store: EmailStore) -> None:
                 }
 
             # Send to first
-            asyncio.run(run_scheduler_once(store, sender=fake_send))
+            asyncio.run(run_scheduler_once(store, now_iso=SCHEDULER_NOW, sender=fake_send))
             assert sent_to == ["first@test.com"]
 
             # Even after 100 days, the first recipient stays waiting_reply
@@ -409,7 +411,7 @@ def test_waterfall_disabled_when_days_is_zero(store: EmailStore) -> None:
                 )
 
             sent_to.clear()
-            asyncio.run(run_scheduler_once(store, sender=fake_send))
+            asyncio.run(run_scheduler_once(store, now_iso=SCHEDULER_NOW, sender=fake_send))
             # No second send happened (scheduler didn't advance)
             assert sent_to == [], f"expected no second send, got {sent_to}"
         finally:

@@ -1,6 +1,5 @@
 const API_BASE = "/api/v1";
 const AUTH_API_BASE = "/api/auth";
-const API_ACCESS_TOKEN = import.meta.env.VITE_API_ACCESS_TOKEN?.trim() ?? "";
 const API_TIMEOUT_MS = 15000;
 const CSRF_COOKIE_NAME = "aih_csrf";
 const AUTH_REQUIRED_EVENT = "aih:auth-required";
@@ -20,9 +19,6 @@ function getCookie(name: string): string {
 
 function withApiAuth(headers?: HeadersInit, method: string = "GET"): HeadersInit {
   const base: Record<string, string> = { ...(headers as Record<string, string> | undefined ?? {}) };
-  if (API_ACCESS_TOKEN) {
-    base["X-API-Key"] = API_ACCESS_TOKEN;
-  }
   // CSRF double-submit: when cookie auth is in use, mirror aih_csrf into a header
   // for every non-GET request (the backend's CSRF check exempts the /api/auth/* paths).
   if (method && method.toUpperCase() !== "GET") {
@@ -466,6 +462,11 @@ export interface SendEmailDraftRequest {
   sequence_number: number;
 }
 
+export interface EmailDraftUpdateRequest {
+  subject: string;
+  body_text: string;
+}
+
 export interface SendEmailDraftResponse {
   hunt_id: string;
   sequence_index: number;
@@ -473,6 +474,9 @@ export interface SendEmailDraftResponse {
   sent_to: string;
   subject: string;
   status: string;
+  send_status?: string;
+  sent_at?: string;
+  provider_message_id?: string;
 }
 
 export interface DetectReplyResponse {
@@ -760,7 +764,7 @@ async function requestAuth<T>(path: string, options?: RequestInit): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${AUTH_API_BASE}${path}`, {
-      headers: { "Content-Type": "application/json" },
+      headers: withApiAuth({ "Content-Type": "application/json" }, (options?.method ?? "GET").toUpperCase()),
       credentials: "include",
       ...options,
       signal: controller.signal,
@@ -873,9 +877,7 @@ export const api = {
     request<AutomationJob>(`/automation/jobs/${jobId}`),
 
   streamAutomationJob: (jobId: string) => {
-    const suffix = API_ACCESS_TOKEN ? `?api_key=${encodeURIComponent(API_ACCESS_TOKEN)}` : "";
-    const url = `${API_BASE}/automation/jobs/${jobId}/stream${suffix}`;
-    return new EventSource(url);
+    return new EventSource(`${API_BASE}/automation/jobs/${jobId}/stream`, { withCredentials: true });
   },
 
   getAutomationJobByHunt: (huntId: string) =>
@@ -915,16 +917,36 @@ export const api = {
   getHuntResult: (huntId: string) =>
     request<HuntResult>(`/hunts/${huntId}/result`),
 
+  runHuntEmailSequences: (huntId: string) =>
+    request<HuntResponse>(`/hunts/${huntId}/email-sequences/run`, {
+      method: "POST",
+    }),
+
   listHunts: () => request<HuntListItem[]>("/hunts"),
 
   uploadFiles: async (files: File[]): Promise<UploadedFile[]> => {
     const formData = new FormData();
     files.forEach((f) => formData.append("files", f));
-    const res = await fetch(`${API_BASE}/upload`, {
-      method: "POST",
-      body: formData,
-      headers: withApiAuth(),
-    });
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/upload`, {
+        method: "POST",
+        body: formData,
+        credentials: "include",
+        headers: withApiAuth(undefined, "POST"),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new Error(`Request timed out after ${API_TIMEOUT_MS / 1000}s`);
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+    if (res.status === 401) dispatchAuthRequired();
     if (!res.ok) {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
       throw new Error(err.detail || res.statusText);
@@ -965,6 +987,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify(data),
     }),
+
+  updateEmailDraft: (
+    huntId: string,
+    sequenceIndex: number,
+    sequenceNumber: number,
+    data: EmailDraftUpdateRequest,
+  ) => request<EmailDraftUpdateRequest & {
+    hunt_id: string;
+    sequence_index: number;
+    sequence_number: number;
+    body_html: string;
+    auto_send_eligible: boolean;
+  }>(`/hunts/${huntId}/email-sequences/${sequenceIndex}/emails/${sequenceNumber}`, {
+    method: "PATCH",
+    body: JSON.stringify(data),
+  }),
 
   getSettings: () =>
     requestSettings<SettingsApiResponse>(""),
@@ -1024,8 +1062,6 @@ export const api = {
     request<EmailSequenceDetail>(`/email-sequences/${sequenceId}`),
 
   streamHunt: (huntId: string) => {
-    const suffix = API_ACCESS_TOKEN ? `?api_key=${encodeURIComponent(API_ACCESS_TOKEN)}` : "";
-    const url = `${API_BASE}/hunts/${huntId}/stream${suffix}`;
-    return new EventSource(url);
+    return new EventSource(`${API_BASE}/hunts/${huntId}/stream`, { withCredentials: true });
   },
 };

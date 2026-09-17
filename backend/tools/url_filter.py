@@ -101,6 +101,11 @@ def classify_url(url: str) -> str:
     if not domain:
         return "irrelevant"
 
+    # Special case: Google Maps URLs with cid= or place_id are valid company listings
+    if _domain_matches(domain, "google.com"):
+        if "/maps" in url.lower() or "cid=" in url or "place_id=" in url:
+            return "platform_listing"
+
     # 1. Truly irrelevant
     for d in _IRRELEVANT_DOMAINS:
         if _domain_matches(domain, d):

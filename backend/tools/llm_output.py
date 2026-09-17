@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -26,7 +25,7 @@ def clean_json(raw: str) -> str:
     - ```\\n{...}\\n```
     - Leading/trailing prose around JSON
     """
-    text = raw.strip()
+    text = raw.strip().lstrip("\ufeff")
 
     # Strip markdown code fences
     if text.startswith("```"):
@@ -40,6 +39,21 @@ def clean_json(raw: str) -> str:
         text = "\n".join(lines).strip()
 
     return text
+
+
+def _extract_json_value(text: str) -> dict | list | None:
+    """Find the first decodable JSON value without regex brace confusion."""
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (dict, list)):
+            return value
+    return None
 
 
 def parse_json(raw: str, *, context: str = "") -> dict | list | None:
@@ -68,21 +82,11 @@ def parse_json(raw: str, *, context: str = "") -> dict | list | None:
     except json.JSONDecodeError:
         pass
 
-    # Strategy 2: extract outermost JSON object {...}
-    m = re.search(r'\{.*\}', clean, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group())
-        except json.JSONDecodeError:
-            pass
-
-    # Strategy 3: extract outermost JSON array [...]
-    m = re.search(r'\[.*\]', clean, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group())
-        except json.JSONDecodeError:
-            pass
+    # Strategy 2: scan balanced JSON values. Regex extraction breaks when
+    # prose contains braces or when a JSON string contains `]`/`}`.
+    extracted = _extract_json_value(clean)
+    if extracted is not None:
+        return extracted
 
     logger.warning("[%s] Failed to parse JSON: %s", context or "parse_json", clean[:200])
     return None

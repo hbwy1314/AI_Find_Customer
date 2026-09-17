@@ -1,22 +1,24 @@
 import { createRootRoute, createRoute, redirect } from "@tanstack/react-router";
+import { lazy } from "react";
 import { RootLayout } from "./root";
-import { DashboardPage } from "./dashboard";
-import { NewHuntPage } from "./new-hunt";
-import { HuntDetailPage } from "./hunt-detail";
-import { AutomationJobPage } from "./automation-job";
-import { QuotasPage } from "./quotas";
-import { LoginPage } from "./login";
-import { SignupPage } from "./signup";
-import { SettingsLayout } from "./settings-layout";
-import { SettingsPage } from "./settings";
-import { LLMSettingsPage } from "./settings-llm";
-import { GraphSettingsPage } from "./settings-graph";
-import { SearchSettingsPage } from "./settings-search";
-import { NotificationsSettingsPage } from "./settings-notifications";
-import { PerformanceSettingsPage } from "./settings-performance";
-import { EmailTestPage } from "./settings-email-test";
-import { WorkflowSettingsPage } from "./settings-workflow";
-import { ConnectedMailboxesPage } from "./connected-mailboxes";
+
+const DashboardPage = lazy(() => import("./dashboard").then((module) => ({ default: module.DashboardPage })));
+const NewHuntPage = lazy(() => import("./new-hunt").then((module) => ({ default: module.NewHuntPage })));
+const HuntDetailPage = lazy(() => import("./hunt-detail").then((module) => ({ default: module.HuntDetailPage })));
+const AutomationJobPage = lazy(() => import("./automation-job").then((module) => ({ default: module.AutomationJobPage })));
+const QuotasPage = lazy(() => import("./quotas").then((module) => ({ default: module.QuotasPage })));
+const LoginPage = lazy(() => import("./login").then((module) => ({ default: module.LoginPage })));
+const SignupPage = lazy(() => import("./signup").then((module) => ({ default: module.SignupPage })));
+const SettingsLayout = lazy(() => import("./settings-layout").then((module) => ({ default: module.SettingsLayout })));
+const SettingsPage = lazy(() => import("./settings").then((module) => ({ default: module.SettingsPage })));
+const LLMSettingsPage = lazy(() => import("./settings-llm").then((module) => ({ default: module.LLMSettingsPage })));
+const GraphSettingsPage = lazy(() => import("./settings-graph").then((module) => ({ default: module.GraphSettingsPage })));
+const SearchSettingsPage = lazy(() => import("./settings-search").then((module) => ({ default: module.SearchSettingsPage })));
+const NotificationsSettingsPage = lazy(() => import("./settings-notifications").then((module) => ({ default: module.NotificationsSettingsPage })));
+const PerformanceSettingsPage = lazy(() => import("./settings-performance").then((module) => ({ default: module.PerformanceSettingsPage })));
+const EmailTestPage = lazy(() => import("./settings-email-test").then((module) => ({ default: module.EmailTestPage })));
+const WorkflowSettingsPage = lazy(() => import("./settings-workflow").then((module) => ({ default: module.WorkflowSettingsPage })));
+const ConnectedMailboxesPage = lazy(() => import("./connected-mailboxes").then((module) => ({ default: module.ConnectedMailboxesPage })));
 
 // All routes in this file are real pages that exist in the
 // repository. The /settings/* routes are children of a
@@ -30,19 +32,27 @@ import { ConnectedMailboxesPage } from "./connected-mailboxes";
 const KNOWN_ROUTES = new Set([
   "/",
   "/hunts/new",
-  "/automation",
   "/settings",
   "/quotas",
   "/login",
   "/signup",
 ]);
+const KNOWN_SETTINGS_ROUTES = new Set([
+  "llm",
+  "graph",
+  "search",
+  "notifications",
+  "performance",
+  "email-test",
+  "workflow",
+  "mailboxes",
+]);
 function isKnownPrefix(path: string): boolean {
   if (KNOWN_ROUTES.has(path)) return true;
-  for (const known of KNOWN_ROUTES) {
-    if (path === known || path.startsWith(known + "/")) return true;
-  }
-  if (/^\/hunts\/[^/]+/.test(path)) return true; // /hunts/$huntId
-  if (/^\/automation\/[^/]+/.test(path)) return true; // /automation/$jobId
+  const parts = path.split("/").filter(Boolean);
+  if (parts.length === 2 && parts[0] === "hunts" && parts[1] !== "new") return true;
+  if (parts.length === 2 && parts[0] === "automation" && parts[1]) return true;
+  if (parts.length === 2 && parts[0] === "settings" && KNOWN_SETTINGS_ROUTES.has(parts[1])) return true;
   return false;
 }
 
@@ -188,4 +198,3 @@ export const routeTree = rootRoute.addChildren([
     connectedMailboxesRoute,
   ]),
 ]);
-

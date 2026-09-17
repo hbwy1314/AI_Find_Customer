@@ -41,34 +41,40 @@ def _query_recent_reply_events(
     *,
     since_iso: Optional[str],
     limit: int,
+    owner_user_id: int = 0,
+    enforce_owner: bool = False,
 ) -> list[dict[str, Any]]:
     """Latest inbound replies joined to sequence/campaign/account info."""
     store = get_email_store()
     with store._connect() as conn:
+        owner_clause = " AND c.owner_user_id = ?" if enforce_owner else ""
         if since_iso:
             rows = conn.execute(
-                """
+                f"""
                 SELECT r.id, r.sequence_id, r.from_email, r.subject, r.snippet, r.received_at, r.created_at,
                        s.hunt_id, s.campaign_id, s.lead_name
                 FROM email_reply_events r
                 JOIN lead_email_sequences s ON s.id = r.sequence_id
-                WHERE r.received_at >= ?
+                JOIN email_campaigns c ON c.id = s.campaign_id
+                WHERE r.received_at >= ?{owner_clause}
                 ORDER BY r.received_at DESC
                 LIMIT ?
                 """,
-                (since_iso, int(limit)),
+                (since_iso, owner_user_id, int(limit)) if enforce_owner else (since_iso, int(limit)),
             ).fetchall()
         else:
             rows = conn.execute(
-                """
+                f"""
                 SELECT r.id, r.sequence_id, r.from_email, r.subject, r.snippet, r.received_at, r.created_at,
                        s.hunt_id, s.campaign_id, s.lead_name
                 FROM email_reply_events r
                 JOIN lead_email_sequences s ON s.id = r.sequence_id
+                JOIN email_campaigns c ON c.id = s.campaign_id
+                WHERE 1 = 1{owner_clause}
                 ORDER BY r.received_at DESC
                 LIMIT ?
                 """,
-                (int(limit),),
+                (owner_user_id, int(limit)) if enforce_owner else (int(limit),),
             ).fetchall()
     return [dict(r) for r in rows]
 
@@ -89,9 +95,14 @@ def recent_notifications(
     endpoints.
     """
     require_api_access(request)
-    require_user(request)
+    user = require_user(request)
     safe_limit = max(1, min(int(limit or 20), 100))
-    rows = _query_recent_reply_events(since_iso=since, limit=safe_limit)
+    rows = _query_recent_reply_events(
+        since_iso=since,
+        limit=safe_limit,
+        owner_user_id=user.user_id,
+        enforce_owner=user.via == "session" and user.role not in {"admin", "dev"},
+    )
     items = [
         NotificationItem(
             id=str(r.get("id", "")),

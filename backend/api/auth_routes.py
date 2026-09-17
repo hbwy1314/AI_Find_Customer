@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 from auth import users as auth_users
-from auth.security import UserCtx, optional_user
+from auth.security import UserCtx, optional_user, require_api_access
 from config.settings import get_settings
 from emailing.store import get_email_store
 
@@ -169,7 +169,7 @@ def me(ctx: UserCtx | None = Depends(optional_user)) -> dict:
     }
 
 
-@router.post("/change-password")
+@router.post("/change-password", dependencies=[Depends(require_api_access)])
 def change_password(payload: ChangePasswordRequest, request: Request) -> dict:
     """Change the current session user's password.
 
@@ -206,4 +206,9 @@ def change_password(payload: ChangePasswordRequest, request: Request) -> dict:
             detail=str(exc),
         ) from exc
     logger.info("User id=%s changed their password", row["user_id"])
-    return {"ok": True}
+    # Password rotation revokes every session, including the current one.
+    # Tell the SPA to discard both cookies so it does not keep retrying a
+    # session that the server has intentionally invalidated.
+    response = Response(content='{"ok":true,"reauthenticate":true}', media_type="application/json")
+    _clear_auth_cookies(response)
+    return response

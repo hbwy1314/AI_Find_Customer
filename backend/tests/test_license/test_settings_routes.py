@@ -250,7 +250,7 @@ class TestEmailSettings:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["webhook_url"] == "https://open.feishu.test/hook/abc"
+        assert data["webhook_url"] == "http****/abc"
         assert mock_send.called
 
     @pytest.mark.asyncio
@@ -311,10 +311,10 @@ class TestMaskHelpers:
         assert result.startswith("sk-a")
         assert result.endswith("mnop")
 
-    def test_short_value_not_masked(self):
+    def test_short_value_is_masked(self):
         from api.settings_routes import _mask
 
-        assert _mask("short") == "short"
+        assert _mask("short") == "*****"
 
     def test_is_masked_detection(self):
         from api.settings_routes import _is_masked
