@@ -16,19 +16,24 @@ import {
   Search,
   Send,
   LayoutDashboard,
+  MailX,
 } from "lucide-react";
 import type { ReactNode } from "react";
+import { useAuth } from "@/lib/auth";
 
 type NavItem = {
   to: string;
   label: string;
   icon: ReactNode;
   group?: string;
+  adminOnly?: boolean;
 };
 
 const NAV_ITEMS: NavItem[] = [
   { to: "/settings", label: "总览", icon: <LayoutDashboard className="h-4 w-4" />, group: "配置中心" },
   { to: "/settings/mailboxes", label: "邮箱账号", icon: <Inbox className="h-4 w-4" />, group: "邮件" },
+  { to: "/settings/unsubscribes", label: "退订邮箱", icon: <MailX className="h-4 w-4" />, group: "邮件", adminOnly: true },
+  { to: "/inbox", label: "统一收件箱", icon: <Inbox className="h-4 w-4" />, group: "邮件" },
   { to: "/settings/email-test", label: "邮件测试", icon: <Send className="h-4 w-4" />, group: "邮件" },
   { to: "/settings/graph", label: "Microsoft Graph", icon: <KeyRound className="h-4 w-4" />, group: "邮件" },
   { to: "/settings/llm", label: "AI 模型", icon: <Cpu className="h-4 w-4" />, group: "系统" },
@@ -60,7 +65,9 @@ function groupItems(items: NavItem[]) {
 
 export function SettingsLayout() {
   const { location } = useRouterState();
-  const groups = groupItems(NAV_ITEMS);
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin" || user?.role === "dev";
+  const groups = groupItems(NAV_ITEMS.filter((item) => !item.adminOnly || isAdmin));
 
   return (
     <div className="max-w-6xl mx-auto px-4 py-6">

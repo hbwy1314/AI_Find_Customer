@@ -26,8 +26,6 @@ export function EmailTestPage() {
   const [toEmail, setToEmail] = useState<string>("");
   const [subject, setSubject] = useState<string>("");
   const [body, setBody] = useState<string>("");
-  const [minutes, setMinutes] = useState<number>(10);
-
   const [sending, setSending] = useState(false);
   const [checking, setChecking] = useState(false);
   const [sendResult, setSendResult] = useState<
@@ -79,7 +77,7 @@ export function EmailTestPage() {
     setChecking(true);
     setInboxItems(null);
     try {
-      const res = await api.fetchTestInbox(accountId, minutes, 15);
+      const res = await api.fetchTestInbox(accountId, 15);
       setInboxItems((res as any).items ?? []);
       setInboxAt(new Date().toLocaleString());
     } catch (e) {
@@ -158,24 +156,9 @@ export function EmailTestPage() {
           />
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <div className="space-y-1.5">
-            <Label>查看最近（分钟）</Label>
-            <Input
-              type="number"
-              min={1}
-              max={1440}
-              value={minutes}
-              onChange={(e) => setMinutes(Number(e.target.value) || 10)}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label>&nbsp;</Label>
-            <p className="text-xs text-muted-foreground pt-2">
-              点击"发一封测试"会用上面配置真实发送；点击"查收件箱"会从该账号的 inbox 拉近 {minutes} 分钟的邮件。
-            </p>
-          </div>
-        </div>
+        <p className="text-xs text-muted-foreground">
+          点击“发一封测试邮件”会用上面配置真实发送；点击“查收件箱”会读取所选账号当天 00:00 至今的邮件（按系统邮件时区）。
+        </p>
 
         <div className="flex flex-wrap items-center gap-2 pt-1">
           <Button
@@ -228,12 +211,12 @@ export function EmailTestPage() {
               {selected?.from_email || "账号"} 收件箱
             </div>
             <div className="text-xs text-muted-foreground">
-              {inboxItems.length} 封（近 {minutes} 分钟） · 拉取于 {inboxAt}
+              {inboxItems.length} 封（今天） · 拉取于 {inboxAt}
             </div>
           </div>
           {inboxItems.length === 0 ? (
             <div className="px-4 py-6 text-center text-sm text-muted-foreground">
-              最近 {minutes} 分钟没有新邮件
+              今天没有新邮件
             </div>
           ) : (
             <ul className="divide-y">

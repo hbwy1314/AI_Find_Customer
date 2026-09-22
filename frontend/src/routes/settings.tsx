@@ -21,8 +21,10 @@ import {
   CircleCheck,
   CircleAlert,
   CircleDashed,
+  MailX,
 } from "lucide-react";
 import { api } from "@/api/client";
+import { useAuth } from "@/lib/auth";
 
 type SectionCard = {
   to: string;
@@ -34,6 +36,7 @@ type SectionCard = {
 };
 
 export function SettingsPage() {
+  const { user } = useAuth();
   const settingsQ = useQuery({ queryKey: ["app-settings"], queryFn: api.getSettings });
   const accountsQ = useQuery({ queryKey: ["email-accounts"], queryFn: api.listEmailAccounts });
   const graphQ = useQuery({ queryKey: ["graph-config"], queryFn: api.graphConfig });
@@ -70,6 +73,7 @@ export function SettingsPage() {
   const feishuReady = Boolean(settings.AUTOMATION_FEISHU_WEBHOOK_URL?.trim());
 
   const provider = (settings.EMAIL_PROVIDER_TYPE || "graph").toLowerCase();
+  const isAdmin = user?.role === "admin" || user?.role === "dev";
 
   const cards: SectionCard[] = [
     {
@@ -87,6 +91,12 @@ export function SettingsPage() {
       icon: <KeyRound className="h-5 w-5 text-primary" />,
       badge: graphReady ? "已配置" : "未配置",
       badgeTone: graphReady ? "ok" : "muted",
+    },
+    {
+      to: "/settings/unsubscribes",
+      title: "退订邮箱",
+      description: "查看邮件退订记录，手动维护全局禁止发送名单，或恢复误退订的邮箱。",
+      icon: <MailX className="h-5 w-5 text-primary" />,
     },
     {
       to: "/settings/llm",
@@ -150,7 +160,7 @@ export function SettingsPage() {
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2">
-        {cards.map((card) => (
+        {cards.filter((card) => card.to !== "/settings/unsubscribes" || isAdmin).map((card) => (
           <Link
             key={card.to}
             to={card.to}

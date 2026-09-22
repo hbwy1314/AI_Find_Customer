@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link, Outlet, useLocation, useNavigate, useRouter } from "@tanstack/react-router";
-import { BarChart3, Crosshair, KeyRound, LayoutDashboard, LogOut, Plus, Settings, User, X } from "lucide-react";
+import { BarChart3, Crosshair, Inbox, KeyRound, LayoutDashboard, LogOut, Plus, Settings, User, X } from "lucide-react";
 import { AuthProvider, useAuth } from "../lib/auth";
 import { NotificationBell } from "../lib/notification-bell";
 import { api, AUTH_REQUIRED_EVENT } from "../api/client";
@@ -273,6 +273,13 @@ export function RootLayout() {
                 >
                   <BarChart3 className="h-4 w-4" />
                   发送限额
+                </Link>
+                <Link
+                  to="/inbox"
+                  className="flex items-center gap-1.5 text-muted-foreground transition-colors hover:text-foreground [&.active]:text-foreground"
+                >
+                  <Inbox className="h-4 w-4" />
+                  收件箱
                 </Link>
               </nav>
               <div className="ml-auto flex items-center gap-4">

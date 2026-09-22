@@ -31,6 +31,9 @@ import {
 const SAVE_KEYS = [
   "graph_tenant_id", "graph_client_id", "graph_client_secret",
   "graph_mailbox_upn", "graph_default_scopes",
+  "email_representative_name", "email_representative_address",
+  "email_representative_reply_to", "email_shared_inbox_upn",
+  "email_inbox_sync_enabled", "email_inbox_compat_scan_enabled", "email_inbox_sync_interval_seconds",
   "email_provider_type",
   "email_auto_send_enabled",
 ];
@@ -361,16 +364,92 @@ export function GraphSettingsPage() {
             </CardContent>
           </Card>
 
-          {/* Shared mailbox */}
+          {/* Shared sender and inbox */}
           <Card>
             <CardHeader>
-              <CardTitle className="text-base">共享发件邮箱</CardTitle>
+              <CardTitle className="text-base">统一代表发件人与共享收件箱</CardTitle>
               <CardDescription>
-                所有 Graph 账号都用这个邮箱发件和查收件箱。可以是 sales@company.com，也可以是某个共享 mailbox。
+                多个 Graph 账号仍负责轮换和额度，但收件人看到统一的代表地址。实际账号必须在 Exchange 中拥有该地址的 Send As 权限。
               </CardDescription>
             </CardHeader>
-            <CardContent className="space-y-1.5">
-              <Label htmlFor="graph_mailbox_upn">共享发件邮箱 (UPN)</Label>
+            <CardContent className="space-y-4">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-1.5">
+                  <Label htmlFor="email_representative_name">统一显示名</Label>
+                  <Input
+                    id="email_representative_name"
+                    value={form.values.email_representative_name ?? ""}
+                    onChange={(e) => form.handleChange("email_representative_name", e.target.value)}
+                    placeholder="AI Hunter Sales"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="email_representative_address">统一代表发件地址</Label>
+                  <Input
+                    id="email_representative_address"
+                    type="email"
+                    value={form.values.email_representative_address ?? ""}
+                    onChange={(e) => form.handleChange("email_representative_address", e.target.value)}
+                    placeholder="sales@company.com"
+                    className="font-mono text-sm"
+                  />
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="email_representative_reply_to">统一 Reply-To（可选）</Label>
+                <Input
+                  id="email_representative_reply_to"
+                  type="email"
+                  value={form.values.email_representative_reply_to ?? ""}
+                  onChange={(e) => form.handleChange("email_representative_reply_to", e.target.value)}
+                  placeholder="留空则使用统一代表发件地址"
+                  className="font-mono text-sm"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="email_shared_inbox_upn">共享收件 Inbox UPN</Label>
+                <Input
+                  id="email_shared_inbox_upn"
+                  value={form.values.email_shared_inbox_upn ?? ""}
+                  onChange={(e) => form.handleChange("email_shared_inbox_upn", e.target.value)}
+                  placeholder="sales@company.com"
+                  className="font-mono text-sm"
+                />
+                <p className="text-xs text-muted-foreground">留空时兼容使用下方旧的 GRAPH_MAILBOX_UPN。该邮箱用于优先收件和回信检测。</p>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={(form.values.email_inbox_sync_enabled ?? "true").toLowerCase() !== "false"}
+                    onChange={(e) => form.handleChange("email_inbox_sync_enabled", e.target.checked ? "true" : "false")}
+                    className="h-4 w-4 rounded border-input"
+                  />
+                  启用收件同步与 Graph 已读检测
+                </label>
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={(form.values.email_inbox_compat_scan_enabled ?? "true").toLowerCase() !== "false"}
+                    onChange={(e) => form.handleChange("email_inbox_compat_scan_enabled", e.target.checked ? "true" : "false")}
+                    className="h-4 w-4 rounded border-input"
+                  />
+                  兼容扫描实际发件账号 Inbox
+                </label>
+                <div className="space-y-1.5">
+                  <Label htmlFor="email_inbox_sync_interval_seconds">收件同步间隔（秒）</Label>
+                  <Input
+                    id="email_inbox_sync_interval_seconds"
+                    type="number"
+                    min={30}
+                    value={form.values.email_inbox_sync_interval_seconds ?? "60"}
+                    onChange={(e) => form.handleChange("email_inbox_sync_interval_seconds", e.target.value)}
+                    className="font-mono text-sm"
+                  />
+                </div>
+              </div>
+              <div className="space-y-1.5 border-t pt-4">
+                <Label htmlFor="graph_mailbox_upn">旧版 Graph 共享邮箱 UPN</Label>
               <Input
                 id="graph_mailbox_upn"
                 value={form.values.graph_mailbox_upn ?? ""}
@@ -378,7 +457,8 @@ export function GraphSettingsPage() {
                 placeholder="sales@company.com"
                 className="font-mono text-sm"
               />
-              <p className="text-xs text-muted-foreground">该邮箱必须在申请 Mail.ReadWrite 时可访问，否则测试会 403/404。</p>
+                <p className="text-xs text-muted-foreground">兼容旧配置。新配置优先使用“共享收件 Inbox UPN”。该邮箱必须在申请 Mail.ReadWrite 时可访问，否则测试会 403/404。</p>
+              </div>
             </CardContent>
           </Card>
 

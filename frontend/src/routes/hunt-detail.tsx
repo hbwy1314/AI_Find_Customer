@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
-import { api, EmailDraft, EmailSequence, HunterContact } from "@/api/client";
+import { api, EmailDraft, EmailSequence, HuntResult, HunterContact } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -1676,6 +1676,29 @@ export function HuntDetailPage() {
   const [templateInfoView, setTemplateInfoView] = useState<"examples" | "notes" | null>(null);
   const [emailOnlyStreamNonce, setEmailOnlyStreamNonce] = useState(0);
 
+  const updateEmailSequenceLocally = useCallback(
+    (sequenceIndex: number, update: (sequence: EmailSequence) => EmailSequence) => {
+      const cachedResult = queryClient.getQueryData<HuntResult>(["hunt-result", huntId]);
+      const targetSequence = cachedResult?.email_sequences[sequenceIndex] || previewSequence;
+      const targetKey = targetSequence ? emailSequenceKey(targetSequence) : "";
+      queryClient.setQueryData<HuntResult | undefined>(["hunt-result", huntId], (current) => {
+        if (!current) return current;
+        return {
+          ...current,
+          email_sequences: current.email_sequences.map((sequence, index) =>
+            index === sequenceIndex ? update(sequence) : sequence,
+          ),
+        };
+      });
+      setRealtimeEmailSequences((current) => current.map((sequence, index) => {
+        const matchesTarget = targetKey ? emailSequenceKey(sequence) === targetKey : index === sequenceIndex;
+        return matchesTarget ? update(sequence) : sequence;
+      }));
+      setPreviewSequence((current) => (current ? update(current) : current));
+    },
+    [huntId, previewSequence, queryClient],
+  );
+
   const continueJobMutation = useMutation({
     mutationFn: ({ targetLeadCount, maxRounds, minNewLeadsThreshold, enableEmailCraft, emailTemplateExamples, emailTemplateNotes }: {
       targetLeadCount: number;
@@ -1725,30 +1748,32 @@ export function HuntDetailPage() {
   const emailDecisionMutation = useMutation({
     mutationFn: ({ sequenceIndex, decision }: { sequenceIndex: number; decision: "approved" | "rejected" }) =>
       api.decideEmailSequence(huntId, sequenceIndex, { decision }),
-    onSuccess: async () => {
+    onSuccess: async (updated, variables) => {
+      updateEmailSequenceLocally(variables.sequenceIndex, (sequence) => ({
+        ...sequence,
+        auto_send_eligible: updated.auto_send_eligible,
+        manual_review: updated.manual_review,
+      }));
       await queryClient.invalidateQueries({ queryKey: ["hunt-result", huntId] });
     },
   });
   const sendDraftMutation = useMutation({
     mutationFn: ({ sequenceIndex, sequenceNumber }: { sequenceIndex: number; sequenceNumber: number }) =>
       api.sendEmailDraft(huntId, sequenceIndex, { sequence_number: sequenceNumber }),
-    onSuccess: async (updated) => {
-      setPreviewSequence((current) => {
-        if (!current) return current;
-        return {
-          ...current,
-          emails: current.emails.map((email) =>
-            email.sequence_number === updated.sequence_number
-              ? {
-                  ...email,
-                  send_status: updated.send_status || "sent",
-                  sent_at: updated.sent_at || new Date().toISOString(),
-                  sent_to: updated.sent_to,
-                }
-              : email,
-          ),
-        };
-      });
+    onSuccess: async (updated, variables) => {
+      updateEmailSequenceLocally(variables.sequenceIndex, (sequence) => ({
+        ...sequence,
+        emails: sequence.emails.map((email) =>
+          email.sequence_number === updated.sequence_number
+            ? {
+                ...email,
+                send_status: updated.send_status || updated.status || "sent",
+                sent_at: updated.sent_at || new Date().toISOString(),
+                sent_to: updated.sent_to,
+              }
+            : email,
+        ),
+      }));
       await queryClient.invalidateQueries({ queryKey: ["hunt-result", huntId] });
     },
   });
@@ -1766,24 +1791,21 @@ export function HuntDetailPage() {
       subject: string;
       bodyText: string;
     }) => api.updateEmailDraft(huntId, sequenceIndex, sequenceNumber, { subject, body_text: bodyText }),
-    onSuccess: async (updated) => {
-      setPreviewSequence((current) => {
-        if (!current) return current;
-        return {
-          ...current,
-          auto_send_eligible: updated.auto_send_eligible,
-          manual_review: {
-            decision: "pending",
-            notes: "邮件内容已人工修改，需要重新审核",
-            updated_at: new Date().toISOString(),
-          },
-          emails: current.emails.map((email) =>
-            email.sequence_number === updated.sequence_number
-              ? { ...email, subject: updated.subject, body_text: updated.body_text, body_html: updated.body_html }
-              : email,
-          ),
-        };
-      });
+    onSuccess: async (updated, variables) => {
+      updateEmailSequenceLocally(variables.sequenceIndex, (sequence) => ({
+        ...sequence,
+        auto_send_eligible: updated.auto_send_eligible,
+        manual_review: {
+          decision: "pending",
+          notes: "邮件内容已人工修改，需要重新审核",
+          updated_at: new Date().toISOString(),
+        },
+        emails: sequence.emails.map((email) =>
+          email.sequence_number === updated.sequence_number
+            ? { ...email, subject: updated.subject, body_text: updated.body_text, body_html: updated.body_html }
+            : email,
+        ),
+      }));
       await queryClient.invalidateQueries({ queryKey: ["hunt-result", huntId] });
     },
   });
@@ -1934,11 +1956,11 @@ export function HuntDetailPage() {
         error: null,
       }));
       setShowResult(true);
-    } else if (liveStatus.status === "failed") {
+    } else if (liveStatus.status === "failed" || liveStatus.status === "cancelled") {
       setSSE((prev) => ({
         ...prev,
         status: "failed",
-        error: liveStatus.error || "任务执行失败",
+        error: liveStatus.error || (liveStatus.status === "cancelled" ? "任务已取消" : "任务执行失败"),
       }));
     }
   }, [liveStatus]);
@@ -1959,14 +1981,14 @@ export function HuntDetailPage() {
         });
         setShowResult(true);
         setInitialLoaded(true);
-      } else if (status.status === "failed") {
+      } else if (status.status === "failed" || status.status === "cancelled") {
         setSSE({
           stage: status.current_stage,
           huntRound: status.hunt_round,
           leadsCount: status.leads_count,
           emailSequencesCount: status.email_sequences_count,
           status: "failed",
-          error: status.error,
+          error: status.error || (status.status === "cancelled" ? "任务已取消" : "任务执行失败"),
         });
         setInitialLoaded(true);
       } else {

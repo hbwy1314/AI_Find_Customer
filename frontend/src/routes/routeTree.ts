@@ -19,6 +19,8 @@ const PerformanceSettingsPage = lazy(() => import("./settings-performance").then
 const EmailTestPage = lazy(() => import("./settings-email-test").then((module) => ({ default: module.EmailTestPage })));
 const WorkflowSettingsPage = lazy(() => import("./settings-workflow").then((module) => ({ default: module.WorkflowSettingsPage })));
 const ConnectedMailboxesPage = lazy(() => import("./connected-mailboxes").then((module) => ({ default: module.ConnectedMailboxesPage })));
+const InboxPage = lazy(() => import("./inbox").then((module) => ({ default: module.InboxPage })));
+const UnsubscribesPage = lazy(() => import("./unsubscribes").then((module) => ({ default: module.UnsubscribesPage })));
 
 // All routes in this file are real pages that exist in the
 // repository. The /settings/* routes are children of a
@@ -34,6 +36,7 @@ const KNOWN_ROUTES = new Set([
   "/hunts/new",
   "/settings",
   "/quotas",
+  "/inbox",
   "/login",
   "/signup",
 ]);
@@ -46,6 +49,7 @@ const KNOWN_SETTINGS_ROUTES = new Set([
   "email-test",
   "workflow",
   "mailboxes",
+  "unsubscribes",
 ]);
 function isKnownPrefix(path: string): boolean {
   if (KNOWN_ROUTES.has(path)) return true;
@@ -158,6 +162,12 @@ const connectedMailboxesRoute = createRoute({
   component: ConnectedMailboxesPage,
 });
 
+const unsubscribesRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "/unsubscribes",
+  component: UnsubscribesPage,
+});
+
 // Real login + signup pages — these existed in main and were
 // already linked from the auth flow, so just register them.
 const loginRoute = createRoute({
@@ -178,6 +188,12 @@ const quotasRoute = createRoute({
   component: QuotasPage,
 });
 
+const inboxRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/inbox",
+  component: InboxPage,
+});
+
 export const routeTree = rootRoute.addChildren([
   indexRoute,
   loginRoute,
@@ -186,6 +202,7 @@ export const routeTree = rootRoute.addChildren([
   huntDetailRoute,
   automationJobRoute,
   quotasRoute,
+  inboxRoute,
   settingsLayoutRoute.addChildren([
     settingsIndexRoute,
     llmSettingsRoute,
@@ -196,5 +213,6 @@ export const routeTree = rootRoute.addChildren([
     emailTestRoute,
     workflowSettingsRoute,
     connectedMailboxesRoute,
+    unsubscribesRoute,
   ]),
 ]);

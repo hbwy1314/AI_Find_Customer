@@ -98,8 +98,10 @@ set -e
 chown root:aihunter /opt/ai-hunter/repo/backend
 chmod 775 /opt/ai-hunter/repo/backend
 
-# 修复所有 .db 文件权限（owner 可写）
-find /opt/ai-hunter/repo/backend -maxdepth 1 -name "*.db" -type f -exec chmod 664 {} \;
+# SQLite 需要对数据库文件和其父目录都有写权限，尤其是创建 journal/WAL 文件时。
+find /opt/ai-hunter/repo/backend -maxdepth 1 \( -name "*.db" -o -name "*.db-*" \) -type f \
+  -exec chown aihunter:aihunter {} \; \
+  -exec chmod 664 {} \;
 
 # 确保 data 目录归 aihunter 所有
 if [ -d /opt/ai-hunter/repo/backend/data ]; then
@@ -123,25 +125,7 @@ echo "✓ 权限修复完成"
 REMOTE_EOF
 echo ""
 
-# 5. 清理弱身份键（公司名）
-if [ "$SKIP_BACKEND" = false ]; then
-  echo "==> [5/6] 清理全局注册表中的弱身份键..."
-  ssh "$REMOTE_HOST" bash <<'REMOTE_EOF'
-set -e
-cd /opt/ai-hunter/repo/backend
-
-# 先 dry-run 查看影响
-echo "检查需要清理的弱身份键..."
-sudo -u aihunter .venv/bin/python scripts/clean_weak_identity_keys.py --dry-run
-
-# 执行清理
-echo "执行清理..."
-sudo -u aihunter .venv/bin/python scripts/clean_weak_identity_keys.py
-
-echo "✓ 弱身份键清理完成"
-REMOTE_EOF
-  echo ""
-fi
+# 去重实时读取现存 Hunt 线索；部署不再清理合法公司名或修改历史线索。
 
 # 6. 重启服务
 if [ "$NO_RESTART" = false ]; then

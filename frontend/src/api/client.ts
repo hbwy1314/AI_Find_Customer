@@ -132,6 +132,44 @@ export interface TestInboxItem {
   conversation_id?: string;
 }
 
+export interface InboxMessage {
+  id: string;
+  owner_user_id: number;
+  mailbox_upn: string;
+  graph_message_id: string;
+  internet_message_id: string;
+  conversation_id: string;
+  in_reply_to: string;
+  references: string[];
+  from_email: string;
+  from_name: string;
+  to_recipients: Array<{ name: string; address: string }>;
+  cc_recipients: Array<{ name: string; address: string }>;
+  subject: string;
+  snippet: string;
+  body_text: string;
+  received_at: string;
+  graph_is_read: boolean;
+  graph_read_at: string;
+  site_is_read: boolean;
+  site_read_at: string;
+  matched_sequence_id: string;
+  matched_message_id: string;
+  match_status: string;
+  is_auto_reply: boolean;
+  is_ignored: boolean;
+  has_attachments: boolean;
+  web_url: string;
+  raw_ref: string;
+}
+
+export interface InboxListResponse {
+  items: InboxMessage[];
+  unread_count: number;
+  shared_inbox_upn: string;
+  compat_scan_enabled: boolean;
+}
+
 export interface NotificationItem {
   id: string;
   sequence_id: string;
@@ -141,6 +179,26 @@ export interface NotificationItem {
   subject: string;
   snippet: string;
   received_at: string;
+}
+
+export interface UnsubscribeRecord {
+  id: string;
+  email: string;
+  scope: string;
+  source: string;
+  unsubscribed_at: string;
+  created_at: string;
+}
+
+export interface UnsubscribeListResponse {
+  items: UnsubscribeRecord[];
+  total: number;
+  counts: {
+    total: number;
+    global: number;
+    campaign: number;
+    sequence: number;
+  };
 }
 
 function dispatchAuthRequired(): void {
@@ -840,10 +898,25 @@ export const api = {
         body: JSON.stringify({ to_email, subject, body }),
       },
     ),
-  fetchTestInbox: (id: string, recent_minutes: number = 10, limit: number = 10) =>
-    request<{ account_id: string; provider: string; since: string; items: TestInboxItem[] }>(
-      `/email-accounts/${id}/test-inbox?recent_minutes=${recent_minutes}&limit=${limit}`,
+  fetchTestInbox: (id: string, limit: number = 15) =>
+    request<{ account_id: string; provider: string; since: string; timezone: string; items: TestInboxItem[] }>(
+      `/email-accounts/${id}/test-inbox?limit=${limit}`,
     ),
+  listInboxMessages: (options: { unreadOnly?: boolean; matchStatus?: string; limit?: number; offset?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (options.unreadOnly) params.set("unread_only", "true");
+    if (options.matchStatus) params.set("match_status", options.matchStatus);
+    params.set("limit", String(options.limit ?? 50));
+    params.set("offset", String(options.offset ?? 0));
+    return request<InboxListResponse>(`/inbox/messages?${params.toString()}`);
+  },
+  getInboxUnreadCount: () => request<{ unread_count: number; shared_inbox_upn: string }>("/inbox/unread-count"),
+  markInboxMessageRead: (id: string, isRead: boolean, syncToGraph = false) =>
+    request<{ message: InboxMessage; graph: { updated: boolean; is_read: boolean } | null }>(`/inbox/messages/${id}/read`, {
+      method: "PATCH",
+      body: JSON.stringify({ is_read: isRead, sync_to_graph: syncToGraph }),
+    }),
+  syncInbox: () => request<Record<string, unknown>>("/inbox/sync", { method: "POST" }),
   graphConfig: () => request<GraphConfigStatus>("/email-accounts/graph/config"),
   fetchRecentNotifications: (since?: string, limit = 20) =>
     request<{ items: NotificationItem[]; unread: number; last_seen_at?: string | null }>(
@@ -857,6 +930,23 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ emails, default_name }),
     }),
+
+  listUnsubscribes: (options: { query?: string; scopeType?: string; source?: string; limit?: number; offset?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (options.query) params.set("query", options.query);
+    if (options.scopeType) params.set("scope_type", options.scopeType);
+    if (options.source) params.set("source", options.source);
+    params.set("limit", String(options.limit ?? 50));
+    params.set("offset", String(options.offset ?? 0));
+    return request<UnsubscribeListResponse>(`/unsubscribes?${params.toString()}`);
+  },
+  createUnsubscribe: (email: string) =>
+    request<{ item: UnsubscribeRecord }>("/unsubscribes", {
+      method: "POST",
+      body: JSON.stringify({ email }),
+    }),
+  deleteUnsubscribe: (id: string) =>
+    request<{ ok: boolean; id: string }>(`/unsubscribes/${id}`, { method: "DELETE" }),
 
   createHunt: (data: HuntRequest) =>
     request<HuntResponse>("/hunts", {
