@@ -103,6 +103,8 @@ packaging/tauri/node_modules/
 # ── IDE / Editor ─────────────────────────────────────────────
 .idea/
 .vscode/
+.hbuilderx/
+.codebuddy/
 *.swp
 *.swo
 *~
@@ -117,3 +119,9 @@ logs/
 
 # ── License server runtime ───────────────────────────────────
 license-server/.env
+
+# SQLite WAL sidecars (runtime, never commit)
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
