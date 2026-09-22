@@ -18,7 +18,7 @@ async def test_send_email_legacy_smtp_provider_is_coerced_to_graph(monkeypatch):
     """Old rows with provider_type='smtp' must flow through Graph (not error out)."""
     monkeypatch.setattr("emailing.graph_client._mailbox_upn", lambda: "sales@example.com")
 
-    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0):
+    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0, account=None):
         if url.endswith("/messages"):
             return (201, {"id": "m1", "internetMessageId": "<m1@x>", "conversationId": "c1"})
         return (202, "")
@@ -55,7 +55,7 @@ async def test_graph_send_uses_two_step_create_then_send(monkeypatch):
         "reply_to": "sales@example.com",
     }
 
-    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0):
+    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0, account=None):
         if method == "POST" and url.endswith("/messages"):
             return (201, {
                 "id": "AAMkAGI2TG9",
@@ -100,7 +100,7 @@ async def test_graph_send_does_not_set_message_id_header(monkeypatch):
     }
     seen_bodies: list[dict] = []
 
-    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0):
+    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0, account=None):
         if json_body:
             seen_bodies.append(json_body)
         if url.endswith("/messages"):
@@ -137,7 +137,7 @@ async def test_graph_send_create_failure_surfaces_as_error(monkeypatch):
         "reply_to": "",
     }
 
-    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0):
+    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0, account=None):
         return (401, {"error": {"code": "ErrorInvalidAuthenticationToken"}})
 
     monkeypatch.setattr("emailing.graph_client._mailbox_upn", lambda: "sales@example.com")
@@ -156,25 +156,22 @@ async def test_graph_send_create_failure_surfaces_as_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_graph_send_does_not_set_from_in_create_payload(monkeypatch):
-    """The original InvalidInternetMessageHeader error was triggered by
-    setting `from` in the create payload to an address that didn't match
-    the shared mailbox. We must NOT set `from` in the create step —
-    Graph will assign the mailbox owner itself.
+async def test_graph_send_sets_configured_representative_from(monkeypatch):
+    """The create payload must carry the configured representative identity.
+
+    The actual Graph account is still selected by the request URL, while
+    Exchange Send As permissions enforce whether the representative address
+    is usable.
     """
     account = {
         "provider_type": "graph",
         "from_name": "Ai Hunter",
-        # Note: from_email is intentionally different from the mailbox
-        # upn below. With Application permissions Graph forces the
-        # sender to the shared mailbox anyway; setting `from` here
-        # would just confuse it.
         "from_email": "alias@example.com",
         "reply_to": "",
     }
     create_payloads: list[dict] = []
 
-    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0):
+    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0, account=None):
         if method == "POST" and url.endswith("/messages"):
             if json_body:
                 create_payloads.append(json_body)
@@ -185,6 +182,22 @@ async def test_graph_send_does_not_set_from_in_create_payload(monkeypatch):
 
     monkeypatch.setattr("emailing.graph_client._mailbox_upn", lambda: "sales@example.com")
     monkeypatch.setattr("emailing.graph_client._graph_request", fake_request)
+    # Isolate from the operator's real .env: `representative_identity`
+    # prefers EMAIL_REPRESENTATIVE_ADDRESS / EMAIL_FROM_ADDRESS over the
+    # shared mailbox, which would leak local config into the assertion.
+    monkeypatch.setattr(
+        "emailing.graph_client.get_settings",
+        lambda: type("S", (), {
+            "email_representative_name": "",
+            "email_from_name": "",
+            "email_representative_address": "",
+            "email_from_address": "",
+            "email_representative_reply_to": "",
+            "email_reply_to": "",
+            "email_shared_inbox_upn": "",
+            "graph_mailbox_upn": "",
+        })(),
+    )
 
     result = await send_via_graph(
         account,
@@ -194,9 +207,7 @@ async def test_graph_send_does_not_set_from_in_create_payload(monkeypatch):
     )
     assert result["ok"] is True
     assert len(create_payloads) == 1
-    assert "from" not in create_payloads[0], (
-        f"create payload must not include `from`; got: {create_payloads[0]!r}"
-    )
+    assert create_payloads[0]["from"]["emailAddress"]["address"] == "sales@example.com"
 
 
 @pytest.mark.asyncio
@@ -212,7 +223,7 @@ async def test_graph_send_falls_back_to_sendmail_when_two_step_send_fails(monkey
         "reply_to": "",
     }
 
-    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0):
+    async def fake_request(method, url, *, json_body=None, headers=None, timeout=30.0, account=None):
         if method == "POST" and url.endswith("/messages") and "/send" not in url:
             return (201, {"id": "m1", "internetMessageId": "<m1@x>", "conversationId": "c1"})
         if method == "POST" and url.endswith("/send"):

@@ -463,6 +463,96 @@ _PLACEHOLDER_TOKENS = (
     "[company name]",
 )
 
+_BRACKET_PLACEHOLDER_RE = re.compile(r"\[[^\]\r\n]{1,120}\]")
+_EMAIL_ADDRESS_RE = re.compile(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_URL_RE = re.compile(r"\b(?:https?://|www\.)[^\s<>\]\[)]+", re.IGNORECASE)
+_LINKEDIN_RE = re.compile(r"\blinked?in(?:\.com)?\b", re.IGNORECASE)
+_CONTACT_LABEL_RE = re.compile(
+    r"\b(?:phone|mobile|telephone|tel|call|whatsapp|wechat|email|e-mail|contact)\b"
+    r"|(?:电话|手机|邮箱|电子邮件|联系我)",
+    re.IGNORECASE,
+)
+_PHONE_RE = re.compile(
+    r"(?<![\w.])(?:\+\d[\d\s().-]{6,}\d|\d[\d\s().-]{7,}\d)(?![\w.])"
+)
+
+
+def _configured_sender_contacts(settings: Any = None) -> list[str]:
+    """Return configured sender contact values that must never enter body text."""
+    if settings is None:
+        settings = get_settings()
+    values: list[str] = []
+    for field in (
+        "email_from_address",
+        "email_reply_to",
+        "email_representative_address",
+        "email_representative_reply_to",
+        "email_signature_block",
+    ):
+        value = str(getattr(settings, field, "") or "").strip()
+        if not value or value.lower().startswith("<magicmock"):
+            continue
+        if field == "email_signature_block":
+            values.extend(_EMAIL_ADDRESS_RE.findall(value))
+            values.extend(_URL_RE.findall(value))
+            values.extend(_PHONE_RE.findall(value))
+        else:
+            values.append(value)
+    return list(dict.fromkeys(item for item in values if item))
+
+
+def _email_content_policy_hits(text: str, settings: Any = None) -> list[str]:
+    """Find placeholders or sender contact details in generated email text."""
+    value = str(text or "")
+    hits: list[str] = []
+    hits.extend(f"占位符 {match}" for match in _BRACKET_PLACEHOLDER_RE.findall(value))
+    lowered = value.lower()
+    for configured in _configured_sender_contacts(settings):
+        if configured.lower() in lowered:
+            hits.append(f"发件人联系方式 {configured}")
+    if _EMAIL_ADDRESS_RE.search(value):
+        hits.append("邮箱地址")
+    if _URL_RE.search(value) or _LINKEDIN_RE.search(value):
+        hits.append("网站或 LinkedIn 地址")
+    if _PHONE_RE.search(value) and (_CONTACT_LABEL_RE.search(value) or "+" in value):
+        hits.append("电话号码")
+    return list(dict.fromkeys(hits))
+
+
+def _sanitize_sender_signature(signature: str, settings: Any = None) -> str:
+    """Keep the sender name/title while removing contact-bearing signature lines."""
+    safe_lines: list[str] = []
+    for line in str(signature or "").splitlines():
+        if not line.strip():
+            continue
+        if _email_content_policy_hits(line, settings):
+            continue
+        safe_lines.append(line.strip())
+    return "\n".join(safe_lines).strip()
+
+
+def _sanitize_email_sequence_content(
+    emails: list[dict[str, Any]],
+    settings: Any = None,
+) -> list[dict[str, Any]]:
+    """Remove unsafe placeholder/contact lines before preview or send."""
+    sanitized: list[dict[str, Any]] = []
+    for email in emails:
+        if not isinstance(email, dict):
+            sanitized.append(email)
+            continue
+        item = dict(email)
+        for field in ("subject", "body_text"):
+            raw = str(item.get(field, "") or "")
+            raw = _BRACKET_PLACEHOLDER_RE.sub("", raw)
+            lines = [
+                line for line in raw.splitlines()
+                if not _email_content_policy_hits(line, settings)
+            ]
+            item[field] = "\n".join(lines).strip()
+        sanitized.append(item)
+    return sanitized
+
 
 # Defensive localization: the locale validator prompt instructs the LLM to
 # write issues/suggestions in Simplified Chinese, but some models still
@@ -536,10 +626,10 @@ def _sender_signature(settings: Any = None) -> str:
         settings = get_settings()
     block = str(getattr(settings, "email_signature_block", "") or "").strip()
     if block:
-        return block
+        return _sanitize_sender_signature(block, settings)
     name = str(getattr(settings, "email_from_name", "") or "").strip()
     if name and not name.lower().startswith("<magicmock"):
-        return name
+        return _sanitize_sender_signature(name, settings)
     return ""
 
 
@@ -601,10 +691,15 @@ Your task: write {task_noun} for a potential buyer/distributor, then validate an
    followed by the sender signature. NEVER truncate the body mid-sentence
    or end with a dangling clause — a missing closing is a hard fail.
 8. Close every email with the sender signature given in the prompt. NEVER
-   emit placeholder tokens such as [Your Name], [Name], [Your Company] —
-   if a signature is provided, sign with it exactly.
-9. Output ONLY the JSON object — no extra text.
-10. **Product hook is mandatory.** Each email MUST anchor on at least
+    emit placeholder tokens such as [Your Name], [Name], [Your Company] —
+    if a signature is provided, sign with it exactly.
+9. NEVER include the sender's email address, phone number, website, LinkedIn,
+   WhatsApp, or any other contact details in the subject or body. The only
+   allowed closing is the sender name/title text supplied in the prompt.
+10. NEVER emit any square-bracket placeholder such as [Your Title],
+    [Your Contact Information], or [Your LinkedIn Profile or Website].
+11. Output ONLY the JSON object — no extra text.
+12. **Product hook is mandatory.** Each email MUST anchor on at least
     one concrete attribute of *our* product (a specific model, spec,
     certification, or named customer reference drawn from "## Your
     Company"). Generic claims ("high quality", "competitive pricing",
@@ -876,8 +971,8 @@ def _fallback_email_from_template(
 
     Placeholders we recognise (case-insensitive):
       {company_name} {industry} {contact_name} {contact_title}
-    Anything else stays as-is so the user can still recognise their
-    own template voice in the output.
+    Unknown square-bracket placeholders are removed rather than copied into
+    the outbound message. Contact-bearing lines are removed as well.
     """
     text = str(raw_template_example or "").strip()
     if not text:
@@ -923,7 +1018,19 @@ def _fallback_email_from_template(
         if value and needle.lower() in subject_line.lower():
             subject_line = re.sub(re.escape(needle), value, subject_line, flags=re.IGNORECASE)
 
-    return _email_dict_with_html({
+    # Resolve only unambiguous recipient placeholders. Sender placeholders
+    # such as [Your Title] or [Your Contact Information] must never be guessed.
+    for pattern, value in (
+        (r"\[(?:lead|target|recipient)\s+company(?:\s+name)?\]", lead_company),
+        (r"\[(?:lead|target|recipient)\s+industry\]", lead_industry),
+        (r"\[(?:contact|recipient)\s+name\]", target_name),
+        (r"\[(?:contact|recipient)\s+title\]", target_title),
+    ):
+        if value:
+            body_text = re.sub(pattern, value, body_text, flags=re.IGNORECASE)
+            subject_line = re.sub(pattern, value, subject_line, flags=re.IGNORECASE)
+
+    cleaned = _sanitize_email_sequence_content([{
         "subject": subject_line,
         "body_text": body_text,
         "suggested_send_day": 0,
@@ -931,17 +1038,27 @@ def _fallback_email_from_template(
         "personalization_points": [p for p in (lead_company, lead_industry, target_title) if p],
         "_template_fallback": True,
         "locale": fallback_locale,
+    }])[0]
+    if not str(cleaned.get("subject", "") or "").strip():
+        cleaned["subject"] = fallback_subject or "Quick note"
+    return _email_dict_with_html({
+        **cleaned,
     }, locale=fallback_locale)
 
 
-def _email_dict_with_html(email: dict[str, Any], locale: str | None = None) -> dict[str, Any]:
+def _email_dict_with_html(
+    email: dict[str, Any],
+    locale: str | None = None,
+    recipient: str = "",
+) -> dict[str, Any]:
     """Return ``email`` with a ``body_html`` key derived from
     ``body_text`` via :func:`emailing.html_format.plaintext_to_html`.
 
     Used by every code path that constructs an email-dict (template
     fallback, validator output, and the per-lead craft pipeline) so
     the in-product preview can render the same HTML the recipient
-    will actually see. The ``locale`` argument drives the
+    will actually see. When ``recipient`` is provided, the preview
+    contains a real recipient-bound unsubscribe token. The ``locale`` argument drives the
     unsubscribe-card language (defaults to the email's own locale
     field if absent). Imports are local so this helper is safe to
     call from the validator/template hot paths without pulling in
@@ -949,19 +1066,33 @@ def _email_dict_with_html(email: dict[str, Any], locale: str | None = None) -> d
     """
     if not isinstance(email, dict):
         return email
-    if "body_html" in email and email["body_html"]:
+    if "body_html" in email and email["body_html"] and not recipient:
         # Already rendered (e.g. by the per-lead craft pipeline which
         # runs the full ReAct loop). Leave it alone.
         return email
     if not email.get("body_text"):
         return email
-    from emailing.html_format import render_preview_html
+    from emailing.html_format import prepare_send_html, render_preview_html
     out = dict(email)
     effective_locale = locale or out.get("locale") or None
-    out["body_html"] = render_preview_html(
-        str(out.get("body_text") or ""),
+    body_text = str(out.get("body_text") or "")
+    body_html = str(out.get("body_html") or "") or render_preview_html(
+        body_text,
         locale=str(effective_locale) if effective_locale else None,
     )
+    recipient_norm = str(recipient or "").strip().lower()
+    if recipient_norm:
+        from emailing.unsubscribe import build_unsubscribe_url, issue_token
+
+        base = str(get_settings().public_base_url or "").strip() or "https://api.nineluan.com"
+        unsubscribe_url = build_unsubscribe_url(base, issue_token(recipient_norm))
+        body_html = prepare_send_html(
+            body_text,
+            body_html,
+            unsubscribe_url,
+            locale=str(effective_locale) if effective_locale else None,
+        )
+    out["body_html"] = body_html
     return out
 
 
@@ -1161,6 +1292,7 @@ def _rule_validate_emails_payload(
     # LLM produced.
     issues: list[str] = []
     suggestions: list[str] = []
+    settings = get_settings()
 
     specs = _active_step_specs(steps)
     expected = [(spec["email_type"], spec["suggested_send_day"]) for spec in specs]
@@ -1187,13 +1319,16 @@ def _rule_validate_emails_payload(
 
         lowered_body = body.lower()
         lowered_subject = str(em.get("subject", "") or "").lower()
-        placeholder_hits = [t for t in _PLACEHOLDER_TOKENS if t in lowered_body or t in lowered_subject]
-        if placeholder_hits:
+        policy_hits = _email_content_policy_hits(
+            f"{em.get('subject', '')}\n{body}",
+            settings,
+        )
+        if policy_hits:
             issues.append(
-                f"第 {i + 1} 封：包含占位文本（{', '.join(placeholder_hits)}）"
+                f"第 {i + 1} 封：包含占位符或发件人联系方式（{', '.join(policy_hits)}）"
             )
             suggestions.append(
-                f"第 {i + 1} 封：请用 prompt 中真实的发件人签名替换占位"
+                f"第 {i + 1} 封：删除所有方括号占位符和发件人联系方式，仅保留发件人姓名/职位"
             )
         if not any(token in lowered_body for token in ["you", "your", "您", "贵公司", "votre", "ihr", "su ", "sua ", "vos", "tu empresa"]):
             issues.append(f"第 {i + 1} 封：缺少面向买方的明确表达")
@@ -1797,6 +1932,7 @@ def _review_email_sequence(
     score = 100
     issues: list[str] = []
     suggestions: list[str] = []
+    settings = get_settings()
 
     # The size check ("序列需要恰好包含 N 封") is intentionally omitted:
     # the LLM is free to ship 1, 2, or N emails per sequence. We still
@@ -1841,6 +1977,13 @@ def _review_email_sequence(
                 issues.append(f"第 {index + 1} 封的发送日应为 {required_days[index]}。")
 
         lowered_subject = subject.lower()
+        policy_hits = _email_content_policy_hits(f"{subject}\n{body}", settings)
+        if policy_hits:
+            score -= 30
+            issues.append(
+                f"第 {index + 1} 封包含占位符或发件人联系方式（{', '.join(policy_hits)}）。"
+            )
+            suggestions.append("删除所有方括号占位符、邮箱、电话、网站和 LinkedIn 地址。")
         if previous_subject and lowered_subject == previous_subject:
             score -= 8
             issues.append(f"第 {index + 1} 封的主题与上一封重复。")
@@ -2046,6 +2189,7 @@ async def _craft_for_lead(
     react_max_iterations: int = 3,
     hunt_id: str = "",
     hunt_round: int = 0,
+    hunter_cache: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict | None:
     """Generate an N-step email sequence for a single lead using a ReAct loop.
 
@@ -2068,9 +2212,20 @@ async def _craft_for_lead(
         # the discovered contacts to the lead dict — they live in the
         # returned ``hunter_contacts`` field for the UI / prompt and
         # for the per-lead waterfall pool.
+        #
+        # Per-hunt domain cache: leads sharing a domain (e.g. multiple
+        # branches of the same company) only pay one Hunter quota. The
+        # cache is keyed by domain and scoped to a single hunt so it
+        # never leaks across user sessions.
         hunter_contacts: list[dict[str, Any]] = []
         if not lead.get("decision_makers"):
-            hunter_contacts = await _enrich_lead_with_hunter(lead)
+            domain = _domain_from_url(str(lead.get("website") or "").strip()) if hunter_cache is not None else ""
+            if domain and hunter_cache is not None and domain in hunter_cache:
+                hunter_contacts = list(hunter_cache[domain])
+            else:
+                hunter_contacts = await _enrich_lead_with_hunter(lead)
+                if domain and hunter_cache is not None:
+                    hunter_cache[domain] = list(hunter_contacts)
         effective_lead = lead
         if hunter_contacts:
             # Mutate a shallow copy so the in-memory state across
@@ -2102,15 +2257,32 @@ async def _craft_for_lead(
             lead = effective_lead
         settings = get_settings()
         default_locale = _get_locale(lead.get("country_code", ""))
-        language_choice = await _select_email_language(
-            lead,
-            target,
-            llm,
-            default_locale=default_locale,
-            language_mode=settings.email_language_mode,
-            default_language=settings.email_default_language,
-            fallback_language=settings.email_fallback_language,
-        )
+        # Language selection short-circuit: when the operator has pinned a
+        # deterministic mode (``manual`` or ``english_only``), the rules in
+        # ``_fallback_language_choice`` already produce the correct answer
+        # without an LLM. Skipping the LLM here saves one call per lead —
+        # the original behaviour called it unconditionally and then ignored
+        # the answer whenever the fallback path would have given the same
+        # verdict (which is what these two modes always do).
+        language_mode = settings.email_language_mode
+        if language_mode in ("manual", "english_only"):
+            language_choice = _fallback_language_choice(
+                lead,
+                default_locale=default_locale,
+                language_mode=language_mode,
+                default_language=settings.email_default_language,
+                fallback_language=settings.email_fallback_language,
+            )
+        else:
+            language_choice = await _select_email_language(
+                lead,
+                target,
+                llm,
+                default_locale=default_locale,
+                language_mode=language_mode,
+                default_language=settings.email_default_language,
+                fallback_language=settings.email_fallback_language,
+            )
         locale = str(language_choice.get("chosen_locale", default_locale) or default_locale)
         company_name = insight.get("company_name", "Our Company")
         products = ", ".join(insight.get("products", []))
@@ -2260,7 +2432,9 @@ async def _craft_for_lead(
             return None
 
         emails = format_email_sequence_bodies(
-            validated["emails"], locale=locale, signature=signature
+            _sanitize_email_sequence_content(validated["emails"], settings),
+            locale=locale,
+            signature=signature,
         )
         # Resolve template-adherence expectations up-front so we pass
         # the same set to the initial review and to any auto-improve
@@ -2299,7 +2473,10 @@ async def _craft_for_lead(
             min_token_match_ratio=min_token_match_ratio,
         )
         emails = format_email_sequence_bodies(
-            list(optimized_sequence.get("emails", []) or emails),
+            _sanitize_email_sequence_content(
+                list(optimized_sequence.get("emails", []) or emails),
+                settings,
+            ),
             locale=locale,
             signature=signature,
         )
@@ -2337,7 +2514,9 @@ async def _craft_for_lead(
                         min_token_match_ratio * 100,
                     )
                     emails = format_email_sequence_bodies(
-                        fallback_emails, locale=locale, signature=signature
+                        _sanitize_email_sequence_content(fallback_emails, settings),
+                        locale=locale,
+                        signature=signature,
                     )
                     template_fallback_used = True
                     # Re-score the fallback so the rest of the pipeline
@@ -2362,7 +2541,11 @@ async def _craft_for_lead(
         # The body_html field is what the scheduler also uses as a
         # starting point at send time (it just swaps the placeholder
         # URL for the real per-recipient token).
-        enriched_emails = [_email_dict_with_html(e, locale=locale) for e in (emails or [])]
+        recipient = str(target.get("target_email", "") or "").strip().lower()
+        enriched_emails = [
+            _email_dict_with_html(e, locale=locale, recipient=recipient)
+            for e in (emails or [])
+        ]
 
         return {
             "lead": lead,
@@ -2381,6 +2564,164 @@ async def _craft_for_lead(
             "auto_send_eligible": _review_allows_send(review_summary, settings),
             "hunter_contacts": hunter_contacts,
         }
+
+
+# ── Template-pool batch helpers ──────────────────────────────────────────────
+#
+# Extracted from ``email_craft_node``'s template-mode branch so the
+# per-member personalize+review+autofix chain can be ``asyncio.gather``-ed
+# across a batch instead of being awaited serially inside a ``for`` loop.
+# Previously 100 leads × ~3 LLM calls each = ~300 sequential LLM calls; with
+# the semaphore these now run concurrently up to ``email_gen_concurrency``.
+
+
+def _build_template_applied(
+    template_result: dict[str, Any],
+    member: tuple[dict[str, Any], dict[str, str], list[dict[str, str]]],
+    *,
+    version_group: str,
+    base_group: str,
+    template_index: int,
+    template_assigned_count: int,
+    template_max_send_count: int,
+) -> dict[str, Any]:
+    """Clone the seed template result into a per-lead ``applied`` dict.
+
+    Pure synchronous helper — uses ``copy.deepcopy`` so each invocation
+    returns an independent dict that's safe to mutate concurrently.
+    """
+    lead, _t, targets = member
+    applied = _apply_template_to_lead(
+        template_result,
+        lead=lead,
+        target=_t,
+        template_group=version_group,
+        template_index=template_index,
+        template_assigned_count=template_assigned_count,
+        template_max_send_count=template_max_send_count,
+    )
+    applied["template_group_base"] = base_group
+    applied["targets"] = targets
+    return applied
+
+
+async def _personalize_template_member(
+    llm: LLMTool,
+    settings: Any,
+    *,
+    applied: dict[str, Any],
+    lead: dict[str, Any],
+    target: dict[str, str],
+    insight: dict[str, Any],
+) -> dict[str, Any]:
+    """Personalize + review + auto-improve one cloned template member.
+
+    Mirrors the original ``index > 1`` branch exactly so the externally
+    observable sequence output is byte-identical when inputs match.
+    """
+    personalized = await _personalize_template_sequence(
+        llm,
+        base_sequence=applied,
+        lead=lead,
+        target=target,
+        insight=insight,
+    )
+    if not isinstance(personalized, dict):
+        return applied
+    validated = validate_dict(
+        personalized,
+        EMAIL_SEQUENCE_REQUIRED,
+        defaults=EMAIL_SEQUENCE_DEFAULTS,
+        context="EmailCraftTemplatePersonalizer",
+    )
+    if validated is None or not validated.get("emails"):
+        return applied
+
+    applied["emails"] = validated["emails"]
+    locale = str(applied.get("locale", "en_US") or "en_US")
+    review_summary = _review_email_sequence(
+        lead,
+        locale=locale,
+        emails=validated["emails"],
+        template_profile=applied.get("template_profile", {}) or {},
+        template_plan=applied.get("template_plan", {}) or {},
+        min_score=int(settings.email_review_min_score or 75),
+        max_blocking_issues=int(settings.email_review_max_blocking_issues or 0),
+    )
+    optimized_sequence, review_summary, review_optimization = await _auto_improve_reviewed_sequence(
+        llm,
+        locale=locale,
+        rules=_get_locale_rules(locale),
+        user_prompt=(
+            f"Personalize this approved template sequence for {lead.get('company_name', '')} "
+            f"and the chosen contact {target.get('target_name', '')} <{target.get('target_email', '')}>."
+        ),
+        current_sequence={
+            "locale": locale,
+            "emails": validated["emails"],
+        },
+        lead=lead,
+        template_profile=applied.get("template_profile", {}) or {},
+        template_plan=applied.get("template_plan", {}) or {},
+        min_score=int(settings.email_review_min_score or 75),
+        max_blocking_issues=int(settings.email_review_max_blocking_issues or 0),
+        validation_max_revisions=max(0, int(getattr(settings, "email_validation_max_revisions", 2) or 2)),
+        max_rounds=max(0, int(getattr(settings, "email_review_auto_fix_rounds", 2) or 2)),
+    )
+    applied["emails"] = format_email_sequence_bodies(
+        list(optimized_sequence.get("emails", []) or validated["emails"]),
+        locale=locale,
+        signature=str(applied.get("signature", "") or "") or None,
+    )
+    applied["review_summary"] = review_summary
+    applied["validation_summary"] = {
+        "passed": review_summary["status"] == "approved",
+        "status": review_summary["status"],
+        "issues": list(review_summary.get("issues", [])),
+        "suggestions": list(review_summary.get("suggestions", [])),
+    }
+    applied["review_status"] = review_summary["status"]
+    applied["review_optimization"] = review_optimization
+    applied["auto_send_eligible"] = _review_allows_send(review_summary, settings)
+    applied["generation_mode"] = "template_pool_personalized"
+    return applied
+
+
+def _finalize_applied_sequence(
+    applied: dict[str, Any],
+    settings: Any,
+) -> dict[str, Any]:
+    """Tail processing: sanitize, strip ``body_html``, attach HTML body.
+
+    Idempotent for any ``applied`` whose ``emails`` already came through the
+    ``applied["emails"] = format_email_sequence_bodies(...)`` assignment
+    inside ``_personalize_template_member``. Safe to call on a seed
+    sequence (index=1) too because ``_sanitize_email_sequence_content``
+    is content-stable.
+    """
+    locale = str(applied.get("locale", "en_US") or "en_US")
+    applied["emails"] = format_email_sequence_bodies(
+        _sanitize_email_sequence_content(
+            list(applied.get("emails", []) or []),
+            settings,
+        ),
+        locale=locale,
+        signature=_sender_signature(settings),
+    )
+    for email in applied["emails"]:
+        if isinstance(email, dict):
+            email.pop("body_html", None)
+    applied["emails"] = [
+        _email_dict_with_html(
+            email,
+            locale=locale,
+            recipient=str(
+                (applied.get("target") or {}).get("target_email", "") or ""
+            ).strip().lower(),
+        )
+        for email in applied["emails"]
+    ]
+    return applied
 
 
 async def email_craft_node(state: HuntState) -> dict:
@@ -2411,6 +2752,19 @@ async def email_craft_node(state: HuntState) -> dict:
     email_template_notes = str(state.get("email_template_notes", "") or "")
     prepared_template_seed = state.get("template_seed") if isinstance(state.get("template_seed"), dict) else None
     progress_callback = state.get("email_progress_callback")
+    # Per-hunt domain → Hunter.io contacts cache. Multiple leads sharing a
+    # domain (multi-branch companies, deduplicated variants) only pay one
+    # Hunter quota. Scoped to this hunt so cross-session leakage is impossible.
+    hunter_cache: dict[str, list[dict[str, Any]]] = {}
+
+    def ensure_not_cancelled() -> None:
+        if not hunt_id:
+            return
+        from api.hunt_store import load_hunt
+        hunt = load_hunt(hunt_id)
+        if isinstance(hunt, dict) and hunt.get("cancel_requested"):
+            from api.routes import HuntCancelledError
+            raise HuntCancelledError(str(hunt.get("cancel_reason") or "Cancelled by user"))
 
     def report_progress(completed: int, generated: int, sequence: dict[str, Any] | None = None) -> None:
         if callable(progress_callback):
@@ -2429,6 +2783,7 @@ async def email_craft_node(state: HuntState) -> dict:
     if _personalize_per_lead_enabled(settings):
         craft_items: list[tuple[dict[str, Any], dict[str, str], list[dict[str, str]]]] = []
         for lead in leads:
+            ensure_not_cancelled()
             target = choose_email_target(lead)
             if not target.get("target_email"):
                 logger.info("[EmailCraftAgent] Skipping %s — no sendable email target", lead.get("company_name"))
@@ -2448,6 +2803,7 @@ async def email_craft_node(state: HuntState) -> dict:
                 react_max_iterations=settings.react_max_iterations,
                 hunt_id=hunt_id,
                 hunt_round=hunt_round,
+                hunter_cache=hunter_cache,
             )
             if result is None:
                 return None
@@ -2458,11 +2814,13 @@ async def email_craft_node(state: HuntState) -> dict:
         results: list[dict[str, Any] | None] = []
         try:
             async def _indexed_craft(index: int, item: tuple[dict[str, Any], dict[str, str], list[dict[str, str]]]) -> tuple[int, dict[str, Any] | None]:
+                ensure_not_cancelled()
                 return index, await _craft_personalized(item)
 
             ordered_results: list[dict[str, Any] | None] = [None] * len(craft_items)
             tasks = [asyncio.create_task(_indexed_craft(index, item)) for index, item in enumerate(craft_items)]
             for task in asyncio.as_completed(tasks):
+                ensure_not_cancelled()
                 index, result = await task
                 ordered_results[index] = result
                 results.append(result)
@@ -2483,6 +2841,7 @@ async def email_craft_node(state: HuntState) -> dict:
 
     grouped_leads: dict[str, list[tuple[dict[str, Any], dict[str, str]]]] = {}
     for lead in leads:
+        ensure_not_cancelled()
         target = choose_email_target(lead)
         if not target.get("target_email"):
             logger.info("[EmailCraftAgent] Skipping %s — no sendable email target", lead.get("company_name"))
@@ -2506,6 +2865,7 @@ async def email_craft_node(state: HuntState) -> dict:
             react_max_iterations=settings.react_max_iterations,
             hunt_id=hunt_id,
             hunt_round=hunt_round,
+            hunter_cache=hunter_cache,
         )
         return group_key, result
 
@@ -2530,80 +2890,68 @@ async def email_craft_node(state: HuntState) -> dict:
                 continue
             base_group = version_group.rsplit("|v", 1)[0]
             template_assigned_count = len(members)
-            for index, (lead, target, targets) in enumerate(members, start=1):
-                applied = _apply_template_to_lead(
-                    template_result,
-                    lead=lead,
-                    target=target,
-                    template_group=version_group,
-                    template_index=index,
-                    template_assigned_count=template_assigned_count,
-                    template_max_send_count=template_max_send_count,
-                )
-                applied["template_group_base"] = base_group
-                applied["targets"] = targets
-                if index > 1:
-                    personalized = await _personalize_template_sequence(
+
+            # ── index=1 (seed) ────────────────────────────────────────────
+            # The seed lead uses the template result directly — no
+            # personalize / review / auto-improve round-trip needed.
+            seed_applied = _build_template_applied(
+                template_result,
+                members[0],
+                version_group=version_group,
+                base_group=base_group,
+                template_index=1,
+                template_assigned_count=template_assigned_count,
+                template_max_send_count=template_max_send_count,
+            )
+            finalized_seed = _finalize_applied_sequence(seed_applied, settings)
+            email_sequences.append(finalized_seed)
+            report_progress(len(email_sequences), 1, finalized_seed)
+
+            # ── index>=2 (batch) ──────────────────────────────────────────
+            # Previously awaited serially inside a ``for`` loop, which
+            # made the per-lead LLM cost stack up at ~3 calls × batch_size.
+            # Now we run all members of one version_group concurrently
+            # under the shared ``semaphore`` (so total in-flight calls
+            # still respect ``email_gen_concurrency`` across all
+            # version_groups).
+            if len(members) <= 1:
+                continue
+
+            async def _personalize_one_batch_member(
+                template_index: int,
+                member: tuple[dict[str, Any], dict[str, str], list[dict[str, str]]],
+            ) -> dict[str, Any]:
+                async with semaphore:
+                    lead, target, _targets = member
+                    applied = _build_template_applied(
+                        template_result,
+                        member,
+                        version_group=version_group,
+                        base_group=base_group,
+                        template_index=template_index,
+                        template_assigned_count=template_assigned_count,
+                        template_max_send_count=template_max_send_count,
+                    )
+                    applied = await _personalize_template_member(
                         llm,
-                        base_sequence=applied,
+                        settings,
+                        applied=applied,
                         lead=lead,
                         target=target,
                         insight=insight,
                     )
-                    if isinstance(personalized, dict):
-                        validated = validate_dict(
-                            personalized,
-                            EMAIL_SEQUENCE_REQUIRED,
-                            defaults=EMAIL_SEQUENCE_DEFAULTS,
-                            context="EmailCraftTemplatePersonalizer",
-                        )
-                        if validated is not None and validated.get("emails"):
-                            applied["emails"] = validated["emails"]
-                            review_summary = _review_email_sequence(
-                                lead,
-                                locale=str(applied.get("locale", "en_US") or "en_US"),
-                                emails=validated["emails"],
-                                template_profile=applied.get("template_profile", {}) or {},
-                                template_plan=applied.get("template_plan", {}) or {},
-                                min_score=int(settings.email_review_min_score or 75),
-                                max_blocking_issues=int(settings.email_review_max_blocking_issues or 0),
-                            )
-                            optimized_sequence, review_summary, review_optimization = await _auto_improve_reviewed_sequence(
-                                llm,
-                                locale=str(applied.get("locale", "en_US") or "en_US"),
-                                rules=_get_locale_rules(str(applied.get("locale", "en_US") or "en_US")),
-                                user_prompt=(
-                                    f"Personalize this approved template sequence for {lead.get('company_name', '')} "
-                                    f"and the chosen contact {target.get('target_name', '')} <{target.get('target_email', '')}>."
-                                ),
-                                current_sequence={
-                                    "locale": str(applied.get("locale", "en_US") or "en_US"),
-                                    "emails": validated["emails"],
-                                },
-                                lead=lead,
-                                template_profile=applied.get("template_profile", {}) or {},
-                                template_plan=applied.get("template_plan", {}) or {},
-                                min_score=int(settings.email_review_min_score or 75),
-                                max_blocking_issues=int(settings.email_review_max_blocking_issues or 0),
-                                validation_max_revisions=max(0, int(getattr(settings, "email_validation_max_revisions", 2) or 2)),
-                                max_rounds=max(0, int(getattr(settings, "email_review_auto_fix_rounds", 2) or 2)),
-                            )
-                            applied["emails"] = format_email_sequence_bodies(
-                                list(optimized_sequence.get("emails", []) or validated["emails"]),
-                                locale=str(applied.get("locale", "en_US") or "en_US"),
-                                signature=str(applied.get("signature", "") or "") or None,
-                            )
-                            applied["review_summary"] = review_summary
-                            applied["validation_summary"] = {
-                                "passed": review_summary["status"] == "approved",
-                                "status": review_summary["status"],
-                                "issues": list(review_summary.get("issues", [])),
-                                "suggestions": list(review_summary.get("suggestions", [])),
-                            }
-                            applied["review_status"] = review_summary["status"]
-                            applied["review_optimization"] = review_optimization
-                            applied["auto_send_eligible"] = _review_allows_send(review_summary, settings)
-                            applied["generation_mode"] = "template_pool_personalized"
+                    return _finalize_applied_sequence(applied, settings)
+
+            ensure_not_cancelled()
+            batch_tasks = [
+                asyncio.create_task(_personalize_one_batch_member(template_index, member))
+                for template_index, member in enumerate(members[1:], start=2)
+            ]
+            # ``asyncio.gather`` returns results in submission order, so the
+            # final ``email_sequences`` list keeps the same per-version-group
+            # ordering the previous serial loop produced.
+            batch_results = await asyncio.gather(*batch_tasks)
+            for applied in batch_results:
                 email_sequences.append(applied)
                 report_progress(len(email_sequences), 1, applied)
     finally:

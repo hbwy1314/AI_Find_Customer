@@ -13,16 +13,33 @@ identity; the user is identified by the email baked into the token.
 from __future__ import annotations
 
 import logging
+import re
 from html import escape as html_escape
+from typing import Any
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from pydantic import BaseModel, Field
 
+from api.security import require_admin, require_api_access
 from emailing.store import get_email_store
 from emailing.unsubscribe import token_hash, verify_token
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class CreateUnsubscribeRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+def _normalize_email(value: str) -> str:
+    email = str(value or "").strip().lower()
+    if not _EMAIL_RE.fullmatch(email):
+        raise HTTPException(status_code=422, detail="请输入有效的邮箱地址")
+    return email
 
 
 _HTML_TEMPLATE = """<!doctype html>
@@ -130,3 +147,54 @@ def unsubscribe_post(token: str) -> Response:
         # try to render the HTML.
         return Response(status_code=200, content="", media_type="text/plain")
     return _render(title, body, status=status)
+
+
+@router.get(
+    "/api/v1/unsubscribes",
+    dependencies=[Depends(require_api_access), Depends(require_admin)],
+)
+def list_unsubscribes(
+    query: str = Query(default="", max_length=320),
+    scope_type: str = Query(default="", pattern="^(|all|campaign|sequence)$"),
+    source: str = Query(default="", max_length=40),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """List suppression records for the administrator management page."""
+    return get_email_store().search_unsubscribes(
+        query=query,
+        scope_type=scope_type,
+        source=source,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post(
+    "/api/v1/unsubscribes",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_api_access), Depends(require_admin)],
+)
+def create_unsubscribe(payload: CreateUnsubscribeRequest) -> dict[str, Any]:
+    """Manually add an address to the global suppression list."""
+    store = get_email_store()
+    email = _normalize_email(payload.email)
+    unsubscribe_id = store.record_unsubscribe(
+        email=email,
+        scope="all",
+        source="manual",
+    )
+    row = store.get_unsubscribe(unsubscribe_id)
+    return {"item": row or {"id": unsubscribe_id, "email": email, "scope": "all", "source": "manual"}}
+
+
+@router.delete(
+    "/api/v1/unsubscribes/{unsubscribe_id}",
+    dependencies=[Depends(require_api_access), Depends(require_admin)],
+)
+def delete_unsubscribe(unsubscribe_id: str) -> dict[str, Any]:
+    """Remove one suppression record; historical stopped sequences stay stopped."""
+    deleted = get_email_store().delete_unsubscribe(unsubscribe_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="退订记录不存在")
+    return {"ok": True, "id": unsubscribe_id}

@@ -43,15 +43,21 @@ def provider_type(settings: Any) -> str:
 
 
 def graph_readiness(settings: Any) -> dict[str, Any]:
+    mailbox_upn = str(
+        getattr(settings, "email_shared_inbox_upn", "")
+        or getattr(settings, "graph_mailbox_upn", "")
+        or ""
+    ).strip()
     missing = _missing_fields(
         settings,
         [
             ("graph_tenant_id", "GRAPH_TENANT_ID"),
             ("graph_client_id", "GRAPH_CLIENT_ID"),
             ("graph_client_secret", "GRAPH_CLIENT_SECRET"),
-            ("graph_mailbox_upn", "GRAPH_MAILBOX_UPN"),
         ],
     )
+    if not mailbox_upn:
+        missing.append("EMAIL_SHARED_INBOX_UPN or GRAPH_MAILBOX_UPN")
     return {
         "ready": not missing,
         "missing_fields": missing,
@@ -67,14 +73,19 @@ def graph_test_readiness(settings: Any) -> dict[str, Any]:
     configured = graph_readiness(settings)
     tested_at = str(getattr(settings, "graph_last_test_at", "") or "").strip()
     ready = bool(configured["ready"] and tested_at)
+    if not configured["ready"]:
+        message = str(configured["message"])
+    elif not tested_at:
+        message = (
+            "Microsoft Graph connection has not been verified yet. "
+            "Please test Graph in Settings before enabling auto send."
+        )
+    else:
+        message = "Microsoft Graph connection verified."
     return {
         "ready": ready,
         "tested_at": tested_at,
-        "message": (
-            "Microsoft Graph connection has not been verified yet. Please test Graph in Settings before enabling auto send."
-            if configured["ready"] and not tested_at
-            else "Microsoft Graph connection verified."
-        ),
+        "message": message,
     }
 
 
@@ -126,57 +137,19 @@ def ensure_inbound_ready(settings: Any) -> None:
 
 
 def ensure_outbound_tested(settings: Any) -> None:
-    """Raise unless Graph is configured AND verified."""
+    """Raise unless Graph is configured AND verified.
+
+    `graph_test_readiness` already reports the *configuration* message
+    when the config is incomplete (and the verified/not-verified message
+    otherwise), so a single status lookup is enough.
+    """
     status = outbound_test_readiness(settings)
     if not status["ready"]:
-        config_status = outbound_readiness(settings)
-        raise ValueError(str(config_status["message"] if not config_status["ready"] else status["message"]))
+        raise ValueError(str(status["message"]))
 
 
 def ensure_inbound_tested(settings: Any) -> None:
     """Raise unless Graph is configured AND verified (for reply detection)."""
     status = inbound_test_readiness(settings)
     if not status["ready"]:
-        config_status = inbound_readiness(settings)
-        raise ValueError(str(config_status["message"] if not config_status["ready"] else status["message"]))
-
-
-# ---------------------------------------------------------------------------
-# Backward-compat shims. Older callers used SMTP/IMAP-specific helpers
-# and we want to keep them working without touching every call site.
-# ---------------------------------------------------------------------------
-
-def smtp_readiness(settings: Any) -> dict[str, Any]:
-    return graph_readiness(settings)
-
-
-def imap_readiness(settings: Any) -> dict[str, Any]:
-    return graph_readiness(settings)
-
-
-def smtp_test_readiness(settings: Any) -> dict[str, Any]:
-    return graph_test_readiness(settings)
-
-
-def imap_test_readiness(settings: Any) -> dict[str, Any]:
-    return graph_test_readiness(settings)
-
-
-def ensure_smtp_ready(settings: Any) -> None:
-    ensure_graph_ready(settings)
-
-
-def ensure_imap_ready(settings: Any) -> None:
-    ensure_graph_ready(settings)
-
-
-def ensure_smtp_tested(settings: Any) -> None:
-    ensure_graph_tested(settings)
-
-
-def ensure_imap_tested(settings: Any) -> None:
-    ensure_graph_tested(settings)
-
-
-def ensure_outbound_tested(settings: Any) -> None:  # noqa: F811 — redefined below
-    ensure_graph_tested(settings)
+        raise ValueError(str(status["message"]))

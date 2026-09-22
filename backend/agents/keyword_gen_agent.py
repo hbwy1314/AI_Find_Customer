@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 
-from agents.search_agent import _REGION_GEO
+from agents.search_agent import _REGION_GEO, _region_lookup_key
 from config.settings import get_settings
 from graph.state import HuntState
 from tools.llm_client import LLMTool
@@ -78,7 +78,7 @@ def _detect_local_languages(target_regions: list[str]) -> list[str]:
     seen: set[str] = set()
     languages: list[str] = []
     for region in target_regions:
-        key = region.strip().lower()
+        key = _region_lookup_key(region)
         geo = _REGION_GEO.get(key, {})
         hl = geo.get("hl", "en")
         if hl != "en" and hl in _HL_TO_LANGUAGE:

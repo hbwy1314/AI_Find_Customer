@@ -3,6 +3,31 @@ from fastapi.testclient import TestClient
 from api.app import create_app
 
 
+def _seed_graph_account(db_path) -> None:
+    """Create an active Graph account in the test store.
+
+    Campaign creation auto-selects a real (non-'default') Graph account
+    with remaining quota, so tests that expect the create/start flow to
+    succeed must seed one first.
+    """
+    from emailing.store import EmailStore
+
+    store = EmailStore(str(db_path))
+    store.init_db()
+    store.upsert_account({
+        "id": "acct-1",
+        "provider_type": "graph",
+        "from_name": "Ai Hunter",
+        "from_email": "sales@example.com",
+        "reply_to": "",
+        "status": "active",
+        "daily_send_limit": 50,
+        "hourly_send_limit": 10,
+        "sort_order": 0,
+        "owner_user_id": 0,
+    })
+
+
 def test_create_and_start_email_campaign(monkeypatch, tmp_path):
     app = create_app()
     client = TestClient(app)
@@ -77,6 +102,8 @@ def test_create_and_start_email_campaign(monkeypatch, tmp_path):
         "email_min_fit_score_to_send": 0.6,
         "email_min_contactability_score_to_send": 0.45,
     })())
+
+    _seed_graph_account(tmp_path / "email.db")
 
     res = client.post("/api/v1/hunts/hunt_1/email-campaigns", json={"name": "Test Campaign"})
     assert res.status_code == 200
@@ -154,6 +181,8 @@ def test_create_campaign_skips_blocked_template(monkeypatch, tmp_path):
         "email_min_contactability_score_to_send": 0.45,
     })())
 
+    _seed_graph_account(tmp_path / "email.db")
+
     res = client.post("/api/v1/hunts/hunt_1/email-campaigns", json={"name": "Blocked Campaign"})
     assert res.status_code == 200
     assert res.json()["sequence_count"] == 0
@@ -227,6 +256,8 @@ def test_create_campaign_skips_unapproved_sequences(monkeypatch, tmp_path):
         "email_min_contactability_score_to_send": 0.45,
     })())
 
+    _seed_graph_account(tmp_path / "email.db")
+
     res = client.post("/api/v1/hunts/hunt_1/email-campaigns", json={"name": "Approved Only"})
     assert res.status_code == 200
     assert res.json()["sequence_count"] == 1
@@ -286,6 +317,8 @@ def test_create_campaign_includes_needs_review_when_approval_not_required(monkey
         "email_require_approval_before_send": False,
     })())
 
+    _seed_graph_account(tmp_path / "email.db")
+
     res = client.post("/api/v1/hunts/hunt_1/email-campaigns", json={"name": "Auto Approve Campaign"})
     assert res.status_code == 200
     assert res.json()["sequence_count"] == 1
@@ -344,6 +377,8 @@ def test_create_campaign_skips_previously_contacted_lead_email(monkeypatch, tmp_
         "email_min_contactability_score_to_send": 0.45,
         "email_require_approval_before_send": True,
     })())
+
+    _seed_graph_account(tmp_path / "email.db")
 
     first = client.post("/api/v1/hunts/hunt_1/email-campaigns", json={"name": "Campaign One"})
     second = client.post("/api/v1/hunts/hunt_1/email-campaigns", json={"name": "Campaign Two"})
@@ -422,6 +457,12 @@ def test_run_email_reply_check_route(monkeypatch, tmp_path):
         return {"checked": 3, "matched": 1, "skipped": 2, "ignored": 1}
 
     monkeypatch.setattr("api.email_routes.run_graph_reply_detection_once", fake_run_reply_detection_once)
+    # The route picks poll accounts from the (empty) test store — feed it
+    # a fake 'default' poll account so reply detection actually runs.
+    monkeypatch.setattr(
+        "emailing.graph_client.distinct_poll_accounts",
+        lambda accounts, compat_scan=True: [{"id": "default"}],
+    )
 
     res = client.post("/api/v1/email-replies/check")
     assert res.status_code == 200
@@ -474,6 +515,8 @@ def test_create_campaign_requires_smtp_configuration(monkeypatch, tmp_path):
         "email_min_fit_score_to_send": 0.6,
         "email_min_contactability_score_to_send": 0.45,
     })())
+
+    _seed_graph_account(tmp_path / "email.db")
 
     res = client.post("/api/v1/hunts/hunt_1/email-campaigns", json={"name": "Blocked Campaign"})
     assert res.status_code == 409

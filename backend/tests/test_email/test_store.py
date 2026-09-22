@@ -480,7 +480,6 @@ def test_test_send_log_counts_toward_daily_quota(tmp_path: Path):
         sent_at=now_iso,
     )
     assert store.count_sent_today_for_account("acct_a", now_iso=now_iso) == 2
-
     # Failed attempts are recorded for audit but DON'T count toward
     # the budget — the user might hit a transient SMTP auth error and
     # we don't want to charge them for it.
@@ -516,3 +515,138 @@ def test_test_send_log_counts_toward_daily_quota(tmp_path: Path):
         sent_at=yesterday,
     )
     assert store.count_sent_today_for_account("acct_a", now_iso=now_iso) == 2
+
+
+def test_manual_send_claim_uses_stable_recipient_identity(tmp_path: Path):
+    store = EmailStore(str(tmp_path / "email.db"))
+    store.init_db()
+    now = "2026-09-21T12:30:00+00:00"
+
+    first, _ = store.claim_manual_send(
+        "hunt-1",
+        0,
+        1,
+        recipient_email="Buyer@Example.com",
+        claim_id="claim-1",
+        now_iso=now,
+    )
+    moved, existing = store.claim_manual_send(
+        "hunt-1",
+        4,
+        1,
+        recipient_email="buyer@example.com",
+        claim_id="claim-2",
+        now_iso=now,
+    )
+    replacement, _ = store.claim_manual_send(
+        "hunt-1",
+        0,
+        1,
+        recipient_email="other@example.com",
+        claim_id="claim-3",
+        now_iso=now,
+    )
+
+    assert first is True
+    assert moved is False
+    assert existing and existing["id"] == "claim-1"
+    assert replacement is True
+
+    assert store.reserve_send_quota(
+        "acct-1",
+        "claim-1",
+        daily_limit=20,
+        hourly_limit=10,
+        now_iso=now,
+    ) is True
+    store.release_manual_send_preparation(
+        "claim-1",
+        message_id="not-created",
+        updated_at=now,
+    )
+    retried, _ = store.claim_manual_send(
+        "hunt-1",
+        4,
+        1,
+        recipient_email="buyer@example.com",
+        claim_id="claim-4",
+        now_iso=now,
+    )
+    assert retried is True
+    with store._connect() as conn:
+        quota_status = conn.execute(
+            "SELECT status FROM email_quota_reservations WHERE message_id = 'claim-1'"
+        ).fetchone()[0]
+    assert quota_status == "released"
+
+
+def test_manual_send_migration_prefers_confirmed_send(tmp_path: Path):
+    store = EmailStore(str(tmp_path / "email.db"))
+    store.init_db()
+    now = "2026-09-21T12:30:00+00:00"
+    store.upsert_account({
+        "id": "acct-1",
+        "provider_type": "graph",
+        "from_name": "Sales",
+        "from_email": "sales@example.com",
+        "created_at": now,
+        "updated_at": now,
+    })
+    store.create_campaign({
+        "id": "campaign-1",
+        "hunt_id": "hunt-1",
+        "email_account_id": "acct-1",
+        "name": "Manual",
+        "created_at": now,
+        "updated_at": now,
+    })
+    for suffix in ("failed", "sent"):
+        sequence_id = f"sequence-{suffix}"
+        message_id = f"message-{suffix}"
+        store.create_sequence({
+            "id": sequence_id,
+            "campaign_id": "campaign-1",
+            "hunt_id": "hunt-1",
+            "lead_key": f"lead-{suffix}",
+            "lead_email": "buyer@example.com",
+            "created_at": now,
+            "updated_at": now,
+        })
+        store.create_message({
+            "id": message_id,
+            "sequence_id": sequence_id,
+            "step_number": 1,
+            "goal": "intro",
+            "locale": "en",
+            "subject": suffix,
+            "body_text": suffix,
+            "status": suffix,
+            "scheduled_at": now,
+            "sent_at": now if suffix == "sent" else "",
+            "created_at": now,
+            "updated_at": now,
+        })
+
+    with store._connect() as conn:
+        conn.execute("DELETE FROM manual_send_recipient_claims")
+        conn.execute(
+            "INSERT INTO manual_send_claims "
+            "(id, hunt_id, sequence_index, sequence_number, status, message_id, created_at, updated_at) "
+            "VALUES ('claim-failed', 'hunt-1', 0, 1, 'failed', 'message-failed', ?, ?)",
+            (now, "2026-09-21T12:31:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO manual_send_claims "
+            "(id, hunt_id, sequence_index, sequence_number, status, message_id, created_at, updated_at) "
+            "VALUES ('claim-sent', 'hunt-1', 3, 1, 'sent', 'message-sent', ?, ?)",
+            (now, now),
+        )
+
+    store.init_db()
+
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT id, status FROM manual_send_recipient_claims "
+            "WHERE hunt_id = 'hunt-1' AND recipient_email = 'buyer@example.com'"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [("claim-sent", "sent")]

@@ -59,6 +59,13 @@ class SettingsPayload(BaseModel):
     email_from_name: str = ""
     email_from_address: str = ""
     email_reply_to: str = ""
+    email_representative_name: str = ""
+    email_representative_address: str = ""
+    email_representative_reply_to: str = ""
+    email_shared_inbox_upn: str = ""
+    email_inbox_sync_enabled: str = ""
+    email_inbox_compat_scan_enabled: str = ""
+    email_inbox_sync_interval_seconds: str = ""
     email_sequence_enabled: str = ""
     email_auto_send_enabled: str = ""
     email_step1_delay_days: str = ""
@@ -223,6 +230,13 @@ async def save_settings(payload: SettingsPayload):
         "email_from_name": "EMAIL_FROM_NAME",
         "email_from_address": "EMAIL_FROM_ADDRESS",
         "email_reply_to": "EMAIL_REPLY_TO",
+        "email_representative_name": "EMAIL_REPRESENTATIVE_NAME",
+        "email_representative_address": "EMAIL_REPRESENTATIVE_ADDRESS",
+        "email_representative_reply_to": "EMAIL_REPRESENTATIVE_REPLY_TO",
+        "email_shared_inbox_upn": "EMAIL_SHARED_INBOX_UPN",
+        "email_inbox_sync_enabled": "EMAIL_INBOX_SYNC_ENABLED",
+        "email_inbox_compat_scan_enabled": "EMAIL_INBOX_COMPAT_SCAN_ENABLED",
+        "email_inbox_sync_interval_seconds": "EMAIL_INBOX_SYNC_INTERVAL_SECONDS",
         "email_sequence_enabled": "EMAIL_SEQUENCE_ENABLED",
         "email_auto_send_enabled": "EMAIL_AUTO_SEND_ENABLED",
         "email_step1_delay_days": "EMAIL_STEP1_DELAY_DAYS",
@@ -279,6 +293,9 @@ async def save_settings(payload: SettingsPayload):
         "graph_client_secret": "GRAPH_CLIENT_SECRET",
         "graph_mailbox_upn": "GRAPH_MAILBOX_UPN",
         "graph_default_scopes": "GRAPH_DEFAULT_SCOPES",
+        # Round-trips the verified-test timestamp so a full settings save
+        # doesn't drop it. Still force-cleared below whenever any Graph
+        # credential changes.
         "graph_last_test_at": "GRAPH_LAST_TEST_AT",
     }
 
@@ -291,7 +308,11 @@ async def save_settings(payload: SettingsPayload):
         if isinstance(value, str) and _is_masked(value):
             continue
         updates[env_key] = str(value)
-        if field in {"graph_tenant_id", "graph_client_id", "graph_client_secret", "graph_mailbox_upn"}:
+        if field in {
+            "graph_tenant_id", "graph_client_id", "graph_client_secret", "graph_mailbox_upn",
+            "email_representative_name", "email_representative_address",
+            "email_representative_reply_to", "email_shared_inbox_upn",
+        }:
             graph_fields_changed = True
 
     if graph_fields_changed:

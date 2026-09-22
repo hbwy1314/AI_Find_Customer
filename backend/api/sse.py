@@ -26,7 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from api.automation_routes import _serialize_job
-from api.routes import _hunts, _sse_queues
+from api.routes import _get_hunt, _hunts, _sse_queues
 from api.security import require_api_access, require_resource_access
 from automation.job_queue import HuntJobQueue
 from config.settings import get_settings
@@ -252,9 +252,10 @@ async def stream_hunt(hunt_id: str, request: Request):
     - failed: Hunt failed with error
     - heartbeat: Keep-alive ping
     """
-    if hunt_id not in _hunts:
+    hunt = _get_hunt(hunt_id)
+    if hunt is None:
         raise HTTPException(status_code=404, detail="Hunt not found")
-    require_resource_access(request, _hunts[hunt_id].get("owner_user_id"))
+    require_resource_access(request, hunt.get("owner_user_id"))
 
     # Create a per-subscriber queue
     queue: asyncio.Queue = asyncio.Queue()

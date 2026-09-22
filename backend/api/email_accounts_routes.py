@@ -19,8 +19,9 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Body, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from auth import secrets as secret_cipher
@@ -338,6 +339,16 @@ def delete_account(account_id: str, request: Request) -> dict:
             """,
             (account_id,),
         ).fetchall()
+        # The scheduler's quota rotation rebinds sequences to accounts
+        # other than their campaign's default — those bindings must block
+        # deletion too, otherwise the sequence is left dangling.
+        rebound_sequence_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM lead_email_sequences WHERE email_account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            or 0
+        )
         test_send_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM email_test_send_log WHERE account_id = ?",
@@ -353,11 +364,12 @@ def delete_account(account_id: str, request: Request) -> dict:
             or 0
         )
     non_empty = [cid for (cid, seq_count) in rows if int(seq_count or 0) > 0]
-    if non_empty or test_send_count or quota_reservation_count:
+    if non_empty or test_send_count or quota_reservation_count or rebound_sequence_count:
         raise HTTPException(
             status_code=409,
             detail=(
                 f"Account has {len(non_empty)} non-empty campaign(s), "
+                f"{rebound_sequence_count} sequence binding(s), "
                 f"{test_send_count} test-send log(s), and "
                 f"{quota_reservation_count} quota reservation(s); "
                 "disable the account instead of deleting it."
@@ -516,6 +528,10 @@ async def test_send_email(
         ok=bool(sent.get("ok")),
         failure_reason=str(sent.get("error") or "") if not sent.get("ok") else "",
         sent_at=sent_at,
+        sender_upn=str(sent.get("actual_sender_upn") or ""),
+        representative_address=str(sent.get("representative_address") or ""),
+        representative_name=str(sent.get("representative_name") or ""),
+        effective_reply_to=str(sent.get("reply_to") or ""),
     )
 
     return {
@@ -526,32 +542,47 @@ async def test_send_email(
     }
 
 
-@router.get("/{account_id}/test-inbox")
+@router.get("/{account_id}/test-inbox", dependencies=[Depends(require_api_access)])
 async def test_inbox(
     account_id: str,
     request: Request,
-    recent_minutes: int = Query(default=10, ge=1, le=1440),
     limit: int = Query(default=10, ge=1, le=100),
 ) -> dict:
     """Fetch the most recent messages from this account's inbox via Microsoft Graph.
 
-    Polls Graph for the latest N messages received in the last `recent_minutes`.
+    The send/receive test uses the current calendar day in the configured
+    email timezone, rather than a rolling minute window.
     """
-    require_api_access(request)
     require_user(request)
     store = get_email_store()
     account = store.get_account(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Email account not found")
     require_resource_access(request, account.get("owner_user_id"))
-    from datetime import datetime, timedelta, timezone
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, min(recent_minutes, 1440)))
-    since_iso = cutoff.isoformat()
+    settings = get_settings()
+    timezone_name = str(getattr(settings, "email_timezone", "UTC") or "UTC")
+    try:
+        configured_timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        configured_timezone = ZoneInfo("UTC")
+        timezone_name = "UTC"
+    current = datetime.now(timezone.utc)
+    start_of_today = current.astimezone(configured_timezone).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    since_iso = start_of_today.astimezone(timezone.utc).isoformat()
     from emailing import graph_client
     # Graph fetcher exposes (raw_ref, message_id, from_email, from_name, subject,
     # in_reply_to, references, received_at, snippet, headers, conversation_id)
     inbound = await graph_client.fetch_graph_replies(
-        None, now_iso=since_iso, recent_days=max(1, recent_minutes // (60 * 24) + 1), limit=limit
+        account,
+        now_iso=current.isoformat(),
+        recent_days=1,
+        limit=limit,
+        since_iso=since_iso,
     )
     items = [
         {
@@ -565,7 +596,13 @@ async def test_inbox(
         }
         for m in (inbound or [])[:limit]
     ]
-    return {"account_id": account_id, "provider": "graph", "since": since_iso, "items": items}
+    return {
+        "account_id": account_id,
+        "provider": "graph",
+        "since": since_iso,
+        "timezone": timezone_name,
+        "items": items,
+    }
 
 
 async def _test_graph(account: dict[str, Any]) -> dict:

@@ -228,7 +228,7 @@ class TestBuildPrompt:
 
 class TestDetectLocalLanguages:
     def test_single_non_english_region(self):
-        langs = _detect_local_languages(["Germany"])
+        langs = _detect_local_languages(["🇩🇪 Germany"])
         assert langs == ["German"]
 
     def test_multiple_non_english_regions(self):

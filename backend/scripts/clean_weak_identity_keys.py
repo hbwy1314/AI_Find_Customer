@@ -127,4 +127,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit("Retired: company names are valid identities. Use audit_lead_dedup.py.")

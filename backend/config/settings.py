@@ -155,6 +155,15 @@ class Settings(BaseSettings):
     email_from_name: str = ""
     email_from_address: str = ""
     email_reply_to: str = ""
+    # Unified sender identity shown to recipients. The legacy EMAIL_FROM_*
+    # fields remain as fallbacks for existing deployments.
+    email_representative_name: str = ""
+    email_representative_address: str = ""
+    email_representative_reply_to: str = ""
+    email_shared_inbox_upn: str = ""
+    email_inbox_sync_enabled: bool = True
+    email_inbox_compat_scan_enabled: bool = True
+    email_inbox_sync_interval_seconds: int = 60
     email_sequence_enabled: bool = False
     email_auto_send_enabled: bool = False
     email_step1_delay_days: int = 0
@@ -164,6 +173,12 @@ class Settings(BaseSettings):
     email_business_hours_end: str = "18:00"
     email_weekdays_only: bool = True
     email_timezone: str = "Asia/Shanghai"
+    # Extra recipient domains the sender must refuse, on top of the RFC
+    # 2606/6761 reserved set (example.com, .test, .invalid, ...).
+    # Comma-separated. acme.* is kept by default because historical
+    # smoke tests used acme.com recipients and the 550 bounces polluted
+    # the shared tenant mailbox; clear this setting to unblock them.
+    email_reserved_recipient_domains: str = "acme.com,acme.org,acme.net"
 
     # --- External lead-source APIs (Hunter.io for email finding/verification) ---
     # ``hunter_api_key`` is also exposed in the settings UI; we declare it
@@ -305,6 +320,17 @@ class Settings(BaseSettings):
 
     # --- Hunt persistence ---
     hunts_dir: str = _resolve_dir("data/hunts")  # directory for JSON hunt files
+    # Retention (in days) for on-disk hunt artifacts: hunt JSONs and their
+    # LangGraph checkpoints. 0 (default) keeps everything forever — no data
+    # is ever deleted unless the operator explicitly opts in. When set,
+    # startup purges hunt JSONs (and orphaned checkpoint threads) whose
+    # files are older than this many days.
+    hunt_retention_days: int = 0
+    # Cap on the number of hunts held in the in-memory `_hunts` dict.
+    # When exceeded, the oldest terminal hunts (completed/failed/cancelled)
+    # are evicted from memory — their JSON stays on disk and is lazily
+    # re-loaded on the next access. 0 = unlimited.
+    hunt_memory_max_hunts: int = 300
 
     # --- File upload ---
     upload_dir: str = _resolve_dir("uploads")

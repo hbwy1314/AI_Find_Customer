@@ -103,6 +103,8 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="Write deduplicated files")
     parser.add_argument("--rebuild-registry", action="store_true", help="Backfill the global lead registry")
     args = parser.parse_args()
+    if args.rebuild_registry or args.apply:
+        parser.error("Legacy writes are disabled. Use audit_lead_dedup.py; current tasks are authoritative.")
 
     settings = get_settings()
     hunts_dir = Path(args.hunts_dir or settings.hunts_dir)

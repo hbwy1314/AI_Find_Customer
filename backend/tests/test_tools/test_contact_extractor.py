@@ -7,6 +7,7 @@ from tools.contact_extractor import (
     extract_phone_numbers,
     extract_social_media,
     merge_contact_info,
+    normalize_phone_number,
     sanitize_phone_list,
 )
 
@@ -15,14 +16,14 @@ from tools.contact_extractor import (
 
 class TestExtractPhoneNumbers:
     def test_international_format(self):
-        text = "Call us at +49 30 12345678 or +1 (555) 123-4567"
+        text = "Call us at +49 30 12345678 or +1 (703) 848-7947"
         phones = extract_phone_numbers(text)
         assert len(phones) >= 2
 
     def test_local_format(self):
-        text = "Phone: (555) 123-4567"
-        phones = extract_phone_numbers(text)
-        assert len(phones) >= 1
+        text = "Phone: (703) 848-7947"
+        phones = extract_phone_numbers(text, country_code="US")
+        assert phones == ["+1 703-848-7947"]
 
     def test_chinese_format(self):
         text = "联系电话: +86-10-12345678"
@@ -124,6 +125,47 @@ class TestSanitizePhoneList:
 
     def test_all_zeros_rejected(self):
         assert sanitize_phone_list(["00000000"]) == []
+
+    def test_validates_and_formats_spanish_local_numbers(self):
+        result = sanitize_phone_list(
+            ["+34 967 810 126", "684 365 166", "937 822 242"],
+            country_code="es",
+        )
+        assert result == ["+34 967 81 01 26", "+34 684 36 51 66", "+34 937 82 22 42"]
+
+    def test_rejects_invalid_and_broken_spanish_numbers(self):
+        result = sanitize_phone_list(
+            ["7404-16970-", "973-799-0901", "4971-16336-", "+1 555-123-4567"],
+            country_code="ES",
+        )
+        assert result == []
+
+    def test_infers_region_from_address(self):
+        assert sanitize_phone_list(["935 405 477"], address="Barcelona, España") == [
+            "+34 935 40 54 77"
+        ]
+
+    def test_infers_region_from_country_domain(self):
+        assert sanitize_phone_list(["030 12345678"], website="https://supplier.de/contact") == [
+            "+49 30 12345678"
+        ]
+
+    def test_rejects_local_fragment_missing_national_prefix(self):
+        assert sanitize_phone_list(
+            ["54 80538", "89 413 29 539", "2025-08-08 20"],
+            country_code="DE",
+        ) == []
+
+    def test_rejects_foreign_local_number_parsed_in_wrong_region(self):
+        assert sanitize_phone_list(["(949) 742-4100"], country_code="GB") == []
+
+
+class TestNormalizePhoneNumber:
+    def test_converts_idd_prefix_and_formats(self):
+        assert normalize_phone_number("0034 935405477", country_code="ES") == "+34 935 40 54 77"
+
+    def test_local_number_requires_region_context(self):
+        assert normalize_phone_number("684 365 166") is None
 
 
 # ── Social media extraction ────────────────────────────────────────────

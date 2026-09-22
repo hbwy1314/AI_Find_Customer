@@ -344,7 +344,8 @@ class TestHuntResult:
         resp = await client.get("/api/v1/hunts/dup-123/result")
         assert resp.status_code == 200
         data = resp.json()
-        assert len(data["leads"]) == 1
+        # Same website is allowed when company names differ.
+        assert len(data["leads"]) == 2
 
 
 class TestEmailSequenceDecision:
@@ -541,6 +542,127 @@ class TestSendEmailDraft:
         assert data["status"] in {"ok", "sent"}
         assert data["sent_to"] == "buyer@acmetest.io"
         assert _hunts["send-1"]["result"]["email_sequences"][0]["emails"][0]["send_status"] == "sent"
+
+    @pytest.mark.asyncio
+    async def test_send_email_draft_restores_durable_sent_state(self, client, tmp_path):
+        _hunts["send-restored"] = {
+            "status": "completed",
+            "result": {
+                "email_sequences": [
+                    {
+                        "lead": {"company_name": "Acme", "emails": ["buyer@acmetest.io"]},
+                        "target": {"target_email": "buyer@acmetest.io"},
+                        "locale": "en_US",
+                        "emails": [
+                            {
+                                "sequence_number": 1,
+                                "subject": "Regenerated subject",
+                                "body_text": "Regenerated body",
+                            }
+                        ],
+                        "manual_review": {"decision": "pending"},
+                        "auto_send_eligible": False,
+                    }
+                ],
+            },
+            "email_sequences_count": 1,
+        }
+        sent_history = [{
+            "sequence_index": 0,
+            "sequence_number": 1,
+            "claim_status": "sent",
+            "message_status": "sent",
+            "message_id": "msg-1",
+            "subject": "Actually sent subject",
+            "body_text": "Actually sent body",
+            "body_html": "<p>Actually sent body</p>",
+            "sent_at": "2026-09-21T12:30:36+00:00",
+            "sent_to": "buyer@acmetest.io",
+            "provider_message_id": "graph-real-id",
+        }]
+        fake_settings = MagicMock()
+        fake_settings.email_db_path = str(tmp_path / "email.db")
+
+        with (
+            patch("api.routes.get_settings", return_value=fake_settings),
+            patch("emailing.store.EmailStore.list_manual_send_history", return_value=sent_history),
+            patch("emailing.email_sender.send_email", new_callable=AsyncMock) as send_mock,
+        ):
+            resp = await client.post(
+                "/api/v1/hunts/send-restored/email-sequences/0/send",
+                json={"sequence_number": 1},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "already_sent"
+        assert resp.json()["provider_message_id"] == "graph-real-id"
+        restored = _hunts["send-restored"]["result"]["email_sequences"][0]["emails"][0]
+        assert restored["send_status"] == "sent"
+        assert restored["subject"] == "Actually sent subject"
+        send_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hunt_result_restores_durable_sent_state(self, client, tmp_path):
+        _hunts["result-restored"] = {
+            "status": "completed",
+            "result": {
+                "email_sequences": [
+                    {
+                        "lead": {"company_name": "Other", "emails": ["other@acmetest.io"]},
+                        "target": {"target_email": "other@acmetest.io"},
+                        "emails": [{"sequence_number": 1, "subject": "Other", "body_text": "Other"}],
+                    },
+                    {
+                        "lead": {"company_name": "Acme", "emails": ["buyer@acmetest.io"]},
+                        "target": {"target_email": "buyer@acmetest.io"},
+                        "emails": [{
+                            "sequence_number": 1,
+                            "subject": "Regenerated subject",
+                            "body_text": "Regenerated body",
+                        }],
+                    },
+                    {
+                        "lead": {"company_name": "Different Company", "emails": ["buyer@acmetest.io"]},
+                        "target": {"target_email": "buyer@acmetest.io"},
+                        "emails": [{
+                            "sequence_number": 1,
+                            "subject": "Must stay unsent",
+                            "body_text": "Different body",
+                        }],
+                    },
+                ],
+            },
+            "email_sequences_count": 3,
+        }
+        sent_history = [{
+            "sequence_index": 0,
+            "sequence_number": 1,
+            "subject": "Actually sent subject",
+            "body_text": "Actually sent body",
+            "body_html": "<p>Actually sent body</p>",
+            "sent_at": "2026-09-21T12:30:36+00:00",
+            "sent_to": "buyer@acmetest.io",
+            "lead_key": "company:acme",
+            "provider_message_id": "graph-real-id",
+        }]
+        fake_settings = MagicMock()
+        fake_settings.email_db_path = str(tmp_path / "email.db")
+
+        with (
+            patch("api.routes.get_settings", return_value=fake_settings),
+            patch("emailing.store.EmailStore.list_manual_send_history", return_value=sent_history),
+        ):
+            resp = await client.get("/api/v1/hunts/result-restored/result")
+
+        assert resp.status_code == 200
+        assert resp.json()["email_sequences"][0]["emails"][0].get("send_status") is None
+        restored = resp.json()["email_sequences"][1]["emails"][0]
+        assert restored["send_status"] == "sent"
+        assert restored["subject"] == "Actually sent subject"
+        assert restored["provider_message_id"] == "graph-real-id"
+        duplicate = resp.json()["email_sequences"][2]["emails"][0]
+        assert duplicate.get("send_status") is None
+        assert duplicate["subject"] == "Must stay unsent"
 
     @pytest.mark.asyncio
     async def test_send_email_draft_requires_approval(self, client):
@@ -836,7 +958,7 @@ class TestListHunts:
             assert "product_keywords" in item
 
     @pytest.mark.asyncio
-    async def test_list_uses_unique_lead_count(self, client):
+    async def test_list_uses_company_name_lead_count(self, client):
         _hunts["dup-list"] = {
             "status": "completed",
             "result": {
@@ -860,7 +982,7 @@ class TestListHunts:
         assert resp.status_code == 200
         data = resp.json()
         item = next(x for x in data if x["hunt_id"] == "dup-list")
-        assert item["leads_count"] == 2
+        assert item["leads_count"] == 3
 
 
 # ── _slim_state unit tests ───────────────────────────────────────────────

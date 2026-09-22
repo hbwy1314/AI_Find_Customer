@@ -104,6 +104,47 @@ def _seed_store(store: EmailStore) -> None:
 
 
 @pytest.mark.asyncio
+async def test_graph_fetch_replies_reads_thread_headers(monkeypatch):
+    from emailing import graph_client
+
+    requested_urls = []
+
+    async def fake_graph_request(method, url, *, timeout, account=None):
+        requested_urls.append(url)
+        return 200, {
+            "value": [{
+                "internetMessageId": "<reply-1@example.com>",
+                "conversationId": "conversation-1",
+                "from": {"emailAddress": {"address": "buyer@acme.com", "name": "Jane"}},
+                "subject": "Changed subject",
+                "receivedDateTime": "2026-03-10T00:00:00Z",
+                "bodyPreview": "Interested",
+                "internetMessageHeaders": [
+                    {"name": "In-Reply-To", "value": "<mid-1@example.com>"},
+                    {"name": "References", "value": "<older@example.com> <mid-1@example.com>"},
+                ],
+            }],
+        }
+
+    monkeypatch.setattr(graph_client, "_graph_request", fake_graph_request)
+
+    rows = await graph_client.fetch_graph_replies(
+        {"graph_user_principal_name": "sales@example.com"},
+        now_iso="2026-03-10T00:05:00Z",
+        recent_days=14,
+        limit=10,
+        since_iso="2026-03-09T16:00:00Z",
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["in_reply_to"] == "<mid-1@example.com>"
+    assert rows[0]["references"] == ["<older@example.com>", "<mid-1@example.com>"]
+    assert rows[0]["conversation_id"] == "conversation-1"
+    assert "internetMessageHeaders" in requested_urls[0]
+    assert "receivedDateTime ge 2026-03-09T16:00:00Z" in requested_urls[0]
+
+
+@pytest.mark.asyncio
 async def test_reply_detector_matches_in_reply_to_and_stops_sequence(tmp_path: Path, monkeypatch):
     store = EmailStore(str(tmp_path / "email.db"))
     _seed_store(store)
@@ -259,7 +300,9 @@ async def test_graph_reply_detection_matches_conversation_and_stops_sequence(tmp
             "references": [],
             "from_email": "buyer@acme.com",
             "from_name": "Jane",
-            "subject": "Re: Hello",
+            # Deliberately changed so sender + subject cannot match. The
+            # Graph conversation id must be used as the fallback.
+            "subject": "A different subject",
             "received_at": "2026-03-10T00:00:00Z",
             "snippet": "Interested, let's talk.",
             "headers": {},

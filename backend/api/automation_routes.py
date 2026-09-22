@@ -336,6 +336,22 @@ async def create_automation_job_from_hunt(
     prior_result = hunt.get("result") if isinstance(hunt.get("result"), dict) else {}
     prior_leads = list(prior_result.get("leads") or [])
 
+    # Reusable hunting context so the continue job doesn't re-pay for the
+    # previous hunt's work: skip the insight ReAct loop, don't regenerate
+    # already-used keywords, and don't re-fetch already-seen URLs.
+    prior_insight = prior_result.get("insight") if isinstance(prior_result.get("insight"), dict) else None
+    prior_used_keywords = [
+        str(kw) for kw in (prior_result.get("used_keywords") or []) if str(kw).strip()
+    ]
+    prior_seen_urls = [
+        str(url) for url in (prior_result.get("seen_urls") or []) if str(url).strip()
+    ]
+    prior_keyword_search_stats = (
+        prior_result.get("keyword_search_stats")
+        if isinstance(prior_result.get("keyword_search_stats"), dict)
+        else {}
+    )
+
     next_payload = {
         "website_url": str(payload.get("website_url", "") or ""),
         "description": str(payload.get("description", "") or ""),
@@ -352,6 +368,11 @@ async def create_automation_job_from_hunt(
         # Carry the prior leads through. Consumer creates a fresh
         # hunt with this as `existing_leads`; see HuntRequest.
         "existing_leads": prior_leads,
+        # …and the rest of the reusable hunting context.
+        "prior_insight": prior_insight,
+        "prior_used_keywords": prior_used_keywords,
+        "prior_seen_urls": prior_seen_urls,
+        "prior_keyword_search_stats": prior_keyword_search_stats,
         "owner_user_id": owner.user_id if owner.via == "session" else int(hunt.get("owner_user_id", 0) or 0),
     }
 
@@ -386,13 +407,32 @@ async def retry_automation_job(job_id: str, request: Request):
     _require_job_access(request, job)
     hunt_id = str(job.get("last_hunt_id", "") or "")
     hunt = load_hunt(hunt_id) if hunt_id else None
-    if hunt and isinstance(hunt.get("result"), dict):
+    if hunt:
+        from api.hunt_store import current_leads
         payload = dict(job.get("payload") or {})
-        result = hunt["result"]
-        payload["existing_leads"] = list(result.get("leads") or [])
+        result = hunt.get("result") if isinstance(hunt.get("result"), dict) else {}
+        payload["existing_leads"] = current_leads(hunt)
         payload.setdefault("website_url", str(hunt.get("website_url", "") or result.get("website_url", "") or ""))
         payload.setdefault("product_keywords", list(hunt.get("product_keywords") or result.get("product_keywords") or []))
         payload.setdefault("target_regions", list(hunt.get("target_regions") or result.get("target_regions") or []))
+        # Reuse the failed hunt's context too: don't re-run insight /
+        # re-generate used keywords / re-fetch seen URLs on retry.
+        if isinstance(result.get("insight"), dict) and not payload.get("prior_insight"):
+            payload["prior_insight"] = result.get("insight")
+        if not payload.get("prior_used_keywords"):
+            payload["prior_used_keywords"] = [
+                str(kw) for kw in (result.get("used_keywords") or []) if str(kw).strip()
+            ]
+        if not payload.get("prior_seen_urls"):
+            payload["prior_seen_urls"] = [
+                str(url) for url in (result.get("seen_urls") or []) if str(url).strip()
+            ]
+        if not payload.get("prior_keyword_search_stats") and isinstance(result.get("keyword_search_stats"), dict):
+            payload["prior_keyword_search_stats"] = result.get("keyword_search_stats")
+        queue.update_payload(job_id, payload, updated_at=now_iso())
+    elif hunt_id:
+        payload = dict(job.get("payload") or {})
+        payload["existing_leads"] = []
         queue.update_payload(job_id, payload, updated_at=now_iso())
     queue.retry_now(job_id, updated_at=now_iso())
     logger.info("[AutomationQueue] retried job=%s", job_id[:8])

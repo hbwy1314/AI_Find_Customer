@@ -220,10 +220,9 @@ async def _create_email_campaign_internal(
             )
 
     settings = get_settings()
-    try:
-        ensure_outbound_ready(settings)
-    except ValueError:
-        raise
+    # Readiness errors (ValueError) propagate to the HTTP route, which
+    # maps them to 409.
+    ensure_outbound_ready(settings)
 
     store = _store()
     requested_account_id = str(payload.email_account_id or "").strip()
@@ -395,21 +394,17 @@ async def create_email_campaign(hunt_id: str, payload: CreateCampaignRequest, re
     require_resource_access(request, hunt.get("owner_user_id"))
     owner = require_user(request)
     account_owner_id = int(hunt.get("owner_user_id", 0) or 0) if owner.via != "session" else owner.user_id
-    # Account-level access check for the chosen mailbox
-    store = _store()
+    # Explicitly-selected mailbox: enforce account-level access here.
+    # Auto-picked accounts are resolved ONCE inside
+    # `_create_email_campaign_internal` (it filters by the same
+    # owner_user_id), so we don't duplicate the pick here — picking twice
+    # could bind a different mailbox than the one we just authorized.
     requested_account_id = str(payload.email_account_id or "").strip()
     if requested_account_id:
+        store = _store()
         account = store.get_account(requested_account_id)
         if not account or str(account.get("status", "active")) != "active":
             raise HTTPException(status_code=400, detail="Selected email account is not active")
-        require_resource_access(request, account.get("owner_user_id"))
-    else:
-        account = _pick_account_for_campaign(store, owner_user_id=account_owner_id)
-        if not account:
-            raise HTTPException(
-                status_code=409,
-                detail="No available email account found. All accounts have reached their send limits."
-            )
         require_resource_access(request, account.get("owner_user_id"))
     try:
         return await _create_email_campaign_internal(hunt_id, payload, owner_user_id=account_owner_id)
@@ -447,10 +442,9 @@ async def _start_email_campaign_internal(campaign_id: str) -> dict[str, str]:
     if not campaign:
         raise ValueError(f"Campaign {campaign_id} not found")
     settings = get_settings()
-    try:
-        ensure_outbound_tested(settings)
-    except ValueError:
-        raise
+    # Readiness errors (ValueError) propagate to the HTTP route, which
+    # maps them to 409.
+    ensure_outbound_tested(settings)
     campaign_account_id = str(campaign.get("email_account_id", ""))
     updated = now_iso()
     if campaign_account_id == "default":
@@ -460,21 +454,6 @@ async def _start_email_campaign_internal(campaign_id: str) -> dict[str, str]:
             store,
             owner_user_id=int(campaign.get("owner_user_id", 0) or 0),
             now_iso_str=updated,
-        )
-        if not real_account:
-            raise ValueError(
-                "Cannot start campaign: no available email accounts found. "
-                "All accounts have reached their send limits or no Graph accounts exist."
-            )
-        # Rebind campaign from 'default' to real account
-        with store._connect() as conn:
-            conn.execute(
-                "UPDATE email_campaigns SET email_account_id = ?, updated_at = ? WHERE id = ?",
-                (real_account["id"], updated, campaign_id),
-            )
-        logger.info(
-            "Rebound legacy campaign %s from 'default' to account %s (%s)",
-            campaign_id[:8], real_account["id"], real_account.get("from_email")
         )
         if not real_account:
             raise ValueError(
@@ -584,22 +563,10 @@ async def run_email_reply_check():
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     
     from emailing import graph_client
-    # Poll all distinct Graph mailboxes, same as the background loop
-    poll_accounts: list[dict[str, Any] | None] = []
-    seen_upns: set[str] = set()
-    for acct in store.list_accounts_by_provider("graph"):
-        if str(acct.get("status", "active")) != "active":
-            continue
-        upn = graph_client.account_upn(acct)
-        if not upn or upn in seen_upns:
-            continue
-        seen_upns.add(upn)
-        poll_accounts.append(acct)
-    global_upn = graph_client.account_upn(None)
-    if global_upn and global_upn not in seen_upns:
-        poll_accounts.append(None)
-    if not poll_accounts:
-        poll_accounts = [None]
+    poll_accounts = graph_client.distinct_poll_accounts(
+        store.list_accounts_by_provider("graph"),
+        compat_scan=bool(getattr(settings, "email_inbox_compat_scan_enabled", True)),
+    )
     
     result = {"checked": 0, "matched": 0, "skipped": 0, "ignored": 0}
     for poll_account in poll_accounts:

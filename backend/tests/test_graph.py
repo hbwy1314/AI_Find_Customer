@@ -140,6 +140,53 @@ class TestGraphWithCustomNodes:
         # Should go: insight → keyword_gen → search → lead_extract → evaluate → email_craft
         assert call_log == ["insight", "keyword_gen", "search", "lead_extract", "evaluate", "email_craft"]
 
+    def test_max_round_finish_generates_email_when_target_is_unmet(self):
+        call_log = []
+
+        def node(name, output=None):
+            def _run(state):
+                call_log.append(name)
+                return output or {"current_stage": name}
+            return _run
+
+        graph = build_graph(
+            parse_description_node=node("parse_description"),
+            insight_node=node("insight"),
+            keyword_gen_node=node("keyword_gen"),
+            search_node=node("search"),
+            lead_extract_node=node("lead_extract", {"leads": [{"company": "X"}], "current_stage": "lead_extract"}),
+            evaluate_node=node("evaluate", {"hunt_round": 2, "current_stage": "evaluate"}),
+            should_continue_fn=lambda state: "finish",
+            email_craft_node=node("email_craft"),
+        )
+
+        graph.invoke(
+            {
+                "website_url": "https://example.com",
+                "product_keywords": [],
+                "target_regions": [],
+                "uploaded_files": [],
+                "target_lead_count": 100,
+                "max_rounds": 2,
+                "enable_email_craft": True,
+                "insight": None,
+                "keywords": [],
+                "used_keywords": [],
+                "search_results": [],
+                "matched_platforms": [],
+                "keyword_search_stats": {},
+                "leads": [],
+                "email_sequences": [],
+                "hunt_round": 2,
+                "prev_round_lead_count": 0,
+                "round_feedback": None,
+                "current_stage": "start",
+                "messages": [],
+            },
+        )
+
+        assert call_log[-2:] == ["evaluate", "email_craft"]
+
     def test_custom_should_continue_loop_once(self):
         """When should_continue returns 'continue' once then 'finish', graph loops."""
         call_log = []

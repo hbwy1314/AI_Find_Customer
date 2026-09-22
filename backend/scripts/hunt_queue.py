@@ -7,6 +7,7 @@ import logging
 import re
 import socket
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -105,7 +106,13 @@ def run_consumer(args: argparse.Namespace) -> int:
     )
 
     while True:
-        job = queue.claim_next(worker_id=worker_id, now_iso=_now_iso())
+        try:
+            job = queue.claim_next(worker_id=worker_id, now_iso=_now_iso())
+        except Exception:
+            # A transient "database is locked" must not take the whole
+            # consumer process down — log it and retry on the next poll.
+            logger.exception("claim_next failed; retrying on next poll")
+            job = None
         if not job:
             if not args.continuous:
                 return 0
@@ -114,6 +121,25 @@ def run_consumer(args: argparse.Namespace) -> int:
 
         logger.info("claimed job=%s", str(job['id'])[:8])
         claim_token = str(job.get("claim_token", "") or "")
+        # Background heartbeat: keeps the job's lease fresh while we wait
+        # on a long-running hunt, so the API's lease sweeper doesn't
+        # reclaim (and double-execute) a job this worker still owns.
+        stop_heartbeat = threading.Event()
+
+        def _heartbeat_loop() -> None:
+            while not stop_heartbeat.wait(60):
+                try:
+                    queue.touch_heartbeat(
+                        str(job["id"]),
+                        now_iso=_now_iso(),
+                        claim_token=claim_token,
+                        worker_id=worker_id,
+                    )
+                except Exception:
+                    logger.exception("heartbeat refresh failed for job=%s", str(job["id"])[:8])
+
+        heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        heartbeat_thread.start()
         try:
             queue.update_progress(
                 str(job["id"]),
@@ -160,6 +186,9 @@ def run_consumer(args: argparse.Namespace) -> int:
             logger.exception("job=%s failed and was requeued: %s", str(job["id"])[:8], exc)
             if not args.continuous:
                 return 1
+        finally:
+            stop_heartbeat.set()
+            heartbeat_thread.join(timeout=2)
 
         if not args.continuous:
             return 0

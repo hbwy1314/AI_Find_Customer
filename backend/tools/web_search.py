@@ -15,6 +15,7 @@ from __future__ import annotations
 import itertools
 import logging
 import threading
+import time
 
 from config.settings import Settings, get_settings
 
@@ -28,17 +29,47 @@ def _parse_keys(raw: str) -> list[str]:
     return [k.strip() for k in raw.split(",") if k.strip()]
 
 
+# Error signatures that mean "this KEY is bad/exhausted" (vs a transient
+# network blip or a bad request). Matching keys are put in cooldown.
+_KEY_FAILURE_MARKERS: tuple[str, ...] = (
+    "401", "403", "429",
+    "invalid api key", "unauthorized", "forbidden",
+    "quota", "rate limit", "insufficient",
+)
+
+
+def _is_key_failure(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _KEY_FAILURE_MARKERS)
+
+
 class _RoundRobinPool:
-    """Thread-safe round-robin key pool."""
+    """Thread-safe round-robin key pool with dead-key cooldown.
+
+    A key that fails with an auth/quota error is benched for 10 minutes
+    instead of being retried every K-th request — previously one dead key
+    made 1/K of all searches silently return nothing (or, with a single
+    key, fail every search for the entire hunt).
+    """
 
     def __init__(self, keys: list[str]) -> None:
         self._keys = keys
         self._cycle = itertools.cycle(keys)
         self._lock = threading.Lock()
+        self._dead_until: dict[str, float] = {}
 
     def next_key(self) -> str:
         with self._lock:
             return next(self._cycle)
+
+    def mark_dead(self, key: str, cooldown_seconds: float = 600.0) -> None:
+        with self._lock:
+            self._dead_until[key] = time.monotonic() + cooldown_seconds
+
+    def is_dead(self, key: str) -> bool:
+        with self._lock:
+            deadline = self._dead_until.get(key)
+            return bool(deadline) and time.monotonic() < deadline
 
     def __len__(self) -> int:
         return len(self._keys)
@@ -166,9 +197,35 @@ class WebSearchTool:
 
         Returns:
             List of dicts with keys: title, link, snippet, position.
+
+        Raises the last key failure if every key is dead/cooling down;
+        rotates to the next key (10-minute cooldown per failure) when a
+        key fails with an auth/quota error.
         """
-        key = self._tavily_pool.next_key()
-        return await _tavily_search(key, query, num, gl)
+        total_keys = len(self._tavily_pool)
+        attempts = 0
+        last_error: Exception | None = None
+        while attempts < max(1, total_keys):
+            attempts += 1
+            key = self._tavily_pool.next_key()
+            if self._tavily_pool.is_dead(key):
+                continue
+            try:
+                return await _tavily_search(key, query, num, gl)
+            except Exception as exc:
+                if not _is_key_failure(exc):
+                    # Transient network error or bad request — retrying a
+                    # different key won't help.
+                    raise
+                self._tavily_pool.mark_dead(key)
+                logger.warning(
+                    "[WebSearch] Tavily key %s… failed (%s); rotating to next key (10min cooldown)",
+                    key[:4], exc,
+                )
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("No Tavily API keys available (all keys in cooldown)")
 
     async def close(self) -> None:
         return None

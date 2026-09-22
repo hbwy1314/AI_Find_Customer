@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -96,6 +97,47 @@ def test_is_unsubscribed_campaign_only_blocks_that_campaign(store: EmailStore) -
     assert not store.is_unsubscribed("campaign-only@example.com", scope="campaign:other")
 
 
+def test_search_unsubscribes_filters_paginates_and_counts(store: EmailStore) -> None:
+    global_id = store.record_unsubscribe(email="alpha@example.com", scope="all", source="manual")
+    store.record_unsubscribe(email="beta@example.com", scope="campaign:camp-1", source="link")
+    store.record_unsubscribe(email="gamma@example.net", scope="sequence:seq-1", source="link")
+
+    page = store.search_unsubscribes(query="example.com", limit=1, offset=1)
+    assert page["total"] == 2
+    assert len(page["items"]) == 1
+    assert page["counts"] == {"total": 3, "global": 1, "campaign": 1, "sequence": 1}
+
+    global_rows = store.search_unsubscribes(scope_type="all", source="manual")
+    assert [row["email"] for row in global_rows["items"]] == ["alpha@example.com"]
+    assert store.delete_unsubscribe(global_id) is True
+    assert store.delete_unsubscribe(global_id) is False
+    assert not store.is_unsubscribed("alpha@example.com")
+
+
+def test_init_db_deduplicates_legacy_unsubscribe_rows(store: EmailStore) -> None:
+    store.record_unsubscribe(email="legacy@example.com", scope="all")
+    with store._connect() as conn:
+        conn.execute("DROP INDEX idx_unsubscribe_email_scope")
+        conn.execute(
+            "INSERT INTO email_unsubscribes "
+            "(id, email, scope, token_hash, source, unsubscribed_at, created_at) "
+            "SELECT 'duplicate-id', email, scope, token_hash, source, unsubscribed_at, created_at "
+            "FROM email_unsubscribes WHERE email = 'legacy@example.com'"
+        )
+
+    store.init_db()
+
+    with store._connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM email_unsubscribes WHERE email = 'legacy@example.com' AND scope = 'all'"
+        ).fetchone()[0]
+        index = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_unsubscribe_email_scope'"
+        ).fetchone()
+    assert count == 1
+    assert index is not None
+
+
 @pytest.fixture
 def client(store: EmailStore, monkeypatch) -> TestClient:
     # `create_app()` reads `get_settings().email_db_path` to wire up
@@ -159,6 +201,80 @@ def test_route_post_is_one_click(client: TestClient, store: EmailStore) -> None:
         with sqlite3.connect(store.db_path) as conn:
             conn.execute("DELETE FROM email_unsubscribes WHERE email = ?", (email,))
             conn.commit()
+
+
+def test_management_routes_create_list_and_delete(client: TestClient, store: EmailStore) -> None:
+    email = "managed@example.com"
+    created = client.post("/api/v1/unsubscribes", json={"email": f"  {email.upper()}  "})
+    assert created.status_code == 201
+    row = created.json()["item"]
+    assert row["email"] == email
+    assert row["scope"] == "all"
+    assert row["source"] == "manual"
+
+    listed = client.get("/api/v1/unsubscribes", params={"query": "managed@", "scope_type": "all"})
+    assert listed.status_code == 200
+    assert listed.json()["total"] == 1
+    assert listed.json()["items"][0]["id"] == row["id"]
+
+    deleted = client.delete(f"/api/v1/unsubscribes/{row['id']}")
+    assert deleted.status_code == 200
+    assert not store.is_unsubscribed(email)
+
+
+def test_management_route_rejects_invalid_email(client: TestClient) -> None:
+    response = client.post("/api/v1/unsubscribes", json={"email": "not-an-email"})
+    assert response.status_code == 422
+
+
+def test_management_routes_require_admin_and_csrf(client: TestClient, store: EmailStore) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    user_id = store.create_user(
+        email="member@example.com",
+        password_hash="unused",
+        role="user",
+        created_at=now.isoformat(),
+    )
+    store.create_session(
+        session_id="member-session",
+        user_id=user_id,
+        csrf_token="member-csrf",
+        ip="127.0.0.1",
+        user_agent="pytest",
+        expires_at=(now + timedelta(hours=1)).isoformat(),
+        last_seen_at=now.isoformat(),
+        created_at=now.isoformat(),
+    )
+    client.cookies.set("aih_session", "member-session")
+    client.cookies.set("aih_csrf", "member-csrf")
+    assert client.get("/api/v1/unsubscribes").status_code == 403
+
+    admin_id = store.create_user(
+        email="admin@example.com",
+        password_hash="unused",
+        role="admin",
+        created_at=now.isoformat(),
+    )
+    store.create_session(
+        session_id="admin-session",
+        user_id=admin_id,
+        csrf_token="admin-csrf",
+        ip="127.0.0.1",
+        user_agent="pytest",
+        expires_at=(now + timedelta(hours=1)).isoformat(),
+        last_seen_at=now.isoformat(),
+        created_at=now.isoformat(),
+    )
+    client.cookies.set("aih_session", "admin-session")
+    client.cookies.set("aih_csrf", "admin-csrf")
+    assert client.get("/api/v1/unsubscribes").status_code == 200
+    assert client.post("/api/v1/unsubscribes", json={"email": "csrf@example.com"}).status_code == 403
+    allowed = client.post(
+        "/api/v1/unsubscribes",
+        json={"email": "csrf@example.com"},
+        headers={"X-CSRF-Token": "admin-csrf"},
+    )
+    assert allowed.status_code == 201
 
 
 @pytest.mark.asyncio

@@ -441,6 +441,56 @@ def test_cancel_and_retry_automation_job(monkeypatch):
     assert missing.status_code == 404
 
 
+def test_retry_completed_job_refreshes_existing_leads(monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+
+    prior_leads = [
+        {"company_name": "ACME", "website": "https://acme.example.com/"},
+    ]
+    state = {
+        "id": "job-retry",
+        "status": "completed",
+        "created_at": "2026-04-05T00:00:00+00:00",
+        "updated_at": "2026-04-05T00:00:00+00:00",
+        "started_at": "",
+        "finished_at": "2026-04-05T00:10:00+00:00",
+        "attempt_count": 4,
+        "last_error": "",
+        "last_hunt_id": "hunt-retry",
+        "payload": {"website_url": "https://acme.example.com/", "existing_leads": []},
+    }
+    payload_updates = []
+
+    class FakeQueue:
+        def init_db(self):
+            return None
+
+        def get(self, job_id):
+            return dict(state) if job_id == "job-retry" else None
+
+        def update_payload(self, job_id, payload, updated_at):
+            payload_updates.append(dict(payload))
+            state["payload"] = dict(payload)
+
+        def retry_now(self, job_id, updated_at):
+            state["status"] = "queued"
+            state["updated_at"] = updated_at
+            state["finished_at"] = ""
+
+    monkeypatch.setattr("api.automation_routes._queue", lambda: FakeQueue())
+    monkeypatch.setattr(
+        "api.automation_routes.load_hunt",
+        lambda hunt_id: {"result": {"leads": prior_leads}} if hunt_id == "hunt-retry" else None,
+    )
+
+    response = client.post("/api/v1/automation/jobs/job-retry/retry")
+
+    assert response.status_code == 200
+    assert payload_updates[0]["existing_leads"] == prior_leads
+    assert response.json()["status"] == "queued"
+
+
 def test_cancel_running_job_requests_hunt_cancel(monkeypatch):
     app = create_app()
     client = TestClient(app)

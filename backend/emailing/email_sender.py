@@ -41,13 +41,32 @@ _STUB_PROVIDER_IDS: frozenset[str] = frozenset({"x", "y", "test", "stub", "fake"
 # 25 mailbox tenants never see a stray test send again.
 _RESERVED_RECIPIENT_DOMAINS: frozenset[str] = frozenset({
     "example.com", "example.org", "example.net",
-    "acme.com", "acme.org", "acme.net",
     "localhost", "localhost.localdomain",
     "test.com", "test.org", "test.local",
     "invalid",
     # RFC 6761: these TLDs are reserved for testing/documentation.
     ".test", ".example", ".invalid", ".localhost",
 })
+
+
+def _extra_reserved_domains() -> frozenset[str]:
+    """Operator-configured extra blocked domains (comma-separated).
+
+    Keeps site-specific test domains (e.g. acme.com smoke-test leads) out
+    of the shared mailbox without hard-coding real, registrable domains
+    into the RFC 2606 blocklist.
+    """
+    try:
+        from config.settings import get_settings
+
+        raw = str(getattr(get_settings(), "email_reserved_recipient_domains", "") or "")
+    except Exception:  # noqa: BLE001 — settings not initialised in tests
+        raw = ""
+    return frozenset(
+        d.strip().lower().lstrip(".").rstrip(".")
+        for d in raw.split(",")
+        if d.strip()
+    )
 
 
 def _is_reserved_recipient(email: str) -> str | None:
@@ -67,6 +86,8 @@ def _is_reserved_recipient(email: str) -> str | None:
     if not domain_lower:
         return "malformed_recipient"
     if domain_lower in _RESERVED_RECIPIENT_DOMAINS:
+        return f"reserved_domain:{domain_lower}"
+    if domain_lower in _extra_reserved_domains():
         return f"reserved_domain:{domain_lower}"
     # Reserved TLDs (RFC 6761).
     for tld in (".test", ".example", ".invalid", ".localhost"):
@@ -141,6 +162,16 @@ async def send_email(
         }
 
     try:
+        from config.settings import get_settings
+        from emailing.html_format import prepare_send_html
+        from emailing.unsubscribe import build_unsubscribe_url, issue_token
+
+        if not list_unsubscribe_url or "__preview__" in list_unsubscribe_url:
+            base_url = str(get_settings().public_base_url or "").strip() or "https://api.nineluan.com"
+            list_unsubscribe_url = build_unsubscribe_url(
+                base_url, issue_token(to_email.strip().lower()),
+            )
+        body_html = prepare_send_html(body_text, body_html, list_unsubscribe_url)
         from emailing.graph_client import send_via_graph
         result = await send_via_graph(
             account,

@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import socket
+import time
 from argparse import Namespace
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from api.auth_routes import router as auth_router
 from api.automation_routes import router as automation_router
 from api.email_accounts_routes import router as email_accounts_router
+from api.inbox_routes import router as inbox_router
 from api.email_routes import (
     CreateCampaignRequest,
     _create_email_campaign_internal,
@@ -28,11 +30,12 @@ from api.email_routes import (
 from api.email_routes import (
     router as email_router,
 )
-from api.hunt_store import load_all_hunts, load_hunt
+from api.hunt_store import load_all_hunts, load_hunt, purge_old_hunts
 from api.notifications_routes import router as notifications_router
 from api.routes import (
     HuntRequest,
     TemplateSeedRequest,
+    _evict_excess_hunts,
     _hunts,
     _prepare_template_seed,
     create_hunt_internal,
@@ -99,22 +102,82 @@ def _hydrate_recovered_job_payload(
     *,
     updated_at: str,
 ) -> int:
-    """Carry saved leads into queue jobs interrupted during a restart."""
+    """Carry saved leads + hunting context into jobs interrupted by a restart."""
     hydrated = 0
     for job in jobs:
         hunt_id = str(job.get("last_hunt_id", "") or "")
         if not hunt_id:
             continue
+        from api.hunt_store import current_leads
         hunt = load_hunt(hunt_id)
-        result = hunt.get("result") if isinstance(hunt, dict) else None
-        leads = result.get("leads") if isinstance(result, dict) else None
-        if not isinstance(leads, list) or not leads:
-            continue
+        leads = current_leads(hunt) if isinstance(hunt, dict) else []
         payload = dict(job.get("payload") or {})
         payload["existing_leads"] = [lead for lead in leads if isinstance(lead, dict)]
+        result = hunt.get("result") if isinstance(hunt, dict) and isinstance(hunt.get("result"), dict) else {}
+        if result:
+            # Reuse the interrupted hunt's context so the recovery run
+            # doesn't re-pay for insight / keyword generation / URL fetches.
+            if isinstance(result.get("insight"), dict) and not payload.get("prior_insight"):
+                payload["prior_insight"] = result.get("insight")
+            if not payload.get("prior_used_keywords"):
+                payload["prior_used_keywords"] = [
+                    str(kw) for kw in (result.get("used_keywords") or []) if str(kw).strip()
+                ]
+            if not payload.get("prior_seen_urls"):
+                payload["prior_seen_urls"] = [
+                    str(url) for url in (result.get("seen_urls") or []) if str(url).strip()
+                ]
+            if not payload.get("prior_keyword_search_stats") and isinstance(result.get("keyword_search_stats"), dict):
+                payload["prior_keyword_search_stats"] = result.get("keyword_search_stats")
         queue.update_payload(str(job["id"]), payload, updated_at=updated_at)
         hydrated += 1
     return hydrated
+
+
+def _cleanup_orphan_checkpoints() -> int:
+    """Delete LangGraph checkpoint rows whose hunt JSON no longer exists.
+
+    Checkpoint threads are named after hunt ids (plus ``:resume:*`` suffix
+    variants). Once the hunt JSON is gone — purged by retention or deleted
+    by the operator — the checkpoint blobs are dead weight that grows
+    ``hunt_sessions.db`` without bound.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    settings = get_settings()
+    db_path = Path(settings.checkpoint_db_path)
+    if not db_path.exists():
+        return 0
+    hunts_dir = Path(settings.hunts_dir)
+
+    def _hunt_exists(thread_id: str) -> bool:
+        # thread ids are hunt ids, optionally suffixed ":resume:<uuid>"
+        base = str(thread_id).split(":", 1)[0]
+        return bool(base) and (hunts_dir / f"{base}.json").exists()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 10000")
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "checkpoints" not in tables:
+            return 0
+        thread_ids = [str(row[0]) for row in conn.execute("SELECT DISTINCT thread_id FROM checkpoints")]
+        removed = 0
+        for thread_id in thread_ids:
+            if _hunt_exists(thread_id):
+                continue
+            for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
+                if table in tables:
+                    conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (thread_id,))
+            removed += 1
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
 
 
 def _release_consumer_claims_for_shutdown(queue: HuntJobQueue, *, updated_at: str) -> int:
@@ -501,6 +564,29 @@ async def _run_automation_consumer_once() -> bool:
         worker_id=_automation_worker_id(),
         last_poll_at=_now_iso(),
     )
+    # ── Lease sweeper ────────────────────────────────────────────────────
+    # Requeue jobs whose consumer died (SIGKILL, crash loop, OOM) without
+    # releasing the claim. Live consumers keep their jobs safe via
+    # heartbeats (see the cancel_check wrapper below), so only genuinely
+    # expired leases are reclaimed. Previously a SIGKILL'd consumer left
+    # its job stuck in `running` forever — the only way out was an API
+    # restart.
+    try:
+        lease_seconds = max(
+            60, int(getattr(settings, "automation_consumer_lease_seconds", 900) or 900)
+        )
+        stale_before_iso = (
+            datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)
+        ).isoformat()
+        requeued = queue.recover_stale_running_jobs(
+            updated_at=_now_iso(), stale_before_iso=stale_before_iso
+        )
+        if requeued:
+            logger.warning(
+                "[AutomationConsumer] lease sweeper requeued %s stale job(s)", requeued
+            )
+    except Exception:
+        logger.exception("[AutomationConsumer] lease sweep failed")
     job = queue.claim_next(worker_id=_automation_worker_id(), now_iso=_now_iso())
     if not job:
         update_worker_state(
@@ -546,7 +632,28 @@ async def _run_automation_consumer_once() -> bool:
         claim_token=claim_token,
         worker_id=worker_id,
     )
-    consumer_args.cancel_check = lambda: queue.is_cancellation_requested(job_id)
+    # Cancel check that doubles as a lease heartbeat: the poll loop calls
+    # this every `status_poll_seconds` while waiting for the hunt, so the
+    # job's heartbeat stays fresh and the lease sweeper above never
+    # reclaims a job this consumer is actively executing.
+    heartbeat_state = {"last_at": 0.0}
+
+    def _cancel_check_with_heartbeat() -> bool:
+        now_monotonic = time.monotonic()
+        if now_monotonic - heartbeat_state["last_at"] >= 60:
+            try:
+                queue.touch_heartbeat(
+                    job_id,
+                    now_iso=_now_iso(),
+                    claim_token=claim_token,
+                    worker_id=worker_id,
+                )
+            except Exception:
+                logger.exception("[AutomationConsumer] heartbeat refresh failed for job=%s", job_id[:8])
+            heartbeat_state["last_at"] = now_monotonic
+        return queue.is_cancellation_requested(job_id)
+
+    consumer_args.cancel_check = _cancel_check_with_heartbeat
 
     try:
         result = await _run_embedded_consumer_job(consumer_args, job.get("payload") or {})
@@ -700,47 +807,42 @@ async def _email_scheduler_loop() -> None:
 
 
 async def _email_reply_loop() -> None:
-    """Poll inbox for replies and stop follow-up sequences.
+    """Sync the shared Inbox and optional compatibility mailboxes.
 
-    Uses Microsoft Graph exclusively. Each connected Graph account may
-    send from its own UPN, so replies land there; the loop also polls
-    the global shared mailbox (Graph ``MAILBOX_UPN``) as a fallback.
+    Shared Inbox is always first. Account mailboxes remain an optional
+    compatibility scan for historical sends made before the shared sender
+    identity was enabled.
     """
     sleep_seconds = 60
     while True:
         try:
             settings = get_settings()
-            sleep_seconds = max(30, int(settings.email_reply_check_interval_seconds))
-            if not bool(settings.email_reply_detection_enabled):
-                await asyncio.sleep(max(30, int(settings.email_reply_check_interval_seconds)))
+            sleep_seconds = max(
+                30,
+                int(getattr(settings, "email_inbox_sync_interval_seconds", 60) or 60),
+            )
+            sync_enabled = bool(getattr(settings, "email_inbox_sync_enabled", True))
+            replies_enabled = bool(settings.email_reply_detection_enabled)
+            if not sync_enabled and not replies_enabled:
+                await asyncio.sleep(sleep_seconds)
                 continue
             store = EmailStore(settings.email_db_path)
             store.init_db()
             from emailing import graph_client
             from emailing.reply_detector import run_graph_reply_detection_once
 
-            # Poll every distinct Graph mailbox: each connected account
-            # may send from its own UPN, so replies land there. Falls
-            # back to the global shared mailbox when configured.
-            poll_accounts: list[dict[str, Any] | None] = []
-            seen_upns: set[str] = set()
-            for acct in store.list_accounts_by_provider("graph"):
-                if str(acct.get("status", "active")) != "active":
-                    continue
-                upn = graph_client.account_upn(acct)
-                if not upn or upn in seen_upns:
-                    continue
-                seen_upns.add(upn)
-                poll_accounts.append(acct)
-            global_upn = graph_client.account_upn(None)
-            if global_upn and global_upn not in seen_upns:
-                poll_accounts.append(None)
-            if not poll_accounts:
-                poll_accounts = [None]
+            poll_accounts = graph_client.distinct_poll_accounts(
+                store.list_accounts_by_provider("graph"),
+                compat_scan=bool(getattr(settings, "email_inbox_compat_scan_enabled", True)),
+            )
 
             result = {"checked": 0, "matched": 0, "skipped": 0, "ignored": 0, "matches": []}
             for poll_account in poll_accounts:
-                part = await run_graph_reply_detection_once(store, poll_account)
+                part = await run_graph_reply_detection_once(
+                    store,
+                    poll_account,
+                    match_replies=replies_enabled,
+                )
                 for key in ("checked", "matched", "skipped", "ignored"):
                     result[key] += int(part.get(key, 0) or 0)
                 result["matches"].extend(part.get("matches", []) or [])
@@ -935,7 +1037,21 @@ async def lifespan(app: FastAPI):
         job for job in queue.list_jobs(limit=1000)
         if str(job.get("status", "") or "") == "running"
     ]
-    recovered_jobs = queue.recover_stale_running_jobs(updated_at=recovery_now_iso)
+    # Only reclaim jobs whose heartbeat lease has EXPIRED. Requeueing all
+    # running jobs unconditionally would double-execute anything an
+    # external consumer (hunt_queue.py worker, headless worker) is still
+    # actively working on. Fresh-heartbeat jobs are left alone — if their
+    # consumer really is gone, the consumer loop's lease sweeper will
+    # reclaim them once the lease expires.
+    recovery_lease_seconds = max(
+        60, int(getattr(settings, "automation_consumer_lease_seconds", 900) or 900)
+    )
+    recovery_stale_before = (
+        recovery_now - timedelta(seconds=recovery_lease_seconds)
+    ).isoformat()
+    recovered_jobs = queue.recover_stale_running_jobs(
+        updated_at=recovery_now_iso, stale_before_iso=recovery_stale_before
+    )
     hydrated_jobs = _hydrate_recovered_job_payload(
         queue,
         interrupted_jobs,
@@ -950,6 +1066,46 @@ async def lifespan(app: FastAPI):
         logger.warning("[AutomationConsumer] restored saved leads for %s recovered job(s)", hydrated_jobs)
     if recovered_seed_jobs:
         logger.warning("[TemplateSeedWorker] recovered %s stale template seed job(s)", recovered_seed_jobs)
+
+    # ── Retention cleanup (opt-in via HUNT_RETENTION_DAYS > 0) ─────────
+    # Purges hunt JSONs older than the retention window, evicts them from
+    # the in-memory _hunts dict, and removes orphaned LangGraph checkpoint
+    # threads so hunt_sessions.db / data/hunts don't grow without bound.
+    # Default 0 = keep everything (no behaviour change unless opted in).
+    retention_days = max(0, int(getattr(settings, "hunt_retention_days", 0) or 0))
+    if retention_days > 0:
+        try:
+            purged_ids = purge_old_hunts(retention_days)
+            if purged_ids:
+                for purged_id in purged_ids:
+                    _hunts.pop(purged_id, None)
+                logger.warning(
+                    "[Retention] purged %s hunt(s) older than %s day(s): %s…",
+                    len(purged_ids), retention_days, purged_ids[:3],
+                )
+        except Exception:
+            logger.exception("[Retention] hunt purge failed")
+        try:
+            removed_threads = _cleanup_orphan_checkpoints()
+            if removed_threads:
+                logger.warning(
+                    "[Retention] removed checkpoints for %s orphaned thread(s)", removed_threads
+                )
+        except Exception:
+            logger.exception("[Retention] checkpoint cleanup failed")
+
+    # Cap the in-memory hunt dict regardless of the on-disk retention
+    # policy — long-running deployments otherwise accumulate every hunt
+    # result in RAM forever. Evicted hunts are lazily re-hydrated from
+    # their on-disk JSON on the next access.
+    try:
+        evicted_hunts = _evict_excess_hunts()
+        if evicted_hunts:
+            logger.warning(
+                "[Retention] evicted %s hunt(s) from memory (cap exceeded)", evicted_hunts
+            )
+    except Exception:
+        logger.exception("[Retention] in-memory hunt eviction failed")
 
     # Enable Langfuse tracing if configured
     from observability.setup import setup_observability
@@ -1060,6 +1216,7 @@ def create_app() -> FastAPI:
     app.include_router(automation_router)
     app.include_router(email_router)
     app.include_router(email_accounts_router, prefix="/api/v1/email-accounts")
+    app.include_router(inbox_router)
     app.include_router(notifications_router)
     app.include_router(sse_router, prefix="/api/v1")
     # Public unsubscribe endpoints (no auth — recipients click from email).

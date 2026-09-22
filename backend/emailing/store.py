@@ -12,6 +12,8 @@ from typing import Any
 
 from auth import secrets as secret_cipher
 
+from migrations.runner import apply_pending_migrations
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,6 +126,11 @@ CREATE TABLE IF NOT EXISTS email_messages (
   claim_token TEXT DEFAULT '',
   claimed_at TEXT DEFAULT '',
   attempt_count INTEGER NOT NULL DEFAULT 0,
+  sender_account_id TEXT DEFAULT '',
+  sender_upn TEXT DEFAULT '',
+  representative_address TEXT DEFAULT '',
+  representative_name TEXT DEFAULT '',
+  effective_reply_to TEXT DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   FOREIGN KEY (sequence_id) REFERENCES lead_email_sequences(id)
@@ -151,6 +158,10 @@ CREATE TABLE IF NOT EXISTS email_test_send_log (
   thread_key TEXT DEFAULT '',
   ok INTEGER NOT NULL DEFAULT 1,
   failure_reason TEXT DEFAULT '',
+  sender_upn TEXT DEFAULT '',
+  representative_address TEXT DEFAULT '',
+  representative_name TEXT DEFAULT '',
+  effective_reply_to TEXT DEFAULT '',
   sent_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
   FOREIGN KEY (account_id) REFERENCES email_accounts(id)
@@ -166,6 +177,21 @@ CREATE TABLE IF NOT EXISTS manual_send_claims (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(hunt_id, sequence_index, sequence_number)
+);
+-- Stable manual-send idempotency. Sequence indexes can move when email
+-- sequences are regenerated, while the recipient address remains stable.
+CREATE TABLE IF NOT EXISTS manual_send_recipient_claims (
+  id TEXT PRIMARY KEY,
+  hunt_id TEXT NOT NULL,
+  recipient_email TEXT NOT NULL,
+  lead_key TEXT NOT NULL DEFAULT '',
+  sequence_index INTEGER NOT NULL,
+  sequence_number INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'sending',
+  message_id TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(hunt_id, recipient_email, sequence_number)
 );
 CREATE TABLE IF NOT EXISTS email_quota_reservations (
   id TEXT PRIMARY KEY,
@@ -185,10 +211,68 @@ CREATE TABLE IF NOT EXISTS email_reply_events (
   snippet TEXT DEFAULT '',
   received_at TEXT NOT NULL,
   raw_ref TEXT DEFAULT '',
+  inbound_message_id TEXT DEFAULT '',
+  graph_message_id TEXT DEFAULT '',
+  conversation_id TEXT DEFAULT '',
+  mailbox_upn TEXT DEFAULT '',
   created_at TEXT NOT NULL,
   FOREIGN KEY (sequence_id) REFERENCES lead_email_sequences(id)
 );
 CREATE INDEX IF NOT EXISTS idx_reply_sequence_id ON email_reply_events(sequence_id);
+CREATE TABLE IF NOT EXISTS email_inbound_messages (
+  id TEXT PRIMARY KEY,
+  owner_user_id INTEGER NOT NULL DEFAULT 0,
+  mailbox_upn TEXT NOT NULL DEFAULT '',
+  graph_message_id TEXT NOT NULL DEFAULT '',
+  internet_message_id TEXT DEFAULT '',
+  conversation_id TEXT DEFAULT '',
+  in_reply_to TEXT DEFAULT '',
+  references_json TEXT NOT NULL DEFAULT '[]',
+  from_email TEXT NOT NULL DEFAULT '',
+  from_name TEXT DEFAULT '',
+  to_recipients_json TEXT NOT NULL DEFAULT '[]',
+  cc_recipients_json TEXT NOT NULL DEFAULT '[]',
+  subject TEXT DEFAULT '',
+  snippet TEXT DEFAULT '',
+  body_text TEXT DEFAULT '',
+  received_at TEXT NOT NULL,
+  graph_is_read INTEGER NOT NULL DEFAULT 0,
+  graph_read_at TEXT DEFAULT '',
+  site_is_read INTEGER NOT NULL DEFAULT 0,
+  site_read_at TEXT DEFAULT '',
+  matched_sequence_id TEXT DEFAULT '',
+  matched_message_id TEXT DEFAULT '',
+  match_status TEXT NOT NULL DEFAULT 'unmatched',
+  is_auto_reply INTEGER NOT NULL DEFAULT 0,
+  is_ignored INTEGER NOT NULL DEFAULT 0,
+  has_attachments INTEGER NOT NULL DEFAULT 0,
+  web_url TEXT DEFAULT '',
+  raw_headers_json TEXT NOT NULL DEFAULT '{}',
+  raw_ref TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inbound_received ON email_inbound_messages(mailbox_upn, received_at);
+CREATE INDEX IF NOT EXISTS idx_inbound_site_read ON email_inbound_messages(site_is_read, received_at);
+CREATE INDEX IF NOT EXISTS idx_inbound_conversation ON email_inbound_messages(conversation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_graph_id
+  ON email_inbound_messages(mailbox_upn, graph_message_id)
+  WHERE graph_message_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_raw_ref
+  ON email_inbound_messages(raw_ref)
+  WHERE raw_ref != '';
+CREATE TABLE IF NOT EXISTS email_inbound_sync_state (
+  mailbox_upn TEXT PRIMARY KEY,
+  folder_id TEXT NOT NULL DEFAULT 'Inbox',
+  delta_link TEXT DEFAULT '',
+  last_attempt_at TEXT DEFAULT '',
+  last_success_at TEXT DEFAULT '',
+  last_received_at TEXT DEFAULT '',
+  last_error TEXT DEFAULT '',
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  initial_sync_completed INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 -- Unsubscribe records. `email` is the recipient address (lowercased).
 -- `scope` is one of: 'all', 'campaign:{id}', 'sequence:{id}'. A
 -- row with scope='all' acts as a global block; rows with finer scope
@@ -263,6 +347,14 @@ class EmailStore:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # WAL + a generous busy timeout so concurrent writers (API process,
+        # embedded consumer, headless worker) queue up instead of failing
+        # with "database is locked" after the 5s default.
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:  # e.g. read-only FS — fall back
+            pass
+        conn.execute("PRAGMA busy_timeout = 10000")
         # Enforce FOREIGN KEY constraints declared in the DDL. SQLite's
         # default is OFF (a historical quirk — pre-3.6.19 had no FK
         # support and the default was never flipped). Without this
@@ -275,6 +367,12 @@ class EmailStore:
 
     def init_db(self) -> None:
         with self._connect() as conn:
+            # P0.3: run versioned migrations before the inline DDL. New
+            # schema changes should land in backend/migrations/*.sql and
+            # be appended here; the legacy ``_DDL`` block remains as a
+            # no-op safety net on databases that haven't been migrated
+            # forward yet. P1 will replace _DDL with 002_*.sql.
+            apply_pending_migrations(conn)
             conn.executescript(_DDL)
             # Reply polling can run for several Graph mailboxes at once. A
             # pre-check in Python is not enough to prevent the same inbound
@@ -294,6 +392,49 @@ class EmailStore:
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_reply_raw_ref_unique "
                 "ON email_reply_events(raw_ref) WHERE raw_ref != ''"
+            )
+            # Older databases did not enforce the documented (email, scope)
+            # idempotency contract. Keep the earliest record before adding the
+            # unique index so startup is safe even if concurrent clicks created
+            # duplicates in a previous release.
+            conn.execute(
+                "DELETE FROM email_unsubscribes "
+                "WHERE rowid NOT IN ("
+                "SELECT MIN(rowid) FROM email_unsubscribes GROUP BY email, scope"
+                ")"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_unsubscribe_email_scope "
+                "ON email_unsubscribes(email, scope)"
+            )
+            self._ensure_column(
+                conn,
+                "manual_send_recipient_claims",
+                "lead_key",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            # Backfill stable recipient-based claims while keeping the legacy
+            # index-based table intact as an audit and rollback source. When
+            # old index claims collide on recipient, prefer a confirmed send.
+            conn.execute(
+                "INSERT OR IGNORE INTO manual_send_recipient_claims "
+                "(id, hunt_id, recipient_email, lead_key, sequence_index, sequence_number, "
+                "status, message_id, created_at, updated_at) "
+                "SELECT id, hunt_id, recipient_email, '', sequence_index, sequence_number, "
+                "status, message_id, created_at, updated_at FROM ("
+                "SELECT c.id, c.hunt_id, lower(s.lead_email) AS recipient_email, "
+                "c.sequence_index, c.sequence_number, c.status, c.message_id, "
+                "c.created_at, c.updated_at, "
+                "ROW_NUMBER() OVER ("
+                "PARTITION BY c.hunt_id, lower(s.lead_email), c.sequence_number "
+                "ORDER BY CASE WHEN c.status = 'sent' AND m.status = 'sent' THEN 0 "
+                "WHEN c.status = 'sending' THEN 1 ELSE 2 END, "
+                "c.updated_at DESC, c.id DESC) AS claim_rank "
+                "FROM manual_send_claims c "
+                "JOIN email_messages m ON m.id = c.message_id "
+                "JOIN lead_email_sequences s ON s.id = m.sequence_id "
+                "WHERE trim(s.lead_email) != ''"
+                ") ranked WHERE claim_rank = 1"
             )
             # Enforce FK constraints at startup. If an older DB has
             # orphan rows (e.g. a sequence_id was deleted without
@@ -342,6 +483,7 @@ class EmailStore:
             self._ensure_column(conn, "email_accounts", "secrets_ciphertext", "BLOB DEFAULT X''")
             self._ensure_column(conn, "email_accounts", "graph_tenant_id", "TEXT DEFAULT ''")
             self._ensure_column(conn, "email_accounts", "graph_user_principal_name", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_accounts", "graph_client_secret_encrypted", "TEXT DEFAULT ''")
             # Manual rotation order set from the quotas page. Existing rows
             # default to 0; new rows are appended at MAX(sort_order)+1.
             self._ensure_column(conn, "email_accounts", "sort_order", "INTEGER NOT NULL DEFAULT 0")
@@ -352,6 +494,19 @@ class EmailStore:
             self._ensure_column(conn, "email_messages", "claim_token", "TEXT DEFAULT ''")
             self._ensure_column(conn, "email_messages", "claimed_at", "TEXT DEFAULT ''")
             self._ensure_column(conn, "email_messages", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "email_messages", "sender_account_id", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_messages", "sender_upn", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_messages", "representative_address", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_messages", "representative_name", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_messages", "effective_reply_to", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_test_send_log", "sender_upn", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_test_send_log", "representative_address", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_test_send_log", "representative_name", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_test_send_log", "effective_reply_to", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_reply_events", "inbound_message_id", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_reply_events", "graph_message_id", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_reply_events", "conversation_id", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "email_reply_events", "mailbox_upn", "TEXT DEFAULT ''")
             # SMTP/IMAP were removed in f3dcaca (route all email
             # through Microsoft Graph). The columns were left in place
             # for back-compat with the old `cols` whitelist in
@@ -485,6 +640,7 @@ class EmailStore:
             "status", "daily_send_limit", "hourly_send_limit",
             "last_test_at", "created_at", "updated_at",
             "secrets_ciphertext", "graph_tenant_id", "graph_user_principal_name",
+            "graph_client_secret_encrypted",
             "sort_order",
         ]
         # Per-column defaults: every text column defaults to "" (matches the
@@ -628,24 +784,39 @@ class EmailStore:
         sequence_index: int,
         sequence_number: int,
         *,
+        recipient_email: str,
+        lead_key: str = "",
         claim_id: str,
         now_iso: str,
     ) -> tuple[bool, dict[str, Any] | None]:
         """Atomically reserve a preview send so retries cannot double-send."""
+        recipient = str(recipient_email or "").strip().lower()
+        if not recipient:
+            raise ValueError("recipient_email is required")
         with self._connect() as conn:
             try:
                 conn.execute(
-                    "INSERT INTO manual_send_claims "
-                    "(id, hunt_id, sequence_index, sequence_number, status, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, 'sending', ?, ?)",
-                    (claim_id, hunt_id, sequence_index, sequence_number, now_iso, now_iso),
+                    "INSERT INTO manual_send_recipient_claims "
+                    "(id, hunt_id, recipient_email, lead_key, sequence_index, sequence_number, "
+                    "status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'sending', ?, ?)",
+                    (
+                        claim_id,
+                        hunt_id,
+                        recipient,
+                        str(lead_key or ""),
+                        sequence_index,
+                        sequence_number,
+                        now_iso,
+                        now_iso,
+                    ),
                 )
                 return True, {"id": claim_id, "status": "sending"}
             except sqlite3.IntegrityError:
                 row = conn.execute(
-                    "SELECT * FROM manual_send_claims WHERE hunt_id = ? "
-                    "AND sequence_index = ? AND sequence_number = ?",
-                    (hunt_id, sequence_index, sequence_number),
+                    "SELECT * FROM manual_send_recipient_claims WHERE hunt_id = ? "
+                    "AND recipient_email = ? AND sequence_number = ?",
+                    (hunt_id, recipient, sequence_number),
                 ).fetchone()
                 return False, dict(row) if row else None
 
@@ -654,9 +825,65 @@ class EmailStore:
     ) -> None:
         with self._connect() as conn:
             conn.execute(
-                "UPDATE manual_send_claims SET status = ?, message_id = ?, updated_at = ? WHERE id = ?",
+                "UPDATE manual_send_recipient_claims "
+                "SET status = ?, message_id = ?, updated_at = ? WHERE id = ?",
                 (status, message_id, updated_at, claim_id),
             )
+
+    def release_manual_send_preparation(
+        self,
+        claim_id: str,
+        *,
+        message_id: str,
+        updated_at: str,
+    ) -> None:
+        """Release a claim when local setup fails before Graph is called."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE email_quota_reservations SET status = 'released', updated_at = ? "
+                "WHERE message_id = ? AND status = 'reserved'",
+                (updated_at, claim_id),
+            )
+            conn.execute(
+                "DELETE FROM email_messages WHERE id = ? AND status = 'sending'",
+                (message_id,),
+            )
+            conn.execute(
+                "DELETE FROM manual_send_recipient_claims WHERE id = ? AND status = 'sending'",
+                (claim_id,),
+            )
+
+    def list_manual_send_history(self, hunt_id: str) -> list[dict[str, Any]]:
+        """Return durable successful preview sends for one Hunt."""
+        try:
+            with self._connect() as conn:
+                columns = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "PRAGMA table_info(manual_send_recipient_claims)"
+                    ).fetchall()
+                }
+                if not columns:
+                    return []
+                lead_key_sql = "c.lead_key" if "lead_key" in columns else "'' AS lead_key"
+                rows = conn.execute(
+                    "SELECT c.sequence_index, c.sequence_number, c.recipient_email AS sent_to, "
+                    f"{lead_key_sql}, c.status AS claim_status, "
+                    "c.message_id, m.status AS message_status, m.subject, m.body_text, "
+                    "m.body_html, m.goal, m.sent_at, m.provider_message_id, "
+                    "s.lead_email AS sequence_recipient "
+                    "FROM manual_send_recipient_claims c "
+                    "JOIN email_messages m ON m.id = c.message_id "
+                    "JOIN lead_email_sequences s ON s.id = m.sequence_id "
+                    "WHERE c.hunt_id = ? AND c.status = 'sent' AND m.status = 'sent' "
+                    "ORDER BY c.sequence_index, c.sequence_number",
+                    (hunt_id,),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            return []
+        return [dict(row) for row in rows]
 
     def reserve_send_quota(
         self,
@@ -979,10 +1206,16 @@ class EmailStore:
         """
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM lead_email_recipients "
-                "WHERE status = 'waiting_reply' "
-                "AND sent_at != '' AND sent_at < ? "
-                "ORDER BY sent_at ASC",
+                # Join the owning sequence and skip terminal ones: a sequence
+                # that already replied / stopped / failed / exhausted must
+                # NOT have its residual waiting_reply recipients flipped and
+                # cloned into doomed follow-up messages.
+                "SELECT r.* FROM lead_email_recipients r "
+                "JOIN lead_email_sequences s ON s.id = r.sequence_id "
+                "WHERE r.status = 'waiting_reply' "
+                "AND r.sent_at != '' AND r.sent_at < ? "
+                "AND s.status NOT IN ('replied', 'stopped', 'completed', 'failed', 'exhausted') "
+                "ORDER BY r.sent_at ASC",
                 (threshold_iso,),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -1291,17 +1524,40 @@ class EmailStore:
                 (updated_at, message_id, claim_token),
             )
 
-    def mark_message_sent(self, message_id: str, *, provider_message_id: str, thread_key: str, sent_at: str, claim_token: str = "") -> None:
+    def mark_message_sent(
+        self,
+        message_id: str,
+        *,
+        provider_message_id: str,
+        thread_key: str,
+        sent_at: str,
+        claim_token: str = "",
+        sender_account_id: str = "",
+        sender_upn: str = "",
+        representative_address: str = "",
+        representative_name: str = "",
+        effective_reply_to: str = "",
+    ) -> bool:
+        """Mark the message sent. Returns False when the claim predicate
+        matched 0 rows (another worker owns the message now) so callers can
+        skip sequence advancement instead of double-counting."""
         with self._connect() as conn:
             query = (
                 "UPDATE email_messages SET status = 'sent', provider_message_id = ?, thread_key = ?, "
-                "sent_at = ?, claim_token = '', claimed_at = '', updated_at = ? WHERE id = ?"
+                "sent_at = ?, claim_token = '', claimed_at = '', updated_at = ?, "
+                "sender_account_id = ?, sender_upn = ?, representative_address = ?, "
+                "representative_name = ?, effective_reply_to = ? WHERE id = ?"
             )
-            values: list[Any] = [provider_message_id, thread_key, sent_at, sent_at, message_id]
+            values: list[Any] = [
+                provider_message_id, thread_key, sent_at, sent_at,
+                sender_account_id, sender_upn, representative_address,
+                representative_name, effective_reply_to, message_id,
+            ]
             if claim_token:
                 query += " AND status = 'sending' AND claim_token = ?"
                 values.append(claim_token)
-            conn.execute(query, values)
+            cur = conn.execute(query, values)
+            return bool(cur.rowcount)
 
     def mark_message_failed(self, message_id: str, *, failure_reason: str, updated_at: str, claim_token: str = "") -> None:
         with self._connect() as conn:
@@ -1480,6 +1736,10 @@ class EmailStore:
         ok: bool,
         failure_reason: str,
         sent_at: str,
+        sender_upn: str = "",
+        representative_address: str = "",
+        representative_name: str = "",
+        effective_reply_to: str = "",
     ) -> None:
         """Insert a row into `email_test_send_log` after a test-send attempt.
 
@@ -1495,8 +1755,9 @@ class EmailStore:
                 INSERT INTO email_test_send_log
                   (id, account_id, to_email, subject, body_text, provider,
                    provider_message_id, thread_key, ok, failure_reason,
-                   sent_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   sender_upn, representative_address, representative_name,
+                   effective_reply_to, sent_at, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -1509,6 +1770,10 @@ class EmailStore:
                     thread_key,
                     1 if ok else 0,
                     failure_reason,
+                    sender_upn,
+                    representative_address,
+                    representative_name,
+                    effective_reply_to,
                     sent_at,
                     sent_at,
                 ),
@@ -1556,6 +1821,155 @@ class EmailStore:
                 (lead_email, subject),
             ).fetchone()
         return dict(row) if row else None
+
+    def upsert_inbound_message(self, payload: dict[str, Any], *, now_iso: str) -> str:
+        """Insert or refresh one Graph Inbox message without losing site state."""
+        mailbox = str(payload.get("mailbox_upn", "") or "").strip().lower()
+        graph_id = str(payload.get("graph_message_id", "") or "").strip()
+        raw_ref = str(payload.get("raw_ref", "") or "").strip()
+        existing_id = ""
+        with self._connect() as conn:
+            if mailbox and graph_id:
+                row = conn.execute(
+                    "SELECT id FROM email_inbound_messages WHERE mailbox_upn = ? AND graph_message_id = ?",
+                    (mailbox, graph_id),
+                ).fetchone()
+                existing_id = str(row["id"]) if row else ""
+            if not existing_id and raw_ref:
+                row = conn.execute(
+                    "SELECT id FROM email_inbound_messages WHERE raw_ref = ?",
+                    (raw_ref,),
+                ).fetchone()
+                existing_id = str(row["id"]) if row else ""
+
+            message_id = existing_id or str(payload.get("id") or uuid.uuid4().hex)
+            values = {
+                "id": message_id,
+                "owner_user_id": int(payload.get("owner_user_id", 0) or 0),
+                "mailbox_upn": mailbox,
+                "graph_message_id": graph_id,
+                "internet_message_id": str(payload.get("message_id", "") or ""),
+                "conversation_id": str(payload.get("conversation_id", "") or ""),
+                "in_reply_to": str(payload.get("in_reply_to", "") or ""),
+                "references_json": json.dumps(payload.get("references", []) or [], ensure_ascii=False),
+                "from_email": str(payload.get("from_email", "") or ""),
+                "from_name": str(payload.get("from_name", "") or ""),
+                "to_recipients_json": json.dumps(payload.get("to_recipients", []) or [], ensure_ascii=False),
+                "cc_recipients_json": json.dumps(payload.get("cc_recipients", []) or [], ensure_ascii=False),
+                "subject": str(payload.get("subject", "") or ""),
+                "snippet": str(payload.get("snippet", "") or ""),
+                "body_text": str(payload.get("body_text", "") or ""),
+                "received_at": str(payload.get("received_at", "") or now_iso),
+                "graph_is_read": 1 if bool(payload.get("is_read", False)) else 0,
+                "graph_read_at": now_iso if bool(payload.get("is_read", False)) else "",
+                "has_attachments": 1 if bool(payload.get("has_attachments", False)) else 0,
+                "web_url": str(payload.get("web_url", "") or ""),
+                "raw_headers_json": json.dumps(payload.get("headers", {}) or {}, ensure_ascii=False),
+                "raw_ref": raw_ref,
+                "updated_at": now_iso,
+            }
+            if existing_id:
+                conn.execute(
+                    """UPDATE email_inbound_messages SET
+                       owner_user_id = ?, mailbox_upn = ?, graph_message_id = ?,
+                       internet_message_id = ?, conversation_id = ?, in_reply_to = ?,
+                       references_json = ?, from_email = ?, from_name = ?,
+                       to_recipients_json = ?, cc_recipients_json = ?, subject = ?,
+                       snippet = ?, body_text = ?, received_at = ?, graph_is_read = ?,
+                       graph_read_at = CASE WHEN ? = 1 THEN COALESCE(NULLIF(graph_read_at, ''), ?) ELSE graph_read_at END,
+                       has_attachments = ?, web_url = ?, raw_headers_json = ?, raw_ref = ?, updated_at = ?
+                       WHERE id = ?""",
+                    (
+                        values["owner_user_id"], values["mailbox_upn"], values["graph_message_id"],
+                        values["internet_message_id"], values["conversation_id"], values["in_reply_to"],
+                        values["references_json"], values["from_email"], values["from_name"],
+                        values["to_recipients_json"], values["cc_recipients_json"], values["subject"],
+                        values["snippet"], values["body_text"], values["received_at"],
+                        values["graph_is_read"], values["graph_is_read"], now_iso,
+                        values["has_attachments"], values["web_url"], values["raw_headers_json"],
+                        values["raw_ref"], values["updated_at"], message_id,
+                    ),
+                )
+            else:
+                values["created_at"] = now_iso
+                columns = list(values.keys())
+                conn.execute(
+                    f"INSERT INTO email_inbound_messages ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                    [values[column] for column in columns],
+                )
+        return message_id
+
+    def update_inbound_message(self, message_id: str, *, now_iso: str, **fields: Any) -> None:
+        allowed = {
+            "match_status", "is_auto_reply", "is_ignored", "matched_sequence_id",
+            "matched_message_id", "site_is_read", "site_read_at", "graph_is_read",
+            "graph_read_at",
+        }
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return
+        updates["updated_at"] = now_iso
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE email_inbound_messages SET {assignments} WHERE id = ?",
+                [*updates.values(), message_id],
+            )
+
+    def list_inbound_messages(
+        self,
+        *,
+        owner_user_id: int = 0,
+        enforce_owner: bool = False,
+        unread_only: bool = False,
+        match_status: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        where = ["1 = 1"]
+        params: list[Any] = []
+        if enforce_owner:
+            where.append("owner_user_id IN (0, ?)")
+            params.append(owner_user_id)
+        if unread_only:
+            where.append("site_is_read = 0")
+        if match_status:
+            where.append("match_status = ?")
+            params.append(match_status)
+        params.extend([max(1, min(int(limit), 200)), max(0, int(offset))])
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM email_inbound_messages WHERE {' AND '.join(where)} "
+                "ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_inbound_message(self, message_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM email_inbound_messages WHERE id = ?", (message_id,)).fetchone()
+        return dict(row) if row else None
+
+    def count_inbound_unread(self, *, owner_user_id: int = 0, enforce_owner: bool = False) -> int:
+        where = ["site_is_read = 0"]
+        params: list[Any] = []
+        if enforce_owner:
+            where.append("owner_user_id IN (0, ?)")
+            params.append(owner_user_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM email_inbound_messages WHERE {' AND '.join(where)}",
+                params,
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def mark_inbound_site_read(self, message_id: str, *, is_read: bool, now_iso: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE email_inbound_messages SET site_is_read = ?, site_read_at = ?, updated_at = ? WHERE id = ?",
+                (1 if is_read else 0, now_iso if is_read else "", now_iso, message_id),
+            )
+        return int(cur.rowcount or 0) > 0
 
     def has_reply_event(self, raw_ref: str) -> bool:
         with self._connect() as conn:
@@ -1861,19 +2275,17 @@ class EmailStore:
         now = datetime.now(timezone.utc).isoformat()
         row_id = _secrets.token_urlsafe(16)
         with self._connect() as conn:
-            existing = conn.execute(
-                "SELECT id FROM email_unsubscribes WHERE email = ? AND scope = ?",
-                (email_norm, scope_norm),
-            ).fetchone()
-            if existing:
-                return str(existing["id"])
             conn.execute(
-                "INSERT INTO email_unsubscribes "
+                "INSERT OR IGNORE INTO email_unsubscribes "
                 "(id, email, scope, token_hash, source, unsubscribed_at, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (row_id, email_norm, scope_norm, token_hash, source, now, now),
             )
-        return row_id
+            stored = conn.execute(
+                "SELECT id FROM email_unsubscribes WHERE email = ? AND scope = ?",
+                (email_norm, scope_norm),
+            ).fetchone()
+        return str(stored["id"])
 
     def is_unsubscribed(
         self,
@@ -1910,12 +2322,86 @@ class EmailStore:
 
     def list_unsubscribes(self, *, limit: int = 200) -> list[dict[str, Any]]:
         """Return recent unsubscribe records (most recent first)."""
+        return self.search_unsubscribes(limit=limit)["items"]
+
+    def search_unsubscribes(
+        self,
+        *,
+        query: str = "",
+        scope_type: str = "",
+        source: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Return a filtered unsubscribe page and unfiltered scope totals."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        query_norm = str(query or "").strip().lower()
+        if query_norm:
+            clauses.append("(instr(email, ?) > 0 OR instr(lower(scope), ?) > 0)")
+            params.extend((query_norm, query_norm))
+
+        scope_norm = str(scope_type or "").strip().lower()
+        if scope_norm == "all":
+            clauses.append("scope = 'all'")
+        elif scope_norm in {"campaign", "sequence"}:
+            clauses.append("scope LIKE ?")
+            params.append(f"{scope_norm}:%")
+
+        source_norm = str(source or "").strip().lower()
+        if source_norm:
+            clauses.append("source = ?")
+            params.append(source_norm)
+
+        where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        page_limit = max(1, min(int(limit), 200))
+        page_offset = max(0, int(offset))
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM email_unsubscribes ORDER BY created_at DESC LIMIT ?",
-                (int(limit),),
+                f"SELECT * FROM email_unsubscribes{where_sql} "
+                "ORDER BY unsubscribed_at DESC, created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (*params, page_limit, page_offset),
             ).fetchall()
-        return [dict(r) for r in rows]
+            total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM email_unsubscribes{where_sql}",
+                    tuple(params),
+                ).fetchone()[0]
+            )
+            counts = conn.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN scope = 'all' THEN 1 ELSE 0 END) AS global_count, "
+                "SUM(CASE WHEN scope LIKE 'campaign:%' THEN 1 ELSE 0 END) AS campaign_count, "
+                "SUM(CASE WHEN scope LIKE 'sequence:%' THEN 1 ELSE 0 END) AS sequence_count "
+                "FROM email_unsubscribes"
+            ).fetchone()
+        return {
+            "items": [dict(r) for r in rows],
+            "total": total,
+            "counts": {
+                "total": int(counts["total"] or 0),
+                "global": int(counts["global_count"] or 0),
+                "campaign": int(counts["campaign_count"] or 0),
+                "sequence": int(counts["sequence_count"] or 0),
+            },
+        }
+
+    def delete_unsubscribe(self, unsubscribe_id: str) -> bool:
+        """Remove one suppression record, returning whether it existed."""
+        with self._connect() as conn:
+            result = conn.execute(
+                "DELETE FROM email_unsubscribes WHERE id = ?",
+                (str(unsubscribe_id or ""),),
+            )
+        return bool(result.rowcount)
+
+    def get_unsubscribe(self, unsubscribe_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM email_unsubscribes WHERE id = ?",
+                (str(unsubscribe_id or ""),),
+            ).fetchone()
+        return dict(row) if row else None
 
     # --- app_settings (key-value, app-level secrets) ------------------
 

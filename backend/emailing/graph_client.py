@@ -18,14 +18,23 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 from msal import ConfidentialClientApplication
+from msal.exceptions import MsalError, MsalServiceError
 
 from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+class GraphNetworkError(RuntimeError):
+    """Network-level failure talking to Azure AD (DNS/connectivity/timeout).
+
+    Deliberately distinct from configuration/auth errors so the scheduler
+    can retry the message instead of permanently retiring the recipient
+    on a transient network blip.
+    """
 
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -36,56 +45,100 @@ _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 # ---------------------------------------------------------------------------
 
 class _AppTokenCache:
+    """Token cache keyed by (tenant, client_id, secret) credential tuple.
+
+    The global settings credentials are the default entry; a connected
+    account that carries its own `graph_tenant_id` + encrypted
+    `graph_client_secret_encrypted` gets its own cached token so
+    multi-tenant mailbox rotation actually uses per-account credentials
+    instead of silently reusing the global ones.
+    """
+
     def __init__(self) -> None:
-        self._msal_app: ConfidentialClientApplication | None = None
-        self._access_token: str = ""
-        self._expires_at: float = 0.0
+        self._tokens: dict[tuple[str, str, str], tuple[str, float]] = {}
         self._lock = asyncio.Lock()
 
-    def _build_app(self) -> ConfidentialClientApplication | None:
+    @staticmethod
+    def _global_creds() -> tuple[str, str, str]:
         settings = get_settings()
-        tenant = settings.graph_tenant_id.strip()
-        client_id = settings.graph_client_id.strip()
-        secret = settings.graph_client_secret.strip()
-        if not (tenant and client_id and secret):
-            return None
-        authority = f"https://login.microsoftonline.com/{tenant}"
-        return ConfidentialClientApplication(
-            client_id=client_id,
-            client_credential=secret,
-            authority=authority,
+        return (
+            settings.graph_tenant_id.strip(),
+            settings.graph_client_id.strip(),
+            settings.graph_client_secret.strip(),
         )
 
-    async def get_token(self) -> str:
+    @staticmethod
+    def _account_creds(account: dict[str, Any] | None) -> tuple[str, str, str] | None:
+        if not account:
+            return None
+        tenant = str(account.get("graph_tenant_id", "") or "").strip()
+        blob = str(account.get("graph_client_secret_encrypted", "") or "").strip()
+        if not (tenant and blob):
+            return None
+        try:
+            from auth.secrets import decrypt_dict
+
+            data = decrypt_dict(blob) or {}
+        except Exception:  # noqa: BLE001 — undecryptable blob: fall back to global
+            logger.warning("Per-account Graph secret undecryptable; using global credentials")
+            return None
+        secret = str(data.get("graph_secret", "") or "").strip()
+        client_id = get_settings().graph_client_id.strip()
+        if not (secret and client_id):
+            return None
+        return (tenant, client_id, secret)
+
+    async def get_token(self, account: dict[str, Any] | None = None) -> str:
+        creds = self._account_creds(account) or self._global_creds()
+        tenant, client_id, secret = creds
         async with self._lock:
             now = time.time()
-            if self._access_token and now < self._expires_at - 300:  # 5 min early refresh
-                return self._access_token
-            app = self._build_app()
-            if app is None:
+            cached = self._tokens.get(creds)
+            if cached and cached[0] and now < cached[1] - 300:  # 5 min early refresh
+                return cached[0]
+            if not (tenant and client_id and secret):
                 raise RuntimeError(
                     "Microsoft Graph is not configured: GRAPH_TENANT_ID / GRAPH_CLIENT_ID / "
                     "GRAPH_CLIENT_SECRET must all be set."
                 )
+            authority = f"https://login.microsoftonline.com/{tenant}"
+            app = ConfidentialClientApplication(
+                client_id=client_id,
+                client_credential=secret,
+                authority=authority,
+            )
             settings = get_settings()
             scopes = [s.strip() for s in (settings.graph_default_scopes or "").split() if s.strip()]
             if not scopes:
                 scopes = ["https://graph.microsoft.com/.default"]
-            result = await asyncio.to_thread(
-                app.acquire_token_for_client, scopes=scopes
-            )
+            try:
+                result = await asyncio.to_thread(
+                    app.acquire_token_for_client, scopes=scopes
+                )
+            except MsalServiceError as exc:
+                # AAD returned an error response — auth/config problem.
+                raise RuntimeError(
+                    f"failed to acquire Graph app token: {exc}"
+                ) from exc
+            except (MsalError, OSError) as exc:
+                # Network-level failure (DNS/connectivity/timeout; msal's
+                # requests stack raises RequestException which subclasses
+                # OSError, and non-service MsalError is client-side
+                # transport) — must classify as retryable network error,
+                # never a permanent recipient failure.
+                raise GraphNetworkError(
+                    f"failed to acquire Graph app token: {exc}"
+                ) from exc
             if "access_token" not in result:
                 err = result.get("error") or "unknown"
                 desc = result.get("error_description") or ""
                 raise RuntimeError(f"Failed to acquire Graph app token: {err} {desc}")
-            self._access_token = str(result["access_token"])
-            self._expires_at = now + int(result.get("expires_in", 3600))
-            return self._access_token
+            token = str(result["access_token"])
+            self._tokens[creds] = (token, now + int(result.get("expires_in", 3600)))
+            return token
 
     def reset(self) -> None:
-        self._access_token = ""
-        self._expires_at = 0.0
-        self._msal_app = None
+        self._tokens.clear()
 
 
 _token_cache = _AppTokenCache()
@@ -97,7 +150,45 @@ def reset_graph_token_cache() -> None:
 
 
 def _mailbox_upn() -> str:
-    return get_settings().graph_mailbox_upn.strip()
+    settings = get_settings()
+    return str(
+        getattr(settings, "email_shared_inbox_upn", "")
+        or settings.graph_mailbox_upn
+        or ""
+    ).strip()
+
+
+def representative_identity(account: dict[str, Any] | None = None) -> dict[str, str]:
+    """Resolve the address recipients should see, independent of quota account.
+
+    The actual account still controls the Graph ``/users/{upn}`` request and
+    quota accounting. It must never silently become the public From address.
+    """
+    settings = get_settings()
+    shared_upn = _mailbox_upn()
+    name = str(
+        getattr(settings, "email_representative_name", "")
+        or settings.email_from_name
+        or ""
+    ).strip()
+    address = str(
+        getattr(settings, "email_representative_address", "")
+        or settings.email_from_address
+        or shared_upn
+        or ""
+    ).strip()
+    reply_to = str(
+        getattr(settings, "email_representative_reply_to", "")
+        or settings.email_reply_to
+        or address
+        or ""
+    ).strip()
+    return {
+        "name": name,
+        "address": address,
+        "reply_to": reply_to,
+        "shared_inbox_upn": shared_upn,
+    }
 
 
 def account_upn(account: dict[str, Any] | None) -> str:
@@ -121,15 +212,19 @@ def account_upn(account: dict[str, Any] | None) -> str:
 
 async def _graph_request(method: str, url: str, *, json_body: dict | None = None,
                          headers: dict[str, str] | None = None,
-                         timeout: float = 30.0) -> tuple[int, dict | str]:
-    token = await _token_cache.get_token()
+                         timeout: float = 30.0,
+                         account: dict[str, Any] | None = None) -> tuple[int, dict | str]:
+    token = await _token_cache.get_token(account)
     h = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     if json_body is not None:
         h["Content-Type"] = "application/json"
     if headers:
         h.update(headers)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.request(method, f"{_GRAPH_BASE}{url}", headers=h, json=json_body)
+        # `url` is a relative path for regular calls, but Graph pagination
+        # hands back a FULL absolute URL in @odata.nextLink — accept both.
+        full_url = url if url.startswith(("http://", "https://")) else f"{_GRAPH_BASE}{url}"
+        resp = await client.request(method, full_url, headers=h, json=json_body)
     try:
         body = resp.json()
     except Exception:  # noqa: BLE001
@@ -155,8 +250,8 @@ async def send_via_graph(
 ) -> dict[str, Any]:
     """Send `body_text` to `to_email` using the shared Graph mailbox.
 
-    Returns the SAME 7-key dict shape as `_send_via_smtp_sync` so the
-    scheduler/reply_detector pipeline is provider-agnostic.
+    Returns the SAME 7-key dict shape the scheduler/reply_detector
+    pipeline expects, keeping it provider-agnostic.
 
     Implementation note — two-step send with a sendMail fallback:
 
@@ -174,15 +269,10 @@ async def send_via_graph(
     step is the same sendMail under the hood — and we get a real id
     back instead of one that the receiving MTA would reject.
 
-    Why we DON'T set `from` in the draft payload: with Application
-    permissions, Graph forces the sender to be the configured shared
-    mailbox. If we set `from` to the per-account `from_email` (which
-    might be a friendly alias or a different address), Graph silently
-    uses our value to build the auto-generated `Message-ID` but then
-    fails validation on the `/send` step with
-    `InvalidInternetMessageHeader` because the Message-ID's domain
-    doesn't match the actual sender mailbox. The safe move is to let
-    Graph assign `from` itself.
+    The explicit `from` address is the configured representative address.
+    Exchange must grant the actual account Send As permission; if that
+    permission is missing, both Graph paths fail and the caller must not
+    fall back to exposing the actual rotation account.
     """
     if not to_email.strip():
         return _err(account, "missing_recipient", "invalid_recipient", thread_key=thread_key, subject=subject)
@@ -190,11 +280,22 @@ async def send_via_graph(
     upn = account_upn(account)
     if not upn:
         return _err(account, "graph_not_configured", "auth_error", thread_key=thread_key, subject=subject)
+    identity = representative_identity(account)
+    if not identity["address"]:
+        return _err(
+            account,
+            "representative_sender_not_configured",
+            "configuration_error",
+            thread_key=thread_key,
+            subject=subject,
+        )
+    effective_reply_to = identity["reply_to"] or reply_to or identity["address"]
 
     # ── Primary: two-step create + send ───────────────────────────
     two_step_result = await _send_two_step(
         account, upn=upn, to_email=to_email, subject=subject,
-        body_text=body_text, reply_to=reply_to, thread_key=thread_key,
+        body_text=body_text, reply_to=effective_reply_to, thread_key=thread_key,
+        representative_name=identity["name"], representative_address=identity["address"],
         list_unsubscribe_url=list_unsubscribe_url,
         list_unsubscribe_mailto=list_unsubscribe_mailto,
         body_html=body_html,
@@ -207,7 +308,7 @@ async def send_via_graph(
     # would just add latency + a misleading second error.
     err_type = two_step_result.get("error_type", "")
     err = two_step_result.get("error", "")
-    if err_type in {"auth_error", "network_error"} or "missing_recipient" in err:
+    if err_type in {"auth_error", "network_error", "configuration_error"} or "missing_recipient" in err or "representative_sender" in err:
         return two_step_result
     if "graph_create_failed" in err:
         # Create itself failed — sendMail with the same payload is just
@@ -220,7 +321,8 @@ async def send_via_graph(
     )
     fallback = await _send_single_step(
         account, upn=upn, to_email=to_email, subject=subject,
-        body_text=body_text, reply_to=reply_to, thread_key=thread_key,
+        body_text=body_text, reply_to=effective_reply_to, thread_key=thread_key,
+        representative_name=identity["name"], representative_address=identity["address"],
         list_unsubscribe_url=list_unsubscribe_url,
         list_unsubscribe_mailto=list_unsubscribe_mailto,
         body_html=body_html,
@@ -248,11 +350,13 @@ async def _send_two_step(
     list_unsubscribe_url: str | None = None,
     list_unsubscribe_mailto: str | None = None,
     body_html: str | None = None,
+    representative_name: str = "",
+    representative_address: str = "",
 ) -> dict[str, Any]:
     try:
         # ── Step 1: create the draft message ──────────────────────
-        # Note: deliberately OMIT `from` so Graph assigns the shared
-        # mailbox as the sender. See the docstring above for why.
+        # Explicitly set the representative From. Exchange must grant the
+        # actual Graph account Send As permission for this address.
         # Inject the unsubscribe footer + RFC 8058 List-Unsubscribe
         # The plain-text body intentionally stays free of a visible
         # unsubscribe line — the localised unsubscribe card lives in
@@ -278,6 +382,7 @@ async def _send_two_step(
             "body": {"contentType": "HTML", "content": body_html},
             "bodyPreview": body_text or "",
             "toRecipients": [{"emailAddress": {"name": "", "address": to_email}}],
+            "from": {"emailAddress": {"name": representative_name, "address": representative_address}},
         }
         if reply_to:
             draft_payload["replyTo"] = [{"emailAddress": {"name": "", "address": reply_to}}]
@@ -299,6 +404,7 @@ async def _send_two_step(
             f"/users/{upn}/messages",
             json_body=draft_payload,
             timeout=30.0,
+            account=account,
         )
         if create_status not in (200, 201) or not isinstance(create_body, dict):
             err_code = ""
@@ -336,6 +442,7 @@ async def _send_two_step(
             "POST",
             f"/users/{upn}/messages/{graph_message_id}/send",
             timeout=30.0,
+            account=account,
         )
         if send_status in (202, 200):
             return {
@@ -346,6 +453,10 @@ async def _send_two_step(
                 "sent_at": datetime.now(timezone.utc).isoformat(),
                 "error": "",
                 "error_type": "",
+                "actual_sender_upn": upn,
+                "representative_address": representative_address,
+                "representative_name": representative_name,
+                "reply_to": reply_to or "",
             }
         # Send failed — best-effort delete the draft so it doesn't sit
         # in the user's Drafts folder. Ignore errors here; the real
@@ -355,6 +466,7 @@ async def _send_two_step(
                 "DELETE",
                 f"/users/{upn}/messages/{graph_message_id}",
                 timeout=10.0,
+                account=account,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -374,6 +486,8 @@ async def _send_two_step(
             subject=subject,
             extra=send_body if isinstance(send_body, (dict, str)) else str(send_body),
         )
+    except GraphNetworkError as exc:
+        return _err(account, f"graph_network:{exc}", "network_error", thread_key=thread_key, subject=subject)
     except RuntimeError as exc:
         return _err(account, f"graph_token:{exc}", "auth_error", thread_key=thread_key, subject=subject)
     except (httpx.HTTPError, TimeoutError) as exc:
@@ -395,6 +509,8 @@ async def _send_single_step(
     list_unsubscribe_url: str | None = None,
     list_unsubscribe_mailto: str | None = None,
     body_html: str | None = None,
+    representative_name: str = "",
+    representative_address: str = "",
 ) -> dict[str, Any]:
     """Single-shot sendMail — fallback when the two-step create+send fails.
 
@@ -404,8 +520,8 @@ async def _send_single_step(
     already implemented and works fine for this case.
     """
     try:
-        from_email = str(account.get("from_email") or upn)
-        from_name = str(account.get("from_name") or "")
+        from_email = representative_address
+        from_name = representative_name
         # Use the caller's HTML if it was passed in; otherwise render
         # it here (see _send_two_step for the rationale on why we
         # prefer HTML over plain text when sending through Graph).
@@ -430,8 +546,8 @@ async def _send_single_step(
                 parts.append(list_unsubscribe_mailto)
             parts.append(list_unsubscribe_url)
             message["internetMessageHeaders"] = [
-                {"name": "List-Unsubscribe", "value": ", ".join(f"<{p}>" for p in parts)},
-                {"name": "List-Unsubscribe-Post", "value": "List-Unsubscribe=One-Click"},
+                {"name": "X-List-Unsubscribe", "value": ", ".join(f"<{p}>" for p in parts)},
+                {"name": "X-List-Unsubscribe-Post", "value": "List-Unsubscribe=One-Click"},
             ]
         payload = {"message": message, "saveToSentItems": True}
         status_code, body = await _graph_request(
@@ -439,6 +555,7 @@ async def _send_single_step(
             f"/users/{upn}/sendMail",
             json_body=payload,
             timeout=30.0,
+            account=account,
         )
         if status_code in (202, 200):
             return {
@@ -452,6 +569,10 @@ async def _send_single_step(
                 "sent_at": datetime.now(timezone.utc).isoformat(),
                 "error": "",
                 "error_type": "",
+                "actual_sender_upn": upn,
+                "representative_address": representative_address,
+                "representative_name": representative_name,
+                "reply_to": reply_to or "",
             }
         err_code = ""
         if isinstance(body, dict):
@@ -469,6 +590,8 @@ async def _send_single_step(
             subject=subject,
             extra=body if isinstance(body, (dict, str)) else str(body),
         )
+    except GraphNetworkError as exc:
+        return _err(account, f"graph_network:{exc}", "network_error", thread_key=thread_key, subject=subject)
     except RuntimeError as exc:
         return _err(account, f"graph_token:{exc}", "auth_error", thread_key=thread_key, subject=subject)
     except (httpx.HTTPError, TimeoutError) as exc:
@@ -513,36 +636,47 @@ def _err(
 # Reply fetch (replaces IMAP for `provider_type == "graph"`)
 # ---------------------------------------------------------------------------
 
-async def fetch_graph_replies(
+async def fetch_graph_inbox_messages(
     account: dict[str, Any] | None = None,
     *,
     now_iso: str,
     recent_days: int = 14,
     limit: int = 100,
+    since_iso: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return a list of reply dicts in the same shape as `fetch_imap_replies()`.
+    """Fetch Inbox messages, including Graph's current ``isRead`` state.
 
-    Polls the account's own mailbox when the row carries a
-    `graph_user_principal_name`, otherwise the global shared mailbox —
-    replies land in whatever mailbox did the sending.
+    ``account`` selects the actual mailbox for compatibility scanning. Passing
+    ``None`` selects the configured shared Inbox first.
     """
     upn = account_upn(account)
     if not upn:
         return []
     try:
-        # Compute SINCE cutoff in ISO 8601 UTC.
-        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=recent_days)
+        # Callers can provide an exact cutoff (used by the send/receive test's
+        # calendar-day window). Normal reply polling keeps the rolling-day
+        # behavior through recent_days.
+        try:
+            if since_iso:
+                cutoff_dt = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+            else:
+                current_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+                if current_dt.tzinfo is None:
+                    current_dt = current_dt.replace(tzinfo=timezone.utc)
+                cutoff_dt = current_dt - timedelta(days=recent_days)
+        except (AttributeError, ValueError):
+            cutoff_dt = datetime.now(timezone.utc) - timedelta(days=recent_days)
+        if cutoff_dt.tzinfo is None:
+            cutoff_dt = cutoff_dt.replace(tzinfo=timezone.utc)
+        cutoff_dt = cutoff_dt.astimezone(timezone.utc)
         cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        # NOTE: do NOT include `inReplyToId` here — it doesn't exist on the
-        # Graph `Message` resource and causes the whole `$select` to 400
-        # with `RequestBroker--ParseUri`. The `In-Reply-To` header lives in
-        # `internetMessageHeaders` (a navigation property we can't include
-        # in a cheap `$select`); the matching loop falls back to
-        # conversationId + from_email + subject, which is enough for our
-        # use case.
+        # `inReplyToId` is not a Graph Message field. Read the standard
+        # In-Reply-To / References headers through internetMessageHeaders
+        # instead so replies still match when the recipient edits the subject.
+        mailbox_upn = account_upn(account)
         select_fields = (
-            "internetMessageId,conversationId,from,subject,receivedDateTime,"
-            "bodyPreview"
+            "id,internetMessageId,conversationId,isRead,from,toRecipients,ccRecipients,"
+            "subject,receivedDateTime,bodyPreview,hasAttachments,webLink,internetMessageHeaders"
         )
         url = (
             f"/users/{upn}/mailFolders/Inbox/messages"
@@ -554,47 +688,66 @@ async def fetch_graph_replies(
         results: list[dict[str, Any]] = []
         next_url = url
         while next_url and len(results) < limit:
-            status_code, body = await _graph_request("GET", next_url, timeout=30.0)
+            status_code, body = await _graph_request("GET", next_url, timeout=30.0, account=account)
             if status_code != 200 or not isinstance(body, dict):
                 logger.warning("Graph fetch_replies status=%s body=%s", status_code, body)
                 break
             for item in body.get("value", []) or []:
                 if len(results) >= limit:
                     break
+                graph_message_id = str(item.get("id") or "")
                 internet_message_id = str(item.get("internetMessageId") or "")
                 conversation_id = str(item.get("conversationId") or "")
                 sender = (item.get("from") or {}).get("emailAddress") or {}
                 from_email = str(sender.get("address") or "")
                 from_name = str(sender.get("name") or "")
+                def _recipients(key: str) -> list[dict[str, str]]:
+                    return [
+                        {
+                            "name": str((entry.get("emailAddress") or {}).get("name") or ""),
+                            "address": str((entry.get("emailAddress") or {}).get("address") or ""),
+                        }
+                        for entry in item.get(key, []) or []
+                    ]
                 subject = str(item.get("subject") or "")
                 received_at = str(item.get("receivedDateTime") or "")
                 body_preview = str(item.get("bodyPreview") or "")
-                in_reply_to = ""
-                raw_ref = f"graph:{internet_message_id or conversation_id or uuid.uuid4()}"
+                headers: dict[str, str] = {}
+                headers_lower: dict[str, str] = {}
+                for header in item.get("internetMessageHeaders", []) or []:
+                    name = str(header.get("name") or "").strip()
+                    if not name:
+                        continue
+                    value = str(header.get("value") or "")
+                    headers[name] = value
+                    headers_lower[name.lower()] = value
+                in_reply_to = headers_lower.get("in-reply-to", "")
+                references = headers_lower.get("references", "")
+                raw_ref = f"graph:{mailbox_upn}:{graph_message_id or internet_message_id or conversation_id or uuid.uuid4()}"
                 results.append({
                     "raw_ref": raw_ref,
+                    "mailbox_upn": mailbox_upn,
+                    "graph_message_id": graph_message_id,
                     "message_id": internet_message_id,
                     "conversation_id": conversation_id,
                     "in_reply_to": in_reply_to,
-                    "references": [],
+                    "references": references.replace(",", " ").split(),
                     "from_email": from_email,
                     "from_name": from_name,
                     "subject": subject,
                     "received_at": received_at,
                     "snippet": body_preview[:500],
-                    "headers": {
-                        "From": f"{from_name} <{from_email}>" if from_name else from_email,
-                        "Subject": subject,
-                        "Message-ID": internet_message_id,
-                        "In-Reply-To": in_reply_to,
-                    },
+                    "headers": headers,
+                    "to_recipients": _recipients("toRecipients"),
+                    "cc_recipients": _recipients("ccRecipients"),
+                    "is_read": bool(item.get("isRead", False)),
+                    "has_attachments": bool(item.get("hasAttachments", False)),
+                    "web_url": str(item.get("webLink") or ""),
                 })
-            raw_next = str(body.get("@odata.nextLink") or "")
-            if raw_next:
-                parsed = urlsplit(raw_next)
-                next_url = parsed.path + (f"?{parsed.query}" if parsed.query else "")
-            else:
-                next_url = ""
+            # @odata.nextLink is a full absolute URL — use it as-is.
+            # (The old path-only reassembly double-prefixed /v1.0/v1.0/
+            # and 404'd, silently dropping every page past the first.)
+            next_url = str(body.get("@odata.nextLink") or "")
         return results
     except (httpx.HTTPError, TimeoutError) as exc:
         logger.warning("Graph fetch_replies network error: %s", exc)
@@ -602,6 +755,51 @@ async def fetch_graph_replies(
     except Exception:  # noqa: BLE001
         logger.exception("Graph fetch_replies unexpected error")
         return []
+
+
+async def fetch_graph_replies(
+    account: dict[str, Any] | None = None,
+    *,
+    now_iso: str,
+    recent_days: int = 14,
+    limit: int = 100,
+    since_iso: str | None = None,
+) -> list[dict[str, Any]]:
+    """Backward-compatible alias for the Inbox fetcher."""
+    return await fetch_graph_inbox_messages(
+        account,
+        now_iso=now_iso,
+        recent_days=recent_days,
+        limit=limit,
+        since_iso=since_iso,
+    )
+
+
+def distinct_poll_accounts(
+    accounts: list[dict[str, Any]],
+    *,
+    compat_scan: bool = True,
+) -> list[dict[str, Any] | None]:
+    """Return shared Inbox first, then distinct account mailboxes."""
+    result: list[dict[str, Any] | None] = []
+    seen: set[str] = set()
+    shared = account_upn(None).lower()
+    if shared:
+        result.append({"id": "default", "status": "active"})
+        seen.add(shared)
+    if compat_scan:
+        for account in accounts:
+            if str(account.get("status", "active")) != "active":
+                continue
+            upn = account_upn(account).strip().lower()
+            if not upn or upn in seen:
+                continue
+            seen.add(upn)
+            result.append(account)
+    # Keep a stable legacy marker for callers/tests that expect an account
+    # object even when no connected rows exist. It still resolves to the
+    # shared UPN (or an empty mailbox and therefore no-op) at fetch time.
+    return result or [{"id": "default", "status": "active"}]
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +812,8 @@ async def test_graph_connection() -> dict[str, Any]:
         return {"ok": False, "error": "graph_mailbox_upn_not_set"}
     try:
         status_code, body = await _graph_request("GET", f"/users/{upn}", timeout=15.0)
+    except GraphNetworkError as exc:
+        return {"ok": False, "error": str(exc), "error_type": "network_error"}
     except RuntimeError as exc:
         return {"ok": False, "error": str(exc), "error_type": "auth_error"}
     except (httpx.HTTPError, TimeoutError) as exc:
@@ -657,6 +857,8 @@ async def list_tenant_users(*, limit: int = 200) -> dict[str, Any]:
     )
     try:
         status_code, body = await _graph_request("GET", url, timeout=30.0)
+    except GraphNetworkError as exc:
+        return {"ok": False, "error": str(exc), "error_type": "network_error", "users": [], "count": 0}
     except RuntimeError as exc:
         return {"ok": False, "error": str(exc), "error_type": "auth_error", "users": [], "count": 0}
     except (httpx.HTTPError, TimeoutError) as exc:
@@ -720,7 +922,7 @@ def graph_config_status() -> dict[str, Any]:
     return {
         "tenant_configured": bool(settings.graph_tenant_id.strip()),
         "client_configured": bool(settings.graph_client_id.strip()),
-        "mailbox": settings.graph_mailbox_upn.strip(),
+        "mailbox": _mailbox_upn(),
         "scopes": settings.graph_default_scopes.strip() or "https://graph.microsoft.com/.default",
         "admin_consent_url": admin_consent_url(),
     }

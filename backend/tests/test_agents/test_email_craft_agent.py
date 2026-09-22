@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -10,9 +11,12 @@ from agents.email_craft_agent import (
     _auto_improve_reviewed_sequence,
     _build_email_tools,
     _craft_for_lead,
+    _email_dict_with_html,
+    _fallback_email_from_template,
     _get_locale,
     _get_locale_rules,
     _rule_validate_emails_payload,
+    _sender_signature,
     email_craft_node,
 )
 from emailing.template_pipeline import build_fallback_template_profile
@@ -127,6 +131,24 @@ def _base_state(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def test_email_html_uses_recipient_bound_unsubscribe_link():
+    with (
+        patch(
+            "agents.email_craft_agent.get_settings",
+            return_value=SimpleNamespace(public_base_url="https://api.nineluan.com"),
+        ),
+        patch("emailing.unsubscribe.issue_token", return_value="signed-token") as issue_token,
+    ):
+        result = _email_dict_with_html(
+            {"body_text": "Hello", "locale": "en_US"},
+            recipient="BUYER@EXAMPLE.COM",
+        )
+
+    issue_token.assert_called_once_with("buyer@example.com")
+    assert "https://api.nineluan.com/api/unsubscribe/signed-token" in result["body_html"]
+    assert "__preview__" not in result["body_html"]
 
 
 class TestGetLocale:
@@ -388,6 +410,52 @@ class TestValidateEmailsTool:
         # We don't require pass, but no generic-phrase issue should
         # appear.
         assert not any("泛化营销话术" in issue for issue in result["issues"])
+
+    def test_rule_validator_flags_arbitrary_placeholders_and_sender_contacts(self):
+        payload = [{
+            "sequence_number": 1,
+            "email_type": "company_intro",
+            "subject": "A concrete product discussion",
+            "body_text": (
+                "Dear team, our SX-5000 inverter reaches 98.5% efficiency and is CE certified. "
+                "I would like to understand your sourcing plans for this category. "
+                "[Your Title] [Your Contact Information] "
+                "Please reach me at sales@example.com or Phone: +1 202 555 0199. "
+                "Best regards, [Your LinkedIn Profile or Website]"
+            ),
+            "suggested_send_day": 0,
+        }]
+
+        result = _rule_validate_emails_payload(payload)
+
+        assert result["passed"] is False
+        assert any("占位符" in issue for issue in result["issues"])
+        assert any("邮箱地址" in issue or "电话号码" in issue for issue in result["issues"])
+
+    def test_template_fallback_removes_unknown_placeholders_and_contacts(self):
+        result = _fallback_email_from_template(
+            "Potential fit\n"
+            "Hello {company_name}, our SX-5000 inverter may fit your portfolio.\n\n"
+            "[Your Title]\n"
+            "Phone: +1 202 555 0199\n"
+            "[Your Contact Information]",
+            lead={"company_name": "Acme", "industry": "Distribution"},
+            target={"target_name": "Buyer", "target_title": "Purchasing Manager"},
+            fallback_subject="Quick note",
+            fallback_locale="en_US",
+        )
+
+        assert "[" not in result["subject"] + result["body_text"]
+        assert "202 555 0199" not in result["body_text"]
+        assert "Phone:" not in result["body_text"]
+
+    def test_signature_drops_contact_lines(self):
+        class Settings:
+            email_signature_block = "Alex Smith\nSales Director\nemail: sales@example.com\nhttps://example.com"
+            email_from_name = ""
+            email_from_address = "sales@example.com"
+
+        assert _sender_signature(Settings()) == "Alex Smith\nSales Director"
 
     @pytest.mark.asyncio
     async def test_hunter_enriches_lead_when_no_decision_makers(self):

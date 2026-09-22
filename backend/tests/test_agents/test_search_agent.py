@@ -9,6 +9,7 @@ from agents.search_agent import (
     _build_maps_snippet,
     _is_china_region,
     _maps_search_keyword,
+    _resolve_geo_params,
     _result_identity_key,
     search_node,
 )
@@ -211,6 +212,11 @@ class TestSearchNode:
         state = _base_state(keywords=[])
         result = await search_node(state)
         assert result["current_stage"] == "search"
+
+
+class TestRegionLookup:
+    def test_resolves_flagged_region(self):
+        assert _resolve_geo_params(["🇩🇪 Germany"]) == {"gl": "de", "hl": "de"}
 
 
 class TestIsChinaRegion:

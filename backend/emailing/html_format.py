@@ -348,3 +348,23 @@ def render_preview_html(body_text: str, locale: Optional[str] = None) -> str:
         unsubscribe_url=_UNSUBSCRIBE_PLACEHOLDER_URL,
         locale=locale,
     )
+
+
+def prepare_send_html(
+    body_text: str,
+    body_html: str | None,
+    unsubscribe_url: str,
+    locale: Optional[str] = None,
+) -> str:
+    """Replace stored preview links while retaining the localized HTML card."""
+    if not body_html:
+        return plaintext_to_html(body_text, unsubscribe_url=unsubscribe_url, locale=locale)
+    escaped_url = _html.escape(unsubscribe_url, quote=True)
+    rendered, replaced = re.subn(
+        r"https?://[^\s\"'<>]+/api/unsubscribe/[^\s\"'<>]+",
+        lambda _: escaped_url,
+        body_html,
+    )
+    if not replaced and escaped_url not in rendered:
+        rendered += _unsubscribe_card_html(unsubscribe_url, locale=locale)
+    return rendered

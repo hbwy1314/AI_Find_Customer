@@ -253,14 +253,40 @@ class TestShouldContinueHunting:
         state = self._make_state(leads=leads, hunt_round=11, max_rounds=10)
         assert should_continue_hunting(state) == "finish"
 
+    def test_finish_when_max_rounds_reached(self):
+        leads = [{"company": f"C{i}"} for i in range(50)]
+        state = self._make_state(leads=leads, hunt_round=10, max_rounds=10)
+        assert should_continue_hunting(state) == "finish"
+
     def test_finish_on_diminishing_returns(self):
         leads = [{"company": f"C{i}"} for i in range(53)]
         state = self._make_state(
             leads=leads,
             hunt_round=3,
+            low_yield_rounds=2,
             round_feedback=self._feedback(round_num=2, new_leads=3),
         )
         assert should_continue_hunting(state) == "finish"
+
+    def test_continue_low_yield_when_far_below_target(self):
+        leads = [{"company": f"C{i}"} for i in range(9)]
+        state = self._make_state(
+            leads=leads,
+            hunt_round=4,
+            low_yield_rounds=2,
+            round_feedback=self._feedback(round_num=3, new_leads=2),
+        )
+        assert should_continue_hunting(state) == "continue"
+
+    def test_continue_after_one_low_yield_round(self):
+        leads = [{"company": f"C{i}"} for i in range(53)]
+        state = self._make_state(
+            leads=leads,
+            hunt_round=3,
+            low_yield_rounds=1,
+            round_feedback=self._feedback(round_num=2, new_leads=3),
+        )
+        assert should_continue_hunting(state) == "continue"
 
     def test_no_diminishing_returns_on_round_1(self):
         leads = [{"company": f"C{i}"} for i in range(3)]
@@ -283,18 +309,18 @@ class TestShouldContinueHunting:
         assert should_continue_hunting(state) == "continue"
 
     def test_finish_with_leads_below_threshold(self):
-        # default configured threshold = 5; new_leads=4 < 5 → finish
+        # One low-yield round is not enough to stop a hunt.
         leads = [{"company": f"C{i}"} for i in range(54)]
         state = self._make_state(
             leads=leads,
             hunt_round=3,
             round_feedback=self._feedback(round_num=2, new_leads=4),
         )
-        assert should_continue_hunting(state) == "finish"
+        assert should_continue_hunting(state) == "continue"
 
     def test_threshold_does_not_scale_with_small_target(self):
         # target size should not silently change the configured stopping threshold
-        # new_leads=2 < default threshold 5 → finish
+        # but one low-yield round still gets one more search round.
         leads = [{"company": f"C{i}"} for i in range(12)]
         state = self._make_state(
             leads=leads,
@@ -302,7 +328,7 @@ class TestShouldContinueHunting:
             hunt_round=3,
             round_feedback=self._feedback(round_num=2, new_leads=2),
         )
-        assert should_continue_hunting(state) == "finish"
+        assert should_continue_hunting(state) == "continue"
 
     def test_defaults_when_fields_missing(self):
         state = {"leads": [{"company": "X"}]}

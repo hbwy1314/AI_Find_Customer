@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -11,19 +12,31 @@ import pytest
 from agents.lead_extract_agent import (
     _apply_evidence_to_scores,
     _candidate_budget,
+    _competitor_rejection_reason,
     _has_concrete_customs_data,
     _is_generic_mailbox,
     _normalize_decision_maker_emails,
+    _preferred_customer_role,
     _quick_gate_candidate,
     _scrape_and_extract,
+    _strongest_competitor_risk,
     _verify_lead_emails,
     lead_extract_node,
 )
+from api import hunt_store
 from emailing.store import EmailStore
+
+
+@pytest.fixture(autouse=True)
+def isolated_current_tasks(tmp_path, monkeypatch):
+    monkeypatch.setattr(hunt_store, "get_settings", lambda: SimpleNamespace(hunts_dir=str(tmp_path / "hunts")))
+    for hid in ("test-hunt", "hunt-a", "hunt-b", "hunt-vape"):
+        hunt_store.save_hunt(hid, {"result": {"leads": []}})
 
 
 def _base_state(**overrides):
     base = {
+        "hunt_id": "test-hunt",
         "website_url": "https://solartech.de",
         "product_keywords": ["solar inverter"],
         "target_regions": ["Europe"],
@@ -83,6 +96,24 @@ INVALID_REACT_RESULT = json.dumps({
 })
 
 
+class TestCompetitorSignals:
+    def test_keeps_strongest_risk_across_gate_and_deep_research(self):
+        assert _strongest_competitor_risk("low", "medium") == "medium"
+        assert _strongest_competitor_risk("high", "low") == "high"
+        assert _strongest_competitor_risk("moderate", "unknown") == "medium"
+
+    def test_prefers_deep_research_customer_role(self):
+        assert _preferred_customer_role("manufacturer", "distributor") == "manufacturer"
+        assert _preferred_customer_role("unknown", "wholesaler") == "wholesaler"
+
+    def test_medium_risk_is_rejected_even_without_manufacturer_role(self):
+        reason = _competitor_rejection_reason({
+            "competitor_risk": "medium",
+            "customer_role": "distributor",
+        })
+        assert reason == "Explicit medium competitor risk"
+
+
 class TestScrapeAndExtract:
     """Tests for _scrape_and_extract which delegates to react_loop."""
 
@@ -104,6 +135,32 @@ class TestScrapeAndExtract:
         assert result["match_score"] == 0.85
         assert "info@solartech.de" in result["emails"]
         assert result["source_keyword"] == "kw1"
+
+    @pytest.mark.asyncio
+    async def test_normalizes_valid_phones_and_removes_invalid_phones(self):
+        sem = asyncio.Semaphore(5)
+        data = json.loads(VALID_REACT_RESULT)
+        data.update({
+            "country_code": "ES",
+            "address": "Barcelona, España",
+            "phone_numbers": [
+                "+34 967 810 126",
+                "684 365 166",
+                "7404-16970-",
+                "973-799-0901",
+            ],
+        })
+
+        with patch("agents.lead_extract_agent.react_loop", return_value=json.dumps(data)):
+            result = await _scrape_and_extract(
+                {"link": "https://supplier.es", "source_keyword": "kw1"},
+                AsyncMock(), AsyncMock(), sem,
+                insight={"products": ["solar inverter"]},
+                google_search=AsyncMock(),
+            )
+
+        assert result is not None
+        assert result["phone_numbers"] == ["+34 967 81 01 26", "+34 684 36 51 66"]
 
     @pytest.mark.asyncio
     async def test_invalid_lead_returns_none(self):
@@ -296,7 +353,7 @@ class TestCandidateBudget:
 
         jina = AsyncMock()
         jina.read = AsyncMock(return_value=(
-            "# Company Page\nContact us at hello@acmecorp.com or call +1 555 123 4567. "
+            "# Company Page\nContact us at hello@acmecorp.com or call +1 703 848 7947. "
             "Visit https://linkedin.com/company/acme for more info. "
             "Enough text to pass the minimum length check for scraping."
         ))
@@ -371,8 +428,8 @@ class TestQuickGate:
         assert "directory" in gate["risk_flags"]
 
     @pytest.mark.asyncio
-    async def test_quick_gate_keeps_possible_channel_even_with_competitor_risk(self):
-        """QuickGate should allow distributors even with high competitor_risk."""
+    async def test_quick_gate_rejects_possible_competitor_even_if_channel(self):
+        """Any explicit possible-competitor signal is excluded from the hunt."""
         llm = AsyncMock()
         llm.generate = AsyncMock(return_value=json.dumps({
             "pass_gate": True,
@@ -391,10 +448,37 @@ class TestQuickGate:
             {"products": ["micro switch"]},
         )
 
-        assert passed is True
+        assert passed is False
         assert gate["customer_role_guess"] == "distributor"
-        # High competitor_risk is allowed when role is distributor/importer/wholesaler
         assert gate["competitor_risk"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_final_extraction_rejects_competitor_risk(self):
+        sem = asyncio.Semaphore(5)
+        jina = AsyncMock()
+        llm = AsyncMock()
+        google = AsyncMock()
+        competitor_result = json.loads(VALID_REACT_RESULT)
+        competitor_result.update({
+            "competitor_risk": "high",
+            "risk_flags": ["possible_competitor"],
+            "customer_role": "manufacturer",
+        })
+
+        with patch(
+            "agents.lead_extract_agent.react_loop",
+            return_value=json.dumps(competitor_result),
+        ):
+            result = await _scrape_and_extract(
+                {"link": "https://competitor.example", "source_keyword": "kw1"},
+                jina,
+                llm,
+                sem,
+                insight={"products": ["solar inverter"]},
+                google_search=google,
+            )
+
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_react_tool_find_customs_data(self):
@@ -438,7 +522,7 @@ class TestLeadExtractNode:
         assert len(result["leads"]) > 0
 
     @pytest.mark.asyncio
-    async def test_deduplicates_by_domain(self):
+    async def test_deduplicates_by_company_name(self):
         state = _base_state(search_results=[
             {"link": "https://solartech.de/about", "source_keyword": "kw1"},
             {"link": "https://solartech.de/products", "source_keyword": "kw1"},
@@ -458,9 +542,7 @@ class TestLeadExtractNode:
 
             result = await lead_extract_node(state)
 
-        # Both URLs have same domain solartech.de — should only get 1 lead
-        domains = [l["source"] for l in result["leads"]]
-        assert domains.count("solartech.de") == 1
+        assert len(result["leads"]) == 1
 
     @pytest.mark.asyncio
     async def test_skips_already_extracted_domains(self):
@@ -492,7 +574,10 @@ class TestLeadExtractNode:
                     "title": "Known Solar",
                     "link": "https://known-solar.example/",
                     "source": "google_maps",
-                    "maps_data": {"website": "https://known-solar.example/"},
+                    "maps_data": {
+                        "title": "Known Solar",
+                        "website": "https://known-solar.example/",
+                    },
                 },
             ],
         )
@@ -500,7 +585,7 @@ class TestLeadExtractNode:
         registry.list_lead_registry_keys.return_value = {"domain:known-solar.example"}
 
         with (
-            patch("agents.lead_extract_agent.EmailStore", return_value=registry),
+            patch("agents.lead_extract_agent.current_lead_keys", return_value={"company:known solar"}),
             patch("agents.lead_extract_agent.get_settings") as mock_settings,
             patch("agents.lead_extract_agent._scrape_and_extract", new_callable=AsyncMock) as mock_scrape,
         ):
@@ -649,8 +734,8 @@ class TestLeadExtractNode:
         assert len(result["leads"]) == 2
 
     @pytest.mark.asyncio
-    async def test_dedupes_platform_results_by_official_website(self):
-        """Platform URLs should dedupe only when extracted official website matches."""
+    async def test_platform_results_with_different_company_names_are_kept(self):
+        """Shared official domains do not merge different company names."""
         state = _base_state(
             search_results=[
                 {"link": "https://thomasnet.com/company/acme-a", "source_keyword": "kw1"},
@@ -695,7 +780,7 @@ class TestLeadExtractNode:
 
             result = await lead_extract_node(state)
 
-        assert len(result["leads"]) == 1
+        assert len(result["leads"]) == 2
 
     @pytest.mark.asyncio
     async def test_empty_search_results(self):
@@ -737,8 +822,8 @@ class TestLeadExtractNode:
         assert call_count["n"] == 1
 
     @pytest.mark.asyncio
-    async def test_does_not_dedupe_same_name_different_regions(self):
-        """Same company name in different regions should NOT be deduped if they have different identities."""
+    async def test_orphan_registry_does_not_block_extraction(self):
+        """Registry-only customers without current tasks do not block extraction."""
         import tempfile
 
         from agents.lead_identity import lead_identity_keys
@@ -796,7 +881,7 @@ class TestLeadExtractNode:
                  patch("agents.lead_extract_agent.GoogleSearchTool") as MockGoogle, \
                  patch("agents.lead_extract_agent.react_loop", return_value=react_result), \
                  patch("agents.lead_extract_agent.get_settings") as mock_settings, \
-                 patch("agents.lead_extract_agent.EmailStore", return_value=store):
+                 patch("agents.lead_extract_agent.current_lead_keys", return_value=set()):
 
                 mock_settings.return_value.scrape_concurrency = 5
                 mock_settings.return_value.email_db_path = str(db_path)
@@ -902,7 +987,7 @@ class TestLeadExtractNode:
                  patch("agents.lead_extract_agent.GoogleSearchTool") as MockGoogle, \
                  patch("agents.lead_extract_agent.react_loop", side_effect=counting_react_loop), \
                  patch("agents.lead_extract_agent.get_settings") as mock_settings, \
-                 patch("agents.lead_extract_agent.EmailStore", return_value=store):
+                 patch("agents.lead_extract_agent.current_lead_keys", return_value=set()):
 
                 mock_settings.return_value.scrape_concurrency = 5
                 mock_settings.return_value.email_db_path = str(db_path)
@@ -913,8 +998,9 @@ class TestLeadExtractNode:
 
                 result = await lead_extract_node(state)
 
-            # Should only scrape new-c.com (existing-a and existing-b filtered by global dedup)
-            assert scrape_call_count["n"] == 1
+            # Company-name identity is applied after extraction; URLs alone do
+            # not prevent researching candidates in a continued hunt.
+            assert scrape_call_count["n"] == 3
             
             # Result should contain all 3 leads: 2 existing + 1 new
             assert len(result["leads"]) == 3
@@ -929,8 +1015,8 @@ class TestLeadExtractNode:
             assert new_lead["emails"] == ["sales@new-c.com"]
 
     @pytest.mark.asyncio
-    async def test_same_company_name_different_regions_not_deduped(self):
-        """Same company name in different regions should NOT be deduplicated."""
+    async def test_distinct_extracted_names_and_domains_remain_distinct(self):
+        """Distinct official identities remain distinct despite similar search titles."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "test_registry.db"
             store = EmailStore(str(db_path))
@@ -1032,7 +1118,7 @@ class TestLeadExtractNode:
                  patch("agents.lead_extract_agent.GoogleSearchTool") as MockGoogle, \
                  patch("agents.lead_extract_agent.react_loop", side_effect=indexed_react_loop), \
                  patch("agents.lead_extract_agent.get_settings") as mock_settings, \
-                 patch("agents.lead_extract_agent.EmailStore", return_value=store):
+                 patch("agents.lead_extract_agent.current_lead_keys", return_value=set()):
 
                 mock_settings.return_value.scrape_concurrency = 5
                 mock_settings.return_value.email_db_path = str(db_path)
@@ -1068,7 +1154,7 @@ class TestCollectedContactsMerge:
         jina = AsyncMock()
         jina.read = AsyncMock(return_value=(
             "# Company Page\nContact us at hello@acmecorp.com or sales@acmecorp.com. "
-            "Call +1 555 123 4567. Visit https://linkedin.com/company/acme. "
+            "Call +1 703 848 7947. Visit https://linkedin.com/company/acme. "
             "Enough text to pass the minimum length check for scraping."
         ))
         collected = {"emails": set(), "phones": set(), "social": {}}
@@ -1525,11 +1611,11 @@ class TestFinalDedupSafetyNet:
 
 
 class TestExistingLeadsGlobalDedup:
-    """Test that existing_leads are filtered against global registry to prevent
-    cross-hunt duplicates from being preserved during continue mining."""
+    """Inherited customers are never discarded because of an old registry owner."""
 
-    def test_existing_leads_filtered_against_global_registry(self, tmp_path: Path):
-        """Existing leads from other hunts should be removed when continuing mining."""
+    @pytest.mark.asyncio
+    async def test_existing_leads_preserved_across_hunt_ids(self, tmp_path: Path):
+        """Retry must retain the complete inherited baseline."""
         from agents.lead_identity import lead_identity_keys
         from emailing.store import EmailStore
 
@@ -1555,25 +1641,12 @@ class TestExistingLeadsGlobalDedup:
             {"company_name": "Gamma Inc", "website": "https://gamma.com", "emails": []},  # actually belongs to hunt-beta
         ]
 
-        # Simulate filtering existing_leads against global registry
-        filtered = []
-        for lead in existing_leads:
-            keys = lead_identity_keys(lead)
-            # Check if any key belongs to a different hunt
-            belongs_to_other = False
-            for key in keys:
-                owner = store.get_hunt_id_for_key(key)
-                if owner and owner != "hunt-beta":
-                    belongs_to_other = True
-                    break
-            if not belongs_to_other:
-                filtered.append(lead)
+        result = await lead_extract_node(_base_state(
+            hunt_id="hunt-beta", leads=existing_leads, search_results=[]))
+        assert result["leads"] == existing_leads
 
-        # Only Gamma Inc should remain (not registered by any hunt yet)
-        assert len(filtered) == 1
-        assert filtered[0]["company_name"] == "Gamma Inc"
-
-    def test_existing_leads_preserved_when_belonging_to_current_hunt(self, tmp_path: Path):
+    @pytest.mark.asyncio
+    async def test_existing_leads_preserved_when_belonging_to_current_hunt(self, tmp_path: Path):
         """Leads originally from current hunt should be preserved."""
         from agents.lead_identity import lead_identity_keys
         from emailing.store import EmailStore
@@ -1598,30 +1671,17 @@ class TestExistingLeadsGlobalDedup:
             {"company_name": "Beta Ltd", "website": "https://beta.com", "emails": []},
         ]
 
-        # Filter against global registry
-        filtered = []
-        for lead in existing_leads:
-            keys = lead_identity_keys(lead)
-            belongs_to_other = False
-            for key in keys:
-                owner = store.get_hunt_id_for_key(key)
-                if owner and owner != "hunt-alpha":
-                    belongs_to_other = True
-                    break
-            if not belongs_to_other:
-                filtered.append(lead)
-
-        # Both should be preserved (they belong to hunt-alpha)
-        assert len(filtered) == 2
-        assert {lead["company_name"] for lead in filtered} == {"Acme Corp", "Beta Ltd"}
+        result = await lead_extract_node(_base_state(
+            hunt_id="hunt-alpha", leads=existing_leads, search_results=[]))
+        assert result["leads"] == existing_leads
 
 
 class TestCandidateGlobalDedup:
     """Test pre-scrape global deduplication using candidate_identity_keys."""
 
     @pytest.mark.asyncio
-    async def test_same_name_different_place_not_deduped(self):
-        """同名公司但不同place_id应该不被去重"""
+    async def test_orphan_registry_does_not_block_maps_candidate(self):
+        """仅存在于旧注册表、现存任务没有的客户可以重新抓取。"""
         import tempfile
         from pathlib import Path
 
@@ -1689,7 +1749,7 @@ class TestCandidateGlobalDedup:
                  patch("agents.lead_extract_agent.GoogleSearchTool") as MockGoogle, \
                  patch("agents.lead_extract_agent.react_loop", return_value=react_result), \
                  patch("agents.lead_extract_agent.get_settings") as mock_settings, \
-                 patch("agents.lead_extract_agent.EmailStore", return_value=store):
+                 patch("agents.lead_extract_agent.current_lead_keys", return_value=set()):
 
                 mock_settings.return_value.scrape_concurrency = 5
 
@@ -1723,8 +1783,8 @@ class TestCandidateGlobalDedup:
                 assert result["leads"][0]["company_name"] == "Vape Store Warsaw"
 
     @pytest.mark.asyncio
-    async def test_same_domain_is_deduped(self):
-        """相同域名的候选应该被去重"""
+    async def test_same_domain_with_different_company_is_allowed(self):
+        """相同域名但公司名称不同的候选不能被域名规则误杀"""
         import tempfile
         from pathlib import Path
 
@@ -1735,7 +1795,7 @@ class TestCandidateGlobalDedup:
             store = EmailStore(str(Path(tmpdir) / "test.db"))
             store.init_db()
 
-            # Hunt A 已经收集了 acme.com
+            # Hunt A 已经收集了 Acme Corp；同域名的新公司名仍应允许抓取。
             hunt_a_lead = {
                 "company_name": "Acme Corp",
                 "website": "https://acme.com",
@@ -1749,7 +1809,7 @@ class TestCandidateGlobalDedup:
                 now_iso="2026-01-01"
             )
 
-            # Hunt B 搜索到同一个域名
+            # Hunt B 搜索到同一个域名但不同公司名
             state = {
                 "hunt_id": "hunt-b",
                 "hunt_round": 1,
@@ -1771,7 +1831,7 @@ class TestCandidateGlobalDedup:
                  patch("agents.lead_extract_agent.LLMTool") as MockLLM, \
                  patch("agents.lead_extract_agent.GoogleSearchTool") as MockGoogle, \
                  patch("agents.lead_extract_agent.get_settings") as mock_settings, \
-                 patch("agents.lead_extract_agent.EmailStore", return_value=store):
+                  patch("agents.lead_extract_agent.current_lead_keys", return_value={"company:acme corp"}):
 
                 mock_settings.return_value.scrape_concurrency = 5
 
@@ -1789,8 +1849,6 @@ class TestCandidateGlobalDedup:
 
                 result = await lead_extract_node(state)
 
-                # 不应该抓取任何新线索（acme.com已被hunt-a拥有）
+                # 公司名不同，不应因共享域名而被预过滤。
                 leads = result.get("leads", [])
-                assert len(leads) == 0
-                # Jina不应该被调用（候选在抓取前被过滤）
-                jina_instance.read.assert_not_called()
+                assert len(leads) == 1

@@ -11,6 +11,9 @@ from __future__ import annotations
 import re
 from urllib.parse import urljoin, urlparse
 
+import phonenumbers
+from phonenumbers import PhoneMetadata, PhoneNumberFormat, NumberParseException
+
 # ── Phone number extraction ────────────────────────────────────────────
 
 # Matches international phone formats:
@@ -38,6 +41,21 @@ _PHONE_REGEX = re.compile(
 _PHONE_MIN_DIGITS = 7
 _PHONE_MAX_DIGITS = 15
 _PHONE_MAX_PER_LEAD = 10
+
+_COUNTRY_NAME_TO_REGION = {
+    "australia": "AU", "brazil": "BR", "canada": "CA", "china": "CN",
+    "france": "FR", "germany": "DE", "india": "IN", "italy": "IT",
+    "japan": "JP", "mexico": "MX", "netherlands": "NL", "poland": "PL",
+    "portugal": "PT", "russia": "RU", "saudi arabia": "SA", "south korea": "KR",
+    "spain": "ES", "turkey": "TR", "united arab emirates": "AE",
+    "united kingdom": "GB", "uk": "GB", "england": "GB",
+    "united states": "US", "usa": "US",
+    "españa": "ES", "deutschland": "DE", "francia": "FR", "italia": "IT",
+}
+
+_NON_COUNTRY_TLDS = {
+    "com", "org", "net", "info", "biz", "co", "io", "ai", "shop", "store",
+}
 
 
 def _normalize_phone_digits(raw: str) -> str:
@@ -95,7 +113,64 @@ def _is_valid_phone(raw: str) -> bool:
     return True
 
 
-def extract_phone_numbers(text: str) -> list[str]:
+def _phone_region_hint(country_code: str = "", address: str = "", website: str = "") -> str | None:
+    direct = str(country_code or "").strip().upper()
+    if direct in phonenumbers.SUPPORTED_REGIONS:
+        return direct
+
+    address_lower = str(address or "").lower()
+    for name, region in _COUNTRY_NAME_TO_REGION.items():
+        if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", address_lower):
+            return region
+
+    host = urlparse(str(website or "") if "://" in str(website or "") else f"//{website}").hostname or ""
+    tld = host.lower().rstrip(".").rsplit(".", 1)[-1] if "." in host else ""
+    if len(tld) == 2 and tld not in _NON_COUNTRY_TLDS:
+        region = "GB" if tld == "uk" else tld.upper()
+        if region in phonenumbers.SUPPORTED_REGIONS:
+            return region
+    return None
+
+
+def normalize_phone_number(
+    raw: str,
+    *,
+    country_code: str = "",
+    address: str = "",
+    website: str = "",
+) -> str | None:
+    """Validate a number against regional numbering rules and format it internationally."""
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip().rstrip(".,;:")
+    if not cleaned or cleaned.endswith(("-", "/")):
+        return None
+    if cleaned.count("(") != cleaned.count(")") or not _is_valid_phone(cleaned):
+        return None
+
+    region = _phone_region_hint(country_code, address, website)
+    parse_value = re.sub(r"^00", "+", cleaned)
+    if not parse_value.startswith("+") and not region:
+        return None
+    if not parse_value.startswith("+") and region:
+        digits = re.sub(r"\D", "", parse_value)
+        metadata = PhoneMetadata.metadata_for_region(region)
+        national_prefix = str(getattr(metadata, "national_prefix", "") or "")
+        if region in {"US", "CA"}:
+            if len(digits) not in {10, 11} or (len(digits) == 11 and not digits.startswith("1")):
+                return None
+        elif national_prefix and not digits.startswith(national_prefix):
+            return None
+    try:
+        parsed = phonenumbers.parse(parse_value, region)
+    except NumberParseException:
+        return None
+    if not phonenumbers.is_possible_number(parsed) or not phonenumbers.is_valid_number(parsed):
+        return None
+    return phonenumbers.format_number(parsed, PhoneNumberFormat.INTERNATIONAL)
+
+
+def extract_phone_numbers(text: str, country_code: str = "") -> list[str]:
     """Extract unique, validated phone numbers from text.
 
     Filters out: GPS coordinates, all-zero strings, ISO standard numbers,
@@ -110,17 +185,27 @@ def extract_phone_numbers(text: str) -> list[str]:
         cleaned = raw.strip()
         if not _is_valid_phone(cleaned):
             continue
-        digits = _normalize_phone_digits(cleaned)
+        normalized = normalize_phone_number(cleaned, country_code=country_code)
+        if (cleaned.startswith("+") or cleaned.startswith("00") or country_code) and not normalized:
+            continue
+        display = normalized or cleaned
+        digits = _normalize_phone_digits(display)
         if digits not in seen:
             seen.add(digits)
-            result.append(cleaned)
+            result.append(display)
         if len(result) >= _PHONE_MAX_PER_LEAD:
             break
 
     return result
 
 
-def sanitize_phone_list(phones: list[str]) -> list[str]:
+def sanitize_phone_list(
+    phones: list[str],
+    *,
+    country_code: str = "",
+    address: str = "",
+    website: str = "",
+) -> list[str]:
     """Validate and deduplicate a list of phone strings (e.g. from LLM output).
 
     Use this to clean phone_numbers lists returned by the LLM before storing.
@@ -130,13 +215,18 @@ def sanitize_phone_list(phones: list[str]) -> list[str]:
     for raw in phones:
         if not isinstance(raw, str):
             continue
-        cleaned = raw.strip()
-        if not _is_valid_phone(cleaned):
+        normalized = normalize_phone_number(
+            raw,
+            country_code=country_code,
+            address=address,
+            website=website,
+        )
+        if not normalized:
             continue
-        digits = _normalize_phone_digits(cleaned)
+        digits = _normalize_phone_digits(normalized)
         if digits not in seen:
             seen.add(digits)
-            result.append(cleaned)
+            result.append(normalized)
         if len(result) >= _PHONE_MAX_PER_LEAD:
             break
     return result

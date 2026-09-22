@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -10,10 +11,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from api.hunt_store import load_hunt, save_hunt
 from config.settings import get_settings
 from emailing.email_sender import send_email
-from emailing.html_format import _UNSUBSCRIBE_PLACEHOLDER_URL as _HTML_UNSUBSCRIBE_PLACEHOLDER
+from emailing.html_format import prepare_send_html
 from emailing.policy import is_role_based_email
 from emailing.store import EmailStore
-from emailing.unsubscribe import build_mailto_unsubscribe, build_unsubscribe_url, issue_token
+from emailing.unsubscribe import build_unsubscribe_url, issue_token
+
+logger = logging.getLogger(__name__)
 
 _scheduler_lock = asyncio.Lock()
 
@@ -50,6 +53,12 @@ def _next_business_time(current: datetime, settings) -> datetime:
     if start_minutes == end_minutes:
         return current
 
+    # Support overnight windows (e.g. 22:00→06:00): the send window wraps
+    # midnight, and the "closed" gap is [end, start). Without this the
+    # plain start<end logic below never matches and every message would be
+    # deferred forever.
+    overnight = start_minutes > end_minutes
+
     for _ in range(8):
         if bool(getattr(settings, "email_weekdays_only", True)) and local.weekday() >= 5:
             local = (local + timedelta(days=7 - local.weekday())).replace(
@@ -57,6 +66,11 @@ def _next_business_time(current: datetime, settings) -> datetime:
             )
             continue
         minutes = local.hour * 60 + local.minute
+        if overnight:
+            if end_minutes <= minutes < start_minutes:
+                # In the closed gap — jump to the window start later today.
+                local = local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+            return local.astimezone(timezone.utc)
         if minutes < start_minutes:
             local = local.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
         elif minutes >= end_minutes:
@@ -231,6 +245,11 @@ async def _run_scheduler_once(
     # the count for every send.
     sent_today_cache: dict[str, int] = {}
     sent_hour_cache: dict[str, int] = {}
+    # (hunt_id, campaign_id) pairs touched by this pass — the hunt-level
+    # email summary is refreshed once per pair AFTER the loop instead of
+    # once per job, so a pass with N jobs doesn't do N full campaign
+    # scans + N full hunt-JSON writes.
+    touched: set[tuple[str, str]] = set()
     for job in jobs:
         message_id = str(job["id"])
         claim_token = str(job.get("claim_token", "") or "")
@@ -306,7 +325,10 @@ async def _run_scheduler_once(
                 used_hour = store.count_sent_last_hour_for_account(account_id, now_iso=current)
                 sent_hour_cache[account_id] = used_hour
             if used_hour >= hourly_limit:
-                retry_at = current_dt + timedelta(hours=1, seconds=5)
+                # The hourly counter is a rolling 1h window, so a shorter
+                # retry delay recovers as soon as the window drains instead
+                # of always waiting a full hour.
+                retry_at = current_dt + timedelta(minutes=10)
                 store.release_message_claim(
                     message_id,
                     claim_token=claim_token,
@@ -393,6 +415,10 @@ async def _run_scheduler_once(
             if template_status in {"underperforming", "exhausted"}:
                 store.cancel_future_pending_messages(str(sequence["id"]), updated_at=current)
                 store.cancel_claimed_message(message_id, claim_token=claim_token, updated_at=current)
+                # Release the quota reservation reserved above — otherwise
+                # it stays 'reserved' until UTC midnight and silently eats
+                # the account's remaining daily budget.
+                store.finalize_send_quota(message_id, sent=False, updated_at=current)
                 store.update_sequence_status(
                     str(sequence["id"]),
                     status="stopped",
@@ -401,7 +427,7 @@ async def _run_scheduler_once(
                     next_scheduled_at="",
                 )
                 skipped += 1
-                _refresh_hunt_email_summary(store, str(sequence["hunt_id"]), str(sequence["campaign_id"]))
+                touched.add((str(sequence["hunt_id"]), str(sequence["campaign_id"])))
                 continue
 
         # WATERFALL: resolve the actual recipient. The pool is checked
@@ -546,9 +572,10 @@ async def _run_scheduler_once(
         # link, which is in the same URL via the landing page).
         unscope = f"campaign:{str(sequence.get('campaign_id', '') or '')}"
         untoken = issue_token(recipient or "unknown", scope=unscope) if recipient else ""
-        un_base = str(getattr(get_settings(), "public_base_url", "") or "").strip() or "http://api.nineluan.com"
+        un_base = str(getattr(get_settings(), "public_base_url", "") or "").strip() or "https://api.nineluan.com"
         un_url = build_unsubscribe_url(un_base, untoken) if untoken else ""
-        un_mailto = build_mailto_unsubscribe(recipient) if recipient else ""
+        # Do not fabricate an unsubscribe mailbox on the recipient's domain.
+        un_mailto = ""
 
         # The stored body_html was rendered at sequence-create time
         # with a placeholder unsubscribe URL (`__preview__`). Swap
@@ -556,16 +583,9 @@ async def _run_scheduler_once(
         # sees a working unsubscribe link (and the click records
         # against the right campaign scope).
         body_html = str(job.get("body_html", "") or "")
-        if body_html and un_url:
-            body_html = body_html.replace(_HTML_UNSUBSCRIBE_PLACEHOLDER, un_url)
-        elif not body_html and un_url:
-            # Older messages written before body_html existed — fall
-            # back to rendering on the fly so we still get an HTML
-            # email with a clickable unsubscribe button.
-            from emailing.html_format import plaintext_to_html
-            body_html = plaintext_to_html(
-                str(job.get("body_text", "") or ""),
-                unsubscribe_url=un_url,
+        if un_url:
+            body_html = prepare_send_html(
+                str(job.get("body_text", "") or ""), body_html, un_url,
             )
 
         try:
@@ -583,14 +603,32 @@ async def _run_scheduler_once(
         except Exception as exc:  # noqa: BLE001
             result = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
         if result.get("ok"):
-            store.mark_message_sent(
+            applied = store.mark_message_sent(
                 message_id,
                 provider_message_id=str(result.get("provider_message_id", "") or ""),
                 thread_key=str(result.get("thread_key", "") or ""),
                 sent_at=current,
                 claim_token=claim_token,
+                sender_account_id=account_id,
+                sender_upn=str(result.get("actual_sender_upn", "") or ""),
+                representative_address=str(result.get("representative_address", "") or ""),
+                representative_name=str(result.get("representative_name", "") or ""),
+                effective_reply_to=str(result.get("reply_to", "") or ""),
             )
+            # The email DID go out — consume the reservation either way so
+            # the quota counters stay truthful. But if the claim predicate
+            # matched 0 rows (another worker re-claimed the message after a
+            # stale-claim timeout), skip sequence advancement: we no longer
+            # own the row and double-advancing would corrupt the step chain.
             store.finalize_send_quota(message_id, sent=True, updated_at=current)
+            if not applied:
+                logger.warning(
+                    "mark_message_sent matched 0 rows for %s (claim lost); "
+                    "quota finalized, skipping sequence advancement",
+                    message_id,
+                )
+                sent += 1
+                continue
             sent_today_cache[account_id] = sent_today_cache.get(account_id, 0) + 1
             sent_hour_cache[account_id] = sent_hour_cache.get(account_id, 0) + 1
             # WATERFALL: mark this recipient as waiting_reply so the
@@ -640,6 +678,24 @@ async def _run_scheduler_once(
             sent += 1
         else:
             error_kind = str(result.get("error_type", "") or result.get("error", "") or "send_failed")
+            error_text = str(result.get("error", "") or "")
+            # Transient network failures (DNS blips, timeouts, MSAL network
+            # errors) must NOT retire the recipient or fail the message —
+            # release the claim and retry shortly instead.
+            if error_kind in {"network_error", "network", "timeout"} or "graph_network" in error_text:
+                store.finalize_send_quota(message_id, sent=False, updated_at=current)
+                store.release_message_claim(
+                    message_id,
+                    claim_token=claim_token,
+                    updated_at=current,
+                    scheduled_at=(current_dt + timedelta(minutes=10)).isoformat(),
+                )
+                logger.warning(
+                    "Transient network error sending %s (%s); will retry in 10min",
+                    message_id, error_text,
+                )
+                skipped += 1
+                continue
             store.mark_message_failed(
                 message_id,
                 failure_reason=error_kind,
@@ -708,7 +764,13 @@ async def _run_scheduler_once(
                 )
                 store.refresh_campaign_status(str(sequence["campaign_id"]), updated_at=current)
             failed += 1
-        _refresh_hunt_email_summary(store, str(sequence["hunt_id"]), str(sequence["campaign_id"]))
+        touched.add((str(sequence["hunt_id"]), str(sequence["campaign_id"])))
+    # Refresh the hunt-level email summary once per touched
+    # (hunt_id, campaign_id) pair — the per-job deferred collection above
+    # keeps this O(campaigns) instead of O(jobs).
+    for touched_hunt_id, touched_campaign_id in touched:
+        if touched_hunt_id and touched_campaign_id:
+            _refresh_hunt_email_summary(store, touched_hunt_id, touched_campaign_id)
     return {"sent": sent, "failed": failed, "skipped": skipped}
 
 

@@ -22,17 +22,22 @@ from emailing.store import EmailStore
 
 _AUTO_REPLY_SUBJECT_MARKERS = (
     "out of office",
+    "out of the office",
     "automatic reply",
     "auto reply",
+    "auto-reply",
     "autoreply",
-    "vacation",
-    "on leave",
+    "auto-response",
+    "automatic response",
+    "vacation reply",
+    "vacation response",
+    "away from office",
+    "away on vacation",
     "delivery status notification",
     "delivery failure",
     "mail delivery failed",
     "undeliverable",
     "failure notice",
-    "read:",
     "read receipt",
 )
 
@@ -150,12 +155,15 @@ def _is_auto_reply(inbound: dict[str, Any]) -> bool:
     local = from_email.split("@", 1)[0] if "@" in from_email else from_email
     if local in _AUTO_REPLY_LOCAL_PARTS:
         return True
-    headers = inbound.get("headers") or {}
-    auto_submitted = str(headers.get("Auto-Submitted", "") or "").strip().lower()
-    precedence = str(headers.get("Precedence", "") or "").strip().lower()
-    x_autoreply = str(headers.get("X-Autoreply", "") or "").strip().lower()
-    x_autorespond = str(headers.get("X-Autorespond", "") or "").strip().lower()
-    x_failed_recipients = str(headers.get("X-Failed-Recipients", "") or "").strip().lower()
+    headers = {
+        str(key).strip().lower(): value
+        for key, value in (inbound.get("headers") or {}).items()
+    }
+    auto_submitted = str(headers.get("auto-submitted", "") or "").strip().lower()
+    precedence = str(headers.get("precedence", "") or "").strip().lower()
+    x_autoreply = str(headers.get("x-autoreply", "") or "").strip().lower()
+    x_autorespond = str(headers.get("x-autorespond", "") or "").strip().lower()
+    x_failed_recipients = str(headers.get("x-failed-recipients", "") or "").strip().lower()
     if auto_submitted and auto_submitted != "no":
         return True
     if precedence in {"bulk", "junk", "list", "auto_reply"}:
@@ -169,6 +177,8 @@ def process_inbound_messages(
     store: EmailStore,
     inbound_messages: list[dict[str, Any]],
     current: str,
+    *,
+    match_replies: bool = True,
 ) -> dict[str, Any]:
     """Run the reply-matching loop over a pre-fetched inbound list.
 
@@ -189,16 +199,30 @@ def process_inbound_messages(
     matched_details: list[dict[str, str]] = []
     for inbound in inbound_messages:
         checked += 1
+        inbound_id = store.upsert_inbound_message(inbound, now_iso=current)
         raw_ref = str(inbound.get("raw_ref", "") or "")
         if raw_ref and store.has_reply_event(raw_ref):
+            store.update_inbound_message(inbound_id, now_iso=current, match_status="matched")
             skipped += 1
             continue
         if _is_auto_reply(inbound):
+            store.update_inbound_message(
+                inbound_id,
+                now_iso=current,
+                match_status="ignored",
+                is_auto_reply=1,
+                is_ignored=1,
+            )
             ignored += 1
+            continue
+
+        if not match_replies:
+            skipped += 1
             continue
 
         sent_message = _match_sent_message(store, inbound)
         if not sent_message:
+            store.update_inbound_message(inbound_id, now_iso=current, match_status="unmatched")
             skipped += 1
             continue
         sequence = store.get_sequence(str(sent_message.get("sequence_id", "")))
@@ -216,11 +240,22 @@ def process_inbound_messages(
             "snippet": str(inbound.get("snippet", "") or ""),
             "received_at": received_at,
             "raw_ref": raw_ref,
+            "inbound_message_id": inbound_id,
+            "graph_message_id": str(inbound.get("graph_message_id", "") or ""),
+            "conversation_id": str(inbound.get("conversation_id", "") or ""),
+            "mailbox_upn": str(inbound.get("mailbox_upn", "") or ""),
             "created_at": current,
         })
         if not created:
             skipped += 1
             continue
+        store.update_inbound_message(
+            inbound_id,
+            now_iso=current,
+            match_status="matched",
+            matched_sequence_id=str(sequence["id"]),
+            matched_message_id=str(sent_message.get("id", "") or ""),
+        )
         store.update_sequence_status(
             str(sequence["id"]),
             status="replied",
@@ -299,6 +334,7 @@ async def run_graph_reply_detection_once(
     now_iso: str | None = None,
     recent_days: int = 14,
     limit: int = 100,
+    match_replies: bool = True,
 ) -> dict[str, Any]:
     """Poll a Graph mailbox once and match replies to sent messages.
 
@@ -313,7 +349,7 @@ async def run_graph_reply_detection_once(
     inbound_messages = await graph_client.fetch_graph_replies(
         account, now_iso=current, recent_days=recent_days, limit=limit
     )
-    return process_inbound_messages(store, inbound_messages, current)
+    return process_inbound_messages(store, inbound_messages, current, match_replies=match_replies)
 
 
 # Backward-compat alias: the legacy IMAP path exposed this signature
@@ -356,9 +392,8 @@ async def run_reply_detection_once(
 
 def _match_sent_message(store: EmailStore, inbound: dict[str, Any]) -> dict[str, Any] | None:
     # Walk the message-id / in-reply-to / references chain to find the
-    # sent message that this reply is for. If nothing matches, fall
-    # back to a (lead_email, subject) lookup which is threading-
-    # tolerant (strips Re:/Fwd: prefixes, case-insensitive).
+    # sent message that this reply is for. Graph conversationId is the
+    # next strongest signal; sender + normalized subject is the final fallback.
     candidates: list[str] = []
     message_id = _normalize_message_id(str(inbound.get("message_id", "") or ""))
     if message_id:
@@ -375,6 +410,12 @@ def _match_sent_message(store: EmailStore, inbound: dict[str, Any]) -> dict[str,
         if matched:
             return matched
 
+    conversation_id = str(inbound.get("conversation_id", "") or "").strip()
+    if conversation_id:
+        matched = store.find_message_by_thread_key(conversation_id)
+        if matched:
+            return matched
+
     from_email = str(inbound.get("from_email", "") or "").strip().lower()
     normalized_subject = _normalize_subject(str(inbound.get("subject", "") or ""))
     if from_email and normalized_subject:
@@ -383,12 +424,26 @@ def _match_sent_message(store: EmailStore, inbound: dict[str, Any]) -> dict[str,
 
 
 def _refresh_hunt_email_summary(store: EmailStore, hunt_id: str, campaign_id: str) -> None:
-    """Recompute hunt-level email counters and persist the hunt JSON."""
+    """Recompute hunt-level email counters and persist the hunt JSON.
+
+    Mirrors the scheduler's `_refresh_hunt_email_summary` — including the
+    template performance block — so a reply-triggered refresh never
+    overwrites (i.e. drops) the template summary written by a previous
+    scheduler pass.
+    """
     hunt = load_hunt(hunt_id)
     if not hunt:
         return
     campaign = store.get_campaign(campaign_id)
     sequences = store.list_sequences_for_campaign(campaign_id)
+    from config.settings import get_settings
+
+    settings = get_settings()
+    template_summary = store.get_template_performance_for_campaign(
+        campaign_id,
+        underperforming_min_assigned=int(getattr(settings, "email_template_underperforming_min_assigned", 10) or 10),
+        underperforming_min_reply_rate=float(getattr(settings, "email_template_underperforming_min_reply_rate", 1.0) or 1.0),
+    )
     result = hunt.setdefault("result", {})
     result["email_campaign_summary"] = {
         "campaign_id": campaign_id,
@@ -398,5 +453,6 @@ def _refresh_hunt_email_summary(store: EmailStore, hunt_id: str, campaign_id: st
         "failed_count": store.count_messages_for_campaign(campaign_id, status="failed"),
         "pending_count": store.count_messages_for_campaign(campaign_id, status="pending"),
         "replied_count": sum(1 for seq in sequences if seq.get("status") == "replied"),
+        "template_summary": list(template_summary.values()),
     }
     save_hunt(hunt_id, hunt)

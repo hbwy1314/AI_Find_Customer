@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from agents.lead_identity import normalize_url
@@ -147,10 +148,17 @@ _REGION_GEO: dict[str, dict[str, str]] = {
 def _resolve_geo_params(target_regions: list[str]) -> dict[str, str]:
     """Convert target_regions list to Serper gl/hl params using first match."""
     for region in target_regions:
-        key = region.strip().lower()
+        key = _region_lookup_key(region)
         if key in _REGION_GEO:
             return _REGION_GEO[key]
     return {}
+
+
+def _region_lookup_key(region: str) -> str:
+    """Normalize display labels such as ``🇩🇪 Germany`` for region lookup."""
+    key = str(region or "").strip().casefold()
+    match = re.search(r"[\w\u0080-\uffff]", key, re.UNICODE)
+    return key[match.start():] if match else ""
 
 
 _CHINA_KEYWORDS = {"china", "中国", "cn", "大陆", "mainland china"}
@@ -159,7 +167,7 @@ _CHINA_KEYWORDS = {"china", "中国", "cn", "大陆", "mainland china"}
 def _is_china_region(target_regions: list[str]) -> bool:
     """Backward-compatible helper kept for tests and external imports."""
     for region in target_regions:
-        if region.strip().lower() in _CHINA_KEYWORDS:
+        if _region_lookup_key(region) in _CHINA_KEYWORDS:
             return True
     return False
 

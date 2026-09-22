@@ -52,6 +52,7 @@ class HuntState(TypedDict):
     hunt_round: int                         # current round number (1, 2, 3...)
     prev_round_lead_count: int              # lead count at end of previous round
     round_feedback: Optional[dict]          # feedback summary for KeywordGenAgent
+    low_yield_rounds: int                   # consecutive rounds below min_new_leads_threshold
 
     # ── Metadata ────────────────────────────────────────────────────────
     current_stage: str

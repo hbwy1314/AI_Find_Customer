@@ -21,6 +21,7 @@ from emailing.html_format import (
     _LEGACY_FOOTER_SEP,
     _strip_legacy_footer,
     plaintext_to_html,
+    prepare_send_html,
     render_preview_html,
 )
 
@@ -125,6 +126,33 @@ class TestParagraphSplitting:
 
 
 class TestUnsubscribeCard:
+    @pytest.mark.parametrize("scheme", ["http", "https"])
+    def test_send_replaces_preview_on_any_host(self, scheme):
+        preview = render_preview_html("Body", locale="de_DE").replace(
+            "https://api.nineluan.com", f"{scheme}://old.example.org"
+        )
+        rendered = prepare_send_html("Body", preview, "https://api.example.org/api/unsubscribe/real")
+        assert "__preview__" not in rendered
+        assert "Abmelden" in rendered
+        assert rendered.count("https://api.example.org/api/unsubscribe/real") == 1
+
+    def test_send_adds_missing_card_without_losing_html(self):
+        rendered = prepare_send_html("Body", "<p>Custom body</p>", "https://api.example.org/u?a=1&b=2")
+        assert "<p>Custom body</p>" in rendered
+        assert 'href="https://api.example.org/u?a=1&amp;b=2"' in rendered
+
+    def test_send_does_not_duplicate_real_card(self):
+        url = "https://api.example.org/api/unsubscribe/real"
+        rendered = plaintext_to_html("Body", unsubscribe_url=url)
+        assert prepare_send_html("Body", rendered, url) == rendered
+
+    def test_send_rebinds_previous_recipient_token(self):
+        rendered = plaintext_to_html("Body", unsubscribe_url="https://api.example.org/api/unsubscribe/previous")
+        current = "https://api.example.org/api/unsubscribe/current"
+        result = prepare_send_html("Body", rendered, current)
+        assert "/previous" not in result
+        assert result.count(current) == 1
+
     def test_card_uses_real_url(self):
         html = plaintext_to_html(
             "Body",

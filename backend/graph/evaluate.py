@@ -8,6 +8,7 @@ Responsibilities:
 from __future__ import annotations
 
 import logging
+import math
 from collections import Counter
 from typing import Any
 
@@ -117,6 +118,17 @@ def evaluate_progress(state: HuntState) -> dict:
     best_keywords = [kp["keyword"] for kp in keyword_performance if kp["effectiveness"] == "high"]
     worst_keywords = [kp["keyword"] for kp in keyword_performance if kp["effectiveness"] == "low"]
 
+    threshold = max(
+        1,
+        int(state.get("min_new_leads_threshold", get_settings().min_new_leads_threshold)),
+    )
+    previous_low_yield_rounds = max(0, int(state.get("low_yield_rounds", 0) or 0))
+    low_yield_rounds = (
+        previous_low_yield_rounds + 1
+        if current_round > 1 and new_leads_this_round < threshold
+        else 0
+    )
+
     round_feedback = {
         "round": current_round,
         "total_leads": current_leads,
@@ -129,15 +141,19 @@ def evaluate_progress(state: HuntState) -> dict:
         "top_sources": _get_top_sources(leads),
         "industry_distribution": _get_industry_distribution(leads),
         "region_distribution": _get_region_distribution(leads),
+        "low_yield_rounds": low_yield_rounds,
     }
 
     logger.info("[Evaluate] Best keywords: %s | Worst keywords: %s",
                 best_keywords[:3], worst_keywords[:3])
 
     return {
-        "hunt_round": current_round + 1,
+        # `hunt_round` is also displayed to the operator. Do not advance it
+        # past the configured limit when this evaluation is the final round.
+        "hunt_round": current_round if current_round >= int(state.get("max_rounds", 10) or 10) else current_round + 1,
         "prev_round_lead_count": current_leads,
         "round_feedback": round_feedback,
+        "low_yield_rounds": low_yield_rounds,
         "current_stage": "evaluate",
     }
 
@@ -151,7 +167,8 @@ def should_continue_hunting(state: HuntState) -> str:
     Stop conditions (any one triggers finish):
     1. Target met: leads >= target_lead_count
     2. Max rounds exceeded: hunt_round > max_rounds
-    3. Diminishing returns: new leads this round < configured min_threshold (default 5)
+    3. Diminishing returns: two consecutive rounds below the configured
+       min_threshold (default 5)
 
     Returns:
         "continue" — loop back to keyword_gen
@@ -180,23 +197,39 @@ def should_continue_hunting(state: HuntState) -> str:
         return "finish"
 
     # Stop condition 2: max rounds exceeded
-    if current_round > max_rounds:
-        logger.info("[Evaluate] FINISH — max rounds exceeded (%d > %d)", current_round, max_rounds)
+    if current_round >= max_rounds:
+        logger.info("[Evaluate] FINISH — max rounds reached (%d/%d)", current_round, max_rounds)
         return "finish"
 
-    # Stop condition 3: diminishing returns (skip on round 1)
-    # Use the configured threshold directly so the behavior matches user-facing
-    # settings and remains predictable across different target sizes.
+    # Stop condition 3: diminishing returns. A single low-yield round can be a
+    # transient search miss; only consecutive low-yield rounds stop the hunt.
     diminishing_threshold = max(
         1,
         int(state.get("min_new_leads_threshold", get_settings().min_new_leads_threshold)),
     )
-    if evaluated_round > 1 and new_this_round < diminishing_threshold:
+    low_yield_rounds = max(0, int(state.get("low_yield_rounds", 0) or 0))
+    minimum_progress_for_early_stop = min(
+        target,
+        max(diminishing_threshold * 2, math.ceil(target * 0.25)),
+    )
+    if (
+        evaluated_round > 1
+        and current_leads >= minimum_progress_for_early_stop
+        and new_this_round < diminishing_threshold
+        and low_yield_rounds >= 2
+    ):
         logger.info(
-            "[Evaluate] FINISH — diminishing returns (%d new leads < %d threshold in round %d)",
-            new_this_round, diminishing_threshold, evaluated_round,
+            "[Evaluate] FINISH — consecutive diminishing returns (%d new leads < %d threshold for %d rounds)",
+            new_this_round, diminishing_threshold, low_yield_rounds,
         )
         return "finish"
+
+    if low_yield_rounds >= 2 and current_leads < minimum_progress_for_early_stop:
+        logger.info(
+            "[Evaluate] CONTINUE — low yield but progress floor not reached (%d/%d leads)",
+            current_leads,
+            minimum_progress_for_early_stop,
+        )
 
     logger.info("[Evaluate] CONTINUE — %d/%d leads, round %d/%d (new this round: %d)",
                 current_leads, target, current_round, max_rounds, new_this_round)

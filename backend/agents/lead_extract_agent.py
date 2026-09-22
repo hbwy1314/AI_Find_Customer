@@ -34,8 +34,8 @@ from agents.lead_identity import (
     normalize_domain,
     official_domain,
 )
+from api.hunt_store import accept_new_leads, current_lead_keys
 from config.settings import get_settings
-from emailing.store import EmailStore
 from graph.state import HuntState
 from tools.contact_extractor import (
     discover_contact_pages,
@@ -370,6 +370,7 @@ Not every related company is a customer. Industry media, directories, schools, a
 ## Competitor rule
 Only disqualify as a direct competitor when the evidence clearly shows the prospect MANUFACTURES or owns a brand of the same core product as the seller.
 Do NOT auto-reject a company just because it sells related products. A distributor, importer, OEM, integrator, or reseller of similar products may still be a valid customer.
+However, an explicit competitor signal such as competitor_risk=high, competitor, direct_competitor, or possible_competitor is a hard reject for this hunt, even when the role is a channel partner.
 
 ## You will be given
 - Company Profile: factual data extracted from the prospect website and research
@@ -498,6 +499,7 @@ If uncertain, keep it.
 - "Related company" is not enough. Look for a plausible buyer/channel/end-user role.
 - Do NOT reject a distributor/importer/OEM/integrator just because it sells related products.
 - Only classify competitor_risk=high when the evidence clearly shows same-core-product manufacturing or own-brand production.
+- If evidence supports possible_competitor or another explicit competitor flag, set pass_gate=false; do not keep it merely because it is a distributor.
 - confidence must be 0-1.
 - reason must be one concise English sentence.
 - risk_flags should be short tags like: competitor, directory, media, b2c_only, unrelated_industry, insufficient_data, possible_competitor.
@@ -522,6 +524,51 @@ def _extract_contacts_from_text(text: str) -> tuple[list[str], list[str], dict[s
     phones = extract_phone_numbers(text)
     social = extract_social_media(text)
     return emails, phones, social
+
+
+def _competitor_rejection_reason(data: dict[str, Any] | None) -> str:
+    """Return a reason when a gate/lead contains explicit competitor evidence."""
+    if not isinstance(data, dict):
+        return ""
+    if bool(data.get("suspected_competitor", False)):
+        return "Suspected competitor flag detected"
+    risk = str(data.get("competitor_risk", "") or "").strip().lower()
+    flags = {
+        str(flag or "").strip().lower().replace("-", "_").replace(" ", "_")
+        for flag in (data.get("risk_flags", []) or [])
+        if str(flag or "").strip()
+    }
+    role = str(data.get("customer_role", data.get("customer_role_guess", "")) or "").strip().lower()
+    if risk in {"medium", "high"}:
+        return f"Explicit {risk} competitor risk"
+    if flags & {"competitor", "suspected_competitor", "possible_competitor", "direct_competitor"}:
+        return "Competitor risk flag detected"
+    if role == "manufacturer" and risk in {"medium", "high"}:
+        return "Manufacturer with elevated competitor risk"
+    return ""
+
+
+def _strongest_competitor_risk(*values: Any) -> str:
+    """Keep the strongest signal across cheap-gate and deep research."""
+    ranks = {"": 0, "unknown": 0, "low": 1, "medium": 2, "high": 3}
+    aliases = {"moderate": "medium", "elevated": "medium", "severe": "high"}
+    normalized = [
+        aliases.get(str(value or "").strip().lower(), str(value or "").strip().lower())
+        for value in values
+    ]
+    recognized = [value for value in normalized if value in ranks]
+    return max(recognized, key=ranks.get, default="") or "low"
+
+
+def _preferred_customer_role(deep_role: Any, gate_role: Any) -> str:
+    """Prefer the researched role; QuickGate is only a fallback guess."""
+    deep = str(deep_role or "").strip().lower()
+    gate = str(gate_role or "").strip().lower()
+    if deep and deep != "unknown":
+        return deep
+    if gate and gate != "unknown":
+        return gate
+    return "unknown"
 
 
 def _quick_gate_fallback(search_result: dict, insight: dict) -> tuple[bool, dict]:
@@ -552,7 +599,10 @@ def _quick_gate_fallback(search_result: dict, insight: dict) -> tuple[bool, dict
         for tok in p.split()
         if len(tok.strip()) >= 4
     }
-    competitor_markers = ["manufacturer", "factory", "producer", "oem"]
+    competitor_markers = [
+        "manufacturer", "manufactures", "factory", "producer", "production",
+        "own brand", "private label", "proprietary brand",
+    ]
     if any(m in text for m in competitor_markers) and any(t in text for t in product_tokens):
         return False, {
             "pass_gate": False,
@@ -581,6 +631,12 @@ async def _quick_gate_candidate(search_result: dict, llm: LLMTool, insight: dict
     title = str(search_result.get("title", "")).lower()
     description = str(maps.get("description", "")).lower()
     combined_text = f"{title} {description}"
+
+    fallback_pass, fallback_gate = _quick_gate_fallback(search_result, insight)
+    if not fallback_pass and "competitor" in {
+        str(flag or "").strip().lower() for flag in fallback_gate.get("risk_flags", [])
+    }:
+        return False, fallback_gate
     
     # STRICT PASS RULE: Strong B2B signal keywords → force pass gate.
     # These words strongly indicate wholesale/distribution operations.
@@ -638,27 +694,46 @@ async def _quick_gate_candidate(search_result: dict, llm: LLMTool, insight: dict
         competitor_risk = str(parsed.get("competitor_risk", "")).lower().strip()
         entity_type = str(parsed.get("entity_type", "")).lower().strip()
         customer_role_guess = str(parsed.get("customer_role_guess", "")).lower().strip()
+        risk_flags = parsed.get("risk_flags", []) if isinstance(parsed.get("risk_flags"), list) else []
         
-        # Only reject if LLM explicitly said pass_gate=false
-        # Do NOT add extra rejection rules that contradict "if uncertain, keep it"
+        # Competitor signals are a hard exclusion. A distributor with an
+        # explicit possible-competitor flag is still unsafe for this hunt.
         if bool(parsed.get("suspected_competitor", False)):
+            passed = False
+        if _competitor_rejection_reason({
+            "competitor_risk": competitor_risk,
+            "risk_flags": risk_flags,
+            "customer_role_guess": customer_role_guess,
+        }):
             passed = False
         
         # Reject non-company entities (directory, media, association, etc.)
         if entity_type and entity_type not in {"company", "unknown"}:
             passed = False
 
+        gate_reason = str(parsed.get("reason", "")) or "No reason provided"
+        competitor_reason = _competitor_rejection_reason({
+            "suspected_competitor": bool(parsed.get("suspected_competitor", False)),
+            "competitor_risk": competitor_risk,
+            "risk_flags": risk_flags,
+            "customer_role_guess": customer_role_guess,
+        })
+        if competitor_reason:
+            gate_reason = competitor_reason
+
         return passed, {
             "pass_gate": passed,
-            "reason": str(parsed.get("reason", "")) or "No reason provided",
-            "risk_flags": parsed.get("risk_flags", []) if isinstance(parsed.get("risk_flags"), list) else [],
+            "reason": gate_reason,
+            "risk_flags": risk_flags,
             "confidence": float(parsed.get("confidence", 0.0) or 0.0),
             "entity_type": entity_type or "unknown",
             "customer_role_guess": customer_role_guess or "unknown",
             "competitor_risk": competitor_risk or "low",
         }
     except Exception as e:
-        logger.debug("[LeadExtract][QuickGate] fallback due to error: %s", e)
+        # This fallback silently lets most candidates through the gate,
+        # which inflates downstream costs — surface it loudly.
+        logger.warning("[LeadExtract][QuickGate] LLM gate failed, using heuristic fallback: %s", e)
         return _quick_gate_fallback(search_result, insight)
 
 
@@ -677,17 +752,7 @@ def _official_website_domain(url: str) -> str:
 
 
 def _global_lead_keys(lead: dict[str, Any]) -> list[str]:
-    """Cross-Hunt dedup keys using full lead identity.
-
-    Uses domain, email, phone, place_id as strong identities.
-    Company name is only used when combined with other strong signals.
-    
-    This prevents:
-    - Same website being collected twice
-    - Same email being collected twice
-    - Same company at different locations being incorrectly merged
-    """
-    from agents.lead_identity import lead_identity_keys
+    """Customer website domain or normalized company name, across current tasks."""
     return lead_identity_keys(lead)
 
 
@@ -1103,23 +1168,45 @@ async def _scrape_and_extract(
             if v and isinstance(v, str) and v.startswith("http")
         }
 
-        existing_phones = sanitize_phone_list([str(p) for p in validated.get("phone_numbers", []) if p])
+        phone_country = str(validated.get("country_code", "") or "")
+        phone_address = str(validated.get("address", "") or maps_data.get("address", "") or "")
+        phone_website = str(validated.get("website", "") or url or maps_data.get("website", "") or "")
+        existing_phones = sanitize_phone_list(
+            [str(p) for p in validated.get("phone_numbers", []) if p],
+            country_code=phone_country,
+            address=phone_address,
+            website=phone_website,
+        )
         maps_phone = str(maps_data.get("phone_number", "") or maps_data.get("phoneNumber", "")).strip()
         if maps_phone:
-            existing_phones = sanitize_phone_list(existing_phones + [maps_phone])
+            existing_phones = sanitize_phone_list(
+                existing_phones + [maps_phone],
+                country_code=phone_country,
+                address=phone_address,
+                website=phone_website,
+            )
 
         existing_emails = list(set(validated.get("emails", [])))
         maps_email = str(maps_data.get("email", "")).strip()
         if maps_email:
             existing_emails = list(set(existing_emails + [maps_email]))
 
-        # Prefer QuickGate's customer_role_guess over LLM's customer_role if available
+        # Deep research has richer role evidence; retain the strongest risk signal
+        # from either stage so an early low-risk guess cannot hide a competitor.
         quick_gate = search_result.get("quick_gate", {})
         gate_customer_role = str(quick_gate.get("customer_role_guess", "")).strip()
         gate_competitor_risk = str(quick_gate.get("competitor_risk", "")).strip()
+        gate_risk_flags = quick_gate.get("risk_flags", []) if isinstance(quick_gate.get("risk_flags", []), list) else []
+        validated_risk_flags = validated.get("risk_flags", []) if isinstance(validated.get("risk_flags", []), list) else []
         
-        final_customer_role = gate_customer_role if gate_customer_role and gate_customer_role != "unknown" else str(validated.get("customer_role", "unknown") or "unknown")
-        final_competitor_risk = gate_competitor_risk if gate_competitor_risk else str(validated.get("competitor_risk", "low") or "low")
+        final_customer_role = _preferred_customer_role(
+            validated.get("customer_role", "unknown"),
+            gate_customer_role,
+        )
+        final_competitor_risk = _strongest_competitor_risk(
+            gate_competitor_risk,
+            validated.get("competitor_risk", "low"),
+        )
 
         lead = {
             "company_name": validated.get("company_name") or domain,
@@ -1140,7 +1227,7 @@ async def _scrape_and_extract(
             "customer_role": final_customer_role,
             "competitor_risk": final_competitor_risk,
             "evidence_strength": str(validated.get("evidence_strength", "low") or "low"),
-            "risk_flags": validated.get("risk_flags", []) if isinstance(validated.get("risk_flags", []), list) else [],
+            "risk_flags": list(dict.fromkeys(gate_risk_flags + validated_risk_flags)),
             "source": domain,
             "source_url": url,
             "country_code": validated.get("country_code", ""),
@@ -1152,6 +1239,27 @@ async def _scrape_and_extract(
             "maps_data": maps_data,
         }
 
+        competitor_reason = _competitor_rejection_reason({
+            "suspected_competitor": bool(validated.get("suspected_competitor", False)),
+            "competitor_risk": final_competitor_risk,
+            "risk_flags": lead["risk_flags"],
+            "customer_role": final_customer_role,
+        })
+        if competitor_reason:
+            logger.info(
+                "[LeadExtract] Rejecting competitor candidate %s: %s",
+                lead.get("company_name", domain),
+                competitor_reason,
+            )
+            _emit_progress(
+                "scrape_done",
+                domain=domain,
+                valid=False,
+                reason="competitor",
+                detail=competitor_reason,
+            )
+            return None
+
         # ── P0-3: Merge Regex-extracted contacts into lead ────────────
         # This ensures emails/phones found by Regex during scrape_page and
         # google_search are not lost even if the ReAct agent omits them.
@@ -1160,6 +1268,12 @@ async def _scrape_and_extract(
             extra_emails=list(collected_contacts["emails"]),
             extra_phones=list(collected_contacts["phones"]),
             extra_social=collected_contacts["social"],
+        )
+        lead["phone_numbers"] = sanitize_phone_list(
+            [str(phone) for phone in lead.get("phone_numbers", []) if phone],
+            country_code=str(lead.get("country_code", "") or ""),
+            address=str(lead.get("address", "") or ""),
+            website=str(lead.get("website", "") or ""),
         )
         customs_result = collected_customs.get("result") if isinstance(collected_customs, dict) else None
         if isinstance(customs_result, dict) and customs_result.get("status") == "ok":
@@ -1210,7 +1324,7 @@ async def _scrape_and_extract(
         logger.info("[LeadExtract] ✓ %s → %s (%s)",
                     domain, lead['company_name'], contact_summary)
         _emit_progress(
-            "lead_found", domain=domain,
+            "candidate_found", domain=domain,
             company_name=lead["company_name"],
             emails=len(lead["emails"]),
             phones=len(lead["phone_numbers"]),
@@ -1278,44 +1392,9 @@ async def lead_extract_node(state: HuntState) -> dict:
     insight = state.get("insight")
     insight = insight if isinstance(insight, dict) else {}
     keyword_stats = dict(state.get("keyword_search_stats", {}))
-    registry = EmailStore(settings.email_db_path)
-    registry.init_db()
-
-    # Load known company names from the global registry (cross-Hunt dedup).
-    # Only company:xxx keys are stored now — no domain/email/phone/place.
-    global_company_names: set[str] = {
-        k for k in registry.list_lead_registry_keys() if k.startswith("company:")
-    }
+    global_keys = current_lead_keys()
     current_hunt_id = str(state.get("hunt_id", "") or "")
-
-    # Filter existing_leads: keep only those truly belonging to current Hunt.
-    # If a lead's company was first claimed by another Hunt, drop it from existing_leads.
-    if existing_leads:
-        filtered_existing = []
-        for lead in existing_leads:
-            if not isinstance(lead, dict):
-                continue
-            keys = _global_lead_keys(lead)
-            if not keys:
-                filtered_existing.append(lead)
-                continue
-            # Check if ANY key belongs to another Hunt
-            belongs_to_other_hunt = False
-            for key in keys:
-                owner_hunt = registry.get_hunt_id_for_key(key)
-                if owner_hunt and owner_hunt != current_hunt_id:
-                    belongs_to_other_hunt = True
-                    break
-            if not belongs_to_other_hunt:
-                filtered_existing.append(lead)
-                # Register this lead's company names for within-round dedup
-                global_company_names.update(keys)
-        
-        existing_leads = filtered_existing
-        logger.info(
-            "[LeadExtractAgent] Filtered existing_leads: kept %d truly belonging to current Hunt",
-            len(existing_leads),
-        )
+    global_keys.update(key for lead in existing_leads for key in _global_lead_keys(lead))
 
     if target_lead_count and len(existing_leads) >= target_lead_count:
         logger.info(
@@ -1325,12 +1404,13 @@ async def lead_extract_node(state: HuntState) -> dict:
         )
         # Return minimal filter_stats when skipping extraction
         return {
+            "leads": existing_leads,
             "current_stage": "lead_extract",
             "filter_stats": {
                 "total_search_results": len(search_results),
                 "no_link_or_title": 0,
                 "global_dedup_filtered": 0,
-                "within_hunt_domain_dedup": 0,
+                "within_hunt_company_dedup": 0,
                 "irrelevant_url_filtered": 0,
                 "budget_trimmed": 0,
                 "quick_gate_filtered": 0,
@@ -1340,20 +1420,14 @@ async def lead_extract_node(state: HuntState) -> dict:
             }
         }
 
-    # Determine which URLs to process.
-    # Pre-scrape dedup: skip if title/company name already in global registry.
-    # Within-hunt dedup: skip if same official domain already seen this round.
-    existing_domains = {
-        d for d in (_official_website_domain(l.get("website", "")) for l in existing_leads)
-        if d
-    }
-    
+    # Determine which candidates to process. Identity is company-name-only;
+    # different companies may share a website/domain and must be researched.
     # Track filtering stats
     filter_stats = {
         "total_search_results": len(search_results),
         "no_link_or_title": 0,
         "global_dedup_filtered": 0,
-        "within_hunt_domain_dedup": 0,
+        "within_hunt_company_dedup": 0,
         "irrelevant_url_filtered": 0,
         "budget_trimmed": 0,
         "quick_gate_filtered": 0,
@@ -1362,7 +1436,6 @@ async def lead_extract_node(state: HuntState) -> dict:
     }
     
     to_process = []
-    seen_domains: set[str] = set(existing_domains)
     for r in search_results:
         link = r.get("link", "")
         maps_data = r.get("maps_data") or {}
@@ -1371,33 +1444,21 @@ async def lead_extract_node(state: HuntState) -> dict:
             filter_stats["no_link_or_title"] += 1
             continue
 
-        # Pre-scrape global dedup: skip if strong identity (domain/email/phone/place_id)
-        # already exists in global registry. Company name alone is NOT checked here
-        # to avoid rejecting same-name companies in different regions.
+        # Search titles are not company names; use only trusted candidate identities.
         candidate_keys = candidate_identity_keys(r)
         skip_candidate = False
         for key in candidate_keys:
-            owner_hunt = registry.get_hunt_id_for_key(key)
-            if owner_hunt and owner_hunt != current_hunt_id:
+            if key in global_keys:
                 logger.info(
-                    "[LeadExtractAgent] Pre-scrape global dedup dropped candidate: %s (key=%s claimed by hunt=%s)",
+                    "[LeadExtractAgent] Current-task dedup dropped candidate: %s (key=%s)",
                     title or link,
                     key,
-                    owner_hunt,
                 )
                 skip_candidate = True
                 break
         if skip_candidate:
             filter_stats["global_dedup_filtered"] += 1
             continue
-
-        # Within-hunt domain dedup: avoid scraping the same company site twice.
-        link_domain = _official_website_domain(link)
-        if link_domain and link_domain in seen_domains:
-            filter_stats["within_hunt_domain_dedup"] += 1
-            continue
-        if link_domain:
-            seen_domains.add(link_domain)
 
         to_process.append(r)
 
@@ -1414,7 +1475,7 @@ async def lead_extract_node(state: HuntState) -> dict:
         len(to_process),
         len(processable),
         filter_stats["global_dedup_filtered"],
-        filter_stats["within_hunt_domain_dedup"],
+        filter_stats["within_hunt_company_dedup"],
         filter_stats["irrelevant_url_filtered"],
     )
 
@@ -1424,6 +1485,7 @@ async def lead_extract_node(state: HuntState) -> dict:
             filter_stats,
         )
         return {
+            "leads": existing_leads,
             "current_stage": "lead_extract",
             "filter_stats": filter_stats,
         }
@@ -1508,6 +1570,7 @@ async def lead_extract_node(state: HuntState) -> dict:
                 filter_stats,
             )
             return {
+                "leads": existing_leads,
                 "current_stage": "lead_extract",
                 "filter_stats": filter_stats,
             }
@@ -1523,7 +1586,6 @@ async def lead_extract_node(state: HuntState) -> dict:
 
         results = []
         target_new_leads = max(0, target_lead_count - len(existing_leads)) if target_lead_count else 0
-        incremental_seen_domains: set[str] = set(existing_domains)
         incremental_new_count = 0
         reached_target_early = False
         # Use as_completed to process results as they finish (better for logging/monitoring)
@@ -1532,15 +1594,21 @@ async def lead_extract_node(state: HuntState) -> dict:
                 res = await future
                 if res is None:
                     continue
-                results.append(res)
+                res = await _verify_lead_emails(res, EmailVerifierTool())
+                accepted = accept_new_leads(current_hunt_id, [res])
+                if not accepted:
+                    continue
+                results.extend(accepted)
+                _emit_progress("lead_found", lead=res,
+                               domain=_official_website_domain(res.get("website", "")),
+                               company_name=res.get("company_name", ""),
+                               emails=len(res.get("emails") or []),
+                               phones=len(res.get("phone_numbers") or []),
+                               social=list(res.get("social_media") or {}),
+                               match_score=res.get("match_score", 0))
                 if target_new_leads <= 0:
                     continue
-                official_domain = _official_website_domain(res.get("website", ""))
-                if official_domain and official_domain in incremental_seen_domains:
-                    continue
-                if official_domain:
-                    incremental_seen_domains.add(official_domain)
-                incremental_new_count += 1
+                incremental_new_count += len(accepted)
                 if incremental_new_count >= target_new_leads:
                     reached_target_early = True
                     for task in scrape_tasks:
@@ -1554,6 +1622,13 @@ async def lead_extract_node(state: HuntState) -> dict:
                     break
             except asyncio.CancelledError:
                 raise
+            except (OSError, ValueError, RuntimeError):
+                # Persistence/identity failures cannot be treated as empty scrape results.
+                for task in scrape_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*scrape_tasks, return_exceptions=True)
+                raise
             except Exception as e:
                 logger.error("[LeadExtractAgent] Task failed: %s", e)
         if reached_target_early:
@@ -1565,43 +1640,7 @@ async def lead_extract_node(state: HuntState) -> dict:
         await google.close()
 
     # ── Collect valid leads, deduplicate ─────────────────────────────────
-    new_leads = []
-    seen_domains = set(existing_domains)
-
-    for lead in results:
-        if lead is None:
-            continue
-        # Post-scrape company name dedup against global registry
-        lead_keys = _global_lead_keys(lead)
-        if any(key in global_company_names for key in lead_keys):
-            logger.info(
-                "[LeadExtractAgent] Global dedup dropped lead company=%s (already collected)",
-                lead.get("company_name"),
-            )
-            continue
-        official_dom = _official_website_domain(lead.get("website", ""))
-        if official_dom and official_dom in seen_domains:
-            continue
-        if official_dom:
-            seen_domains.add(official_dom)
-        new_leads.append(lead)
-
-    # Save company names to global registry so future Hunts skip them.
-    globally_new = registry.reserve_lead_keys(
-        new_leads,
-        hunt_id=current_hunt_id,
-        key_fn=_global_lead_keys,
-        now_iso=datetime.now(timezone.utc).isoformat(),
-    )
-    new_leads = globally_new
-
-    # ── Verify emails via MX record check (concurrent) ───────────────────
-    # Remove emails whose domains have no MX records, indicating the domain
-    # cannot receive email (likely invalid or expired).
-    verifier = EmailVerifierTool()
-    new_leads = list(await asyncio.gather(
-        *[_verify_lead_emails(lead, verifier) for lead in new_leads]
-    ))
+    new_leads = results
 
     logger.info("[LeadExtractAgent] Completed — %d new leads extracted (total: %d)",
                 len(new_leads), len(existing_leads) + len(new_leads))

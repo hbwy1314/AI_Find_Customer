@@ -1,101 +1,44 @@
-from __future__ import annotations
-
-from agents.lead_identity import (
-    candidate_identity_keys,
-    dedupe_leads,
-    lead_identity_keys,
-    normalize_company_name,
-    normalize_domain,
-)
+from agents.lead_identity import candidate_identity_keys, dedupe_leads, lead_identity_keys, normalize_company_name
 
 
-def test_normalizes_domain_and_company_variants():
-    assert normalize_domain("https://WWW.Example.com:443/about/") == "example.com"
-    assert normalize_domain("https://münchen.example/") == "xn--mnchen-3ya.example"
-    assert normalize_company_name("ACME GmbH & Co. KG") == "acme"
+def test_exact_normalized_company_names():
+    assert normalize_company_name("  ＡＣＭＥ   GmbH ") == "acme gmbh"
+    assert normalize_company_name("Acme GmbH") != normalize_company_name("Acme")
+    assert normalize_company_name("München") != normalize_company_name("Munchen")
 
 
-def test_candidate_keys_match_saved_maps_lead():
-    lead = {
-        "company_name": "Acme GmbH",
-        "website": "https://www.acme.example/about",
-        "emails": ["Sales@acme.example"],
-        "phone_numbers": ["+49 (30) 1234-567"],
-        "maps_data": {"place_id": "PID-1", "title": "Acme", "address": "Berlin"},
-        "source_url": "https://maps.example/place/acme",
-    }
-    candidate = {
-        "title": "Acme",
-        "link": "https://acme.example/",
-        "source": "google_maps",
-        "maps_data": {
-            "place_id": "pid-1",
-            "website": "https://acme.example/",
-            "phone_number": "+49 30 1234567",
-        },
-    }
-
-    assert set(candidate_identity_keys(candidate)) & set(lead_identity_keys(lead))
+def test_only_exact_normalized_company_name_is_identity():
+    assert len(dedupe_leads([
+        {"website": "http://www.acme.de/about", "company_name": "Acme"},
+        {"website": "https://acme.de/contact?utm_source=x", "company_name": "Other"},
+        {"website": "https://different.de", "company_name": " ACME "},
+    ])) == 2
 
 
-def test_dedupe_leads_merges_richer_duplicate_data():
-    leads = dedupe_leads([
-        {"company_name": "Acme GmbH", "website": "https://acme.example/about", "emails": ["a@acme.example"]},
-        {"company_name": "Acme", "website": "https://www.acme.example/", "emails": ["b@acme.example"], "phone_numbers": ["1234567"]},
+def test_contact_details_are_not_identity():
+    leads = [{"company_name": name, "emails": ["shared@example.com"],
+              "phone_numbers": ["123456789"], "maps_data": {"place_id": "shared"}}
+             for name in ("Acme", "Other")]
+    assert len(dedupe_leads(leads)) == 2
+    assert lead_identity_keys({}) == []
+    assert len(dedupe_leads([{}, {}])) == 2
+
+
+def test_same_company_names_merge_without_domain_matching():
+    merged = dedupe_leads([
+        {"company_name": "A", "website": "https://a.de", "emails": ["a@a.de"]},
+        {"company_name": "A", "website": "https://other.de", "emails": ["b@other.de"]},
+        {"company_name": "B", "website": "https://a.de"},
     ])
-
-    assert len(leads) == 1
-    assert leads[0]["emails"] == ["a@acme.example", "b@acme.example"]
-    assert leads[0]["phone_numbers"] == ["1234567"]
-
-
-def test_dedupe_leads_merges_transitive_aliases_in_one_pass():
-    """
-    Transitive merge: A-B share domain, B-C share email → all merge.
-    Company name alone is NOT an identity (weak key), so leads with
-    different emails won't merge just because they share a company name.
-    """
-    leads = [
-        {"company_name": "Acme", "website": "https://acme.example", "emails": ["first@acme.example"]},
-        {"company_name": "Acme", "website": "https://acme.example", "emails": ["shared@other.example"]},
-        {"company_name": "Other", "emails": ["shared@other.example"]},
-    ]
-
-    deduped = dedupe_leads(leads)
-
-    # All three should merge: lead1-lead2 share domain, lead2-lead3 share email
-    assert len(deduped) == 1
-    assert dedupe_leads(deduped) == deduped
+    assert len(merged) == 2
+    assert merged[0]["emails"] == ["a@a.de", "b@other.de"]
+    assert len(dedupe_leads(merged + [{"company_name": "A", "website": "https://third.de"}])) == 2
 
 
-def test_company_name_is_weak_identity():
-    """
-    Company name is only used as identity when NO strong keys exist.
-    Leads with different emails/domains should NOT merge just because
-    they share a company name (prevents same-name companies in different
-    regions from incorrectly deduping).
-    """
-    leads = [
-        {"company_name": "Vape Store", "emails": ["germany@vapestore.de"]},
-        {"company_name": "Vape Store", "emails": ["usa@vapestore.com"]},
-    ]
-
-    deduped = dedupe_leads(leads)
-
-    # Should remain separate - different emails, company name doesn't merge them
-    assert len(deduped) == 2
+def test_search_title_is_not_company_identity():
+    assert candidate_identity_keys({"title": "Best vape wholesalers", "link": ""}) == []
+    assert candidate_identity_keys({"maps_data": {"title": "Acme"}}) == ["company:acme"]
 
 
-def test_company_name_as_fallback_identity():
-    """
-    Company name IS used as identity when the lead has NO other contact info.
-    """
-    leads = [
-        {"company_name": "Mystery Company"},
-        {"company_name": "Mystery Company"},
-    ]
-
-    deduped = dedupe_leads(leads)
-
-    # Should merge - no other identities available, company name is the fallback
-    assert len(deduped) == 1
+def test_public_platform_is_not_customer_domain():
+    assert lead_identity_keys({"website": "https://www.linkedin.com/company/acme", "company_name": "Acme"}) == ["company:acme"]

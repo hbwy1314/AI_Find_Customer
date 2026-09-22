@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from migrations.runner import apply_pending_migrations
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS hunt_jobs (
   id TEXT PRIMARY KEY,
@@ -42,10 +44,21 @@ class HuntJobQueue:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # WAL + generous busy timeout so concurrent writers (API process,
+        # embedded consumer, headless worker) queue up instead of failing
+        # with "database is locked" after SQLite's 5s default.
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:  # e.g. read-only FS — fall back
+            pass
+        conn.execute("PRAGMA busy_timeout = 10000")
         return conn
 
     def init_db(self) -> None:
         with self._connect() as conn:
+            # P0.3: run versioned migrations before the inline DDL.
+            # New schema changes should land in backend/migrations/*.sql.
+            apply_pending_migrations(conn)
             conn.executescript(_DDL)
             self._ensure_column(conn, "hunt_jobs", "progress_stage", "TEXT DEFAULT ''")
             self._ensure_column(conn, "hunt_jobs", "progress_message", "TEXT DEFAULT ''")
@@ -353,7 +366,6 @@ class HuntJobQueue:
                      updated_at = ?,
                      heartbeat_at = '',
                      claim_token = '',
-                    claim_token = '',
                     last_error = ?,
                     last_hunt_id = CASE WHEN ? != '' THEN ? ELSE last_hunt_id END
                  WHERE {predicate}
@@ -380,6 +392,12 @@ class HuntJobQueue:
             )
 
     def retry_now(self, job_id: str, *, updated_at: str) -> None:
+        """Manual requeue of a failed/completed job.
+
+        Resets `attempt_count` so a full retry budget is available again —
+        the operator asked for a fresh run, not "one more attempt before
+        the job is permanently failed again".
+        """
         with self._connect() as conn:
             conn.execute(
                 """
@@ -392,6 +410,7 @@ class HuntJobQueue:
                     claimed_by = '',
                     claim_token = '',
                     heartbeat_at = '',
+                    attempt_count = 0,
                     progress_stage = 'queued',
                     progress_message = 'Waiting for consumer to claim',
                     last_error = ''
@@ -399,6 +418,29 @@ class HuntJobQueue:
                   AND status IN ('failed', 'completed')
                 """,
                 (updated_at, updated_at, job_id),
+            )
+
+    def touch_heartbeat(
+        self, job_id: str, *, now_iso: str, claim_token: str = "", worker_id: str = ""
+    ) -> None:
+        """Refresh a running job's lease heartbeat without touching progress.
+
+        The lease sweeper requeues jobs whose heartbeat is older than the
+        configured lease; consumers must call this (or update_progress)
+        at least once per lease window while executing long hunts.
+        """
+        predicate = "id = ? AND status = 'running'"
+        values: list[Any] = [now_iso, now_iso, job_id]
+        if claim_token:
+            predicate += " AND claim_token = ?"
+            values.append(claim_token)
+            if worker_id:
+                predicate += " AND claimed_by = ?"
+                values.append(worker_id)
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE hunt_jobs SET heartbeat_at = ?, updated_at = ? WHERE {predicate}",
+                values,
             )
 
     def delete_job(self, job_id: str) -> bool:

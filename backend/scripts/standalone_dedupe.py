@@ -199,4 +199,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit("Retired: use audit_lead_dedup.py; this script uses obsolete identity rules.")
