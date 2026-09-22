@@ -320,6 +320,18 @@ class Settings(BaseSettings):
 
     # --- Hunt persistence ---
     hunts_dir: str = _resolve_dir("data/hunts")  # directory for JSON hunt files
+    # SQLite backend for hunt persistence (P1). Co-exists with JSON in Wave 1
+    # (DualWriteBackend writes to both). Wave 3 flips reads to SQLite; Wave 4
+    # retires JSON. When empty (default), the SQLite backend is skipped and
+    # behaviour is identical to the legacy JSON-only path.
+    hunt_db_path: str = _resolve_file("data/hunts.db")
+    # Persistence backend selector for hunt_store. Valid values:
+    #   * "json"   — legacy JSON-only (no SQLite writes). Wave 0 default.
+    #   * "sqlite" — SQLite-only reads/writes (Wave 3+ once read switch flips).
+    #   * "dual"   — write-through to both JSON and SQLite, reads via JSON
+    #                (Wave 1 default). Cheapest safety net: a SQLite write
+    #                failure is logged but never blocks the hunt pipeline.
+    hunt_storage_backend: str = "dual"
     # Retention (in days) for on-disk hunt artifacts: hunt JSONs and their
     # LangGraph checkpoints. 0 (default) keeps everything forever — no data
     # is ever deleted unless the operator explicitly opts in. When set,
